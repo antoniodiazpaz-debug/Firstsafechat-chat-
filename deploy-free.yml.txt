@@ -1,0 +1,144 @@
+name: Deploy (kostenfrei)
+
+# Deployt Mix-Knoten per SSH auf kostenlose VMs (Oracle Always Free,
+# oder jede andere erreichbare Maschine). Kein Anbieter-Lock-in:
+# Es wird nur eine Datei kopiert und ein systemd-Dienst neu gestartet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      node:
+        description: 'Welchen Knoten'
+        required: true
+        default: 'alle'
+        type: choice
+        options: [alle, mix-eu, mix-us, mix-ap]
+
+concurrency:
+  group: deploy-free
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: node test-mixnet.js
+      - run: node test-mix-remote.js
+        timeout-minutes: 3
+
+  deploy:
+    name: ${{ matrix.node.id }}
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1        # nie alle Knoten gleichzeitig neu starten
+      fail-fast: false       # ein toter Knoten stoppt nicht die anderen
+      matrix:
+        node:
+          - { id: mix-eu, host_secret: MIX_EU_HOST }
+          - { id: mix-us, host_secret: MIX_US_HOST }
+          - { id: mix-ap, host_secret: MIX_AP_HOST }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Überspringen, wenn nicht ausgewählt
+        id: check
+        run: |
+          want="${{ inputs.node }}"
+          if [ "$want" != "alle" ] && [ "$want" != "${{ matrix.node.id }}" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Host konfiguriert?
+        if: steps.check.outputs.skip != 'true'
+        id: have
+        env:
+          HOST: ${{ secrets[matrix.node.host_secret] }}
+        run: |
+          if [ -z "$HOST" ]; then
+            echo "::notice::${{ matrix.node.id }} nicht konfiguriert — übersprungen"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: SSH vorbereiten
+        if: steps.check.outputs.skip != 'true' && steps.have.outputs.skip != 'true'
+        env:
+          KEY: ${{ secrets.MIX_SSH_KEY }}
+          HOST: ${{ secrets[matrix.node.host_secret] }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Hostschlüssel festnageln statt blind vertrauen
+          if [ -n "${{ secrets.MIX_KNOWN_HOSTS }}" ]; then
+            echo "${{ secrets.MIX_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "${HOST#*@}" >> ~/.ssh/known_hosts 2>/dev/null
+            echo "::warning::MIX_KNOWN_HOSTS nicht gesetzt — Hostschlüssel ungeprüft übernommen"
+          fi
+
+      - name: Dateien übertragen
+        if: steps.check.outputs.skip != 'true' && steps.have.outputs.skip != 'true'
+        env:
+          HOST: ${{ secrets[matrix.node.host_secret] }}
+        run: |
+          # Nur was der Knoten braucht. Kein Serverquelltext, keine Tests.
+          scp -o BatchMode=yes mixnet.js mix-node.js "$HOST:/opt/securechat/"
+
+      - name: Dienst neu starten
+        if: steps.check.outputs.skip != 'true' && steps.have.outputs.skip != 'true'
+        env:
+          HOST: ${{ secrets[matrix.node.host_secret] }}
+        run: |
+          ssh -o BatchMode=yes "$HOST" '
+            set -e
+            sudo systemctl restart securechat-mix
+            sleep 3
+            sudo systemctl is-active --quiet securechat-mix
+          '
+
+      - name: Erreichbarkeit prüfen
+        if: steps.check.outputs.skip != 'true' && steps.have.outputs.skip != 'true'
+        env:
+          URL: ${{ vars[format('{0}_URL', matrix.node.id)] }}
+        run: |
+          [ -z "$URL" ] && { echo "keine URL hinterlegt, übersprungen"; exit 0; }
+          for i in $(seq 1 20); do
+            if curl -sf "$URL/info" | grep -q '"id"'; then
+              echo "  ok  ${{ matrix.node.id }} antwortet"; exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::${{ matrix.node.id }} antwortet nicht"; exit 1
+
+  # Prüft, dass die Knoten wirklich verschiedene Schlüssel haben.
+  # Gleiche Schlüssel hießen: derselbe Knoten mehrfach — dann ist das
+  # Mixnet ein umständlicher Proxy.
+  verify:
+    name: Knoten sind verschieden
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Schlüssel vergleichen
+        env:
+          URLS: ${{ vars.MIX_NODE_URLS }}
+        run: |
+          [ -z "$URLS" ] && { echo "keine Knoten hinterlegt"; exit 0; }
+          keys=""
+          for u in $URLS; do
+            k=$(curl -sf "$u/info" | sed -n 's/.*"pub":"\([^"]*\)".*/\1/p') || continue
+            echo "  $u → ${k:0:16}…"
+            keys="$keys$k"$'\n'
+          done
+          n=$(printf '%s' "$keys" | grep -c .)
+          u=$(printf '%s' "$keys" | sort -u | grep -c .)
+          if [ "$n" != "$u" ]; then
+            echo "::error::Knoten teilen sich Schlüssel — kein echtes Mixnet"
+            exit 1
+          fi
+          echo "  ok  $u Knoten mit verschiedenen Schlüsseln"

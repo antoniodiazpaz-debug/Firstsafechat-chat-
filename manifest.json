@@ -1,0 +1,22 @@
+{
+  "name": "SecureChat",
+  "short_name": "SecureChat",
+  "description": "Ende-zu-Ende verschlüsselter Messenger",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b141a",
+  "theme_color": "#111b21",
+  "lang": "de",
+  "categories": ["social", "communication"],
+  "icons": [
+    { "src": "/icons/192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Neuer Chat", "url": "/?action=new", "icons": [{ "src": "/icons/192.png", "sizes": "192x192" }] }
+  ],
+  "prefer_related_applications": false
+}

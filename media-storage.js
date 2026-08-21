@@ -1,123 +1,149 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   MEDIA-STORAGE — getrennter Weg für Fotos, Videos, Profilbilder
+   MEDIA-STORAGE — clientseitige Verschlüsselung + direkter R2-Upload
    ─────────────────────────────────────────────────────────────────────
-   Warum getrennt vom Ratchet/Mixnet-Pfad: Die Mixnet-Nutzlast ist auf
-   7 KB begrenzt (feste Paketgröße ist die Voraussetzung für Anonymität).
-   Ein 500-KB-Foto passt dort nicht hinein, und würde man es fragmentieren,
-   wäre das Muster von 96 Paketen zum selben Empfänger ein Fingerabdruck,
-   den jeder Beobachter erkennt.
+   Läuft im BROWSER, nicht auf dem Server. Ablauf für einen Upload:
 
-   Deshalb: Datei bekommt einen eigenen, zufälligen AES-Schlüssel,
-   wird damit verschlüsselt und nach R2 hochgeladen. NUR der Schlüssel
-   und ein Pfad — etwa 250 Byte — reisen durch den geschützten Weg
-   (Ratchet + Mixnet). Der Speicher selbst sieht nur einen undurchsichtigen
-   Blob ohne Namen. Signal macht Anhänge auf demselben Weg: über ein CDN,
-   nicht durch die Sealed-Sender-Kette.
+   1. Zufälligen AES-256-Schlüssel erzeugen (bleibt beim Client bzw.
+      wird — bei Chat-Anhängen — über den bereits verschlüsselten
+      Ratchet-Kanal an den Empfänger mitgeschickt, NIE über den Server
+      im Klartext).
+   2. Datei mit diesem Schlüssel lokal verschlüsseln (AES-GCM, dasselbe
+      Verfahren wie crypto-core.js für Nachrichten — siehe dort P.seal).
+   3. Presigned-Upload-URL vom Server holen (POST /api/media/upload-url)
+      — der Server sieht dabei nur an, DASS eine Datei kommt, nie WAS.
+   4. Verschlüsselte Bytes direkt per PUT zu R2 hochladen — der Server
+      ist an diesem Schritt gar nicht mehr beteiligt.
+   5. Den vom Server vergebenen Pfad + den lokalen AES-Schlüssel behalten
+      (Pfad geht z. B. als avatarPath an /api/profile/avatar, der
+      Schlüssel bei Chat-Anhängen zusätzlich verschlüsselt an den
+      Empfänger).
 
-   Ehrlicher Kompromiss: Für Medien ist der Absender wieder sichtbar,
-   weil der Client direkt mit dem Speicher spricht. Der Nutzer sieht das
-   am Symbol an der Nachricht (📎 statt 🔒) — siehe media-badge in bubble().
+   Download läuft spiegelbildlich: Presigned-Download-URL holen, Bytes
+   laden, mit demselben AES-Schlüssel lokal entschlüsseln.
    ═══════════════════════════════════════════════════════════════════════ */
 
-const te = new TextEncoder();
-const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
-const ub64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const SC = window.crypto?.subtle;
+if (!SC) throw new Error('WebCrypto nicht verfügbar — bitte HTTPS oder localhost.');
 
-export const LIMITS = {
-  profileImage: 100 * 1024,
-  photo:        2 * 1024 * 1024,
-  video:        20 * 1024 * 1024,
-  audio:        8 * 1024 * 1024,
-  file:         10 * 1024 * 1024
-};
-
-/* ── Clientseitige Verkleinerung — der größte Hebel gegen Speicherkosten ── */
-export async function shrinkImage(file, maxDim = 1600, quality = 0.8) {
-  if (!file.type.startsWith('image/')) return file;
-  const bmp = await createImageBitmap(file).catch(() => null);
-  if (!bmp) return file;                          // z. B. HEIC ohne Decoder
-
-  const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
-  const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
-  const canvas = new OffscreenCanvas(w, h);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(bmp, 0, 0, w, h);
-  bmp.close?.();
-
-  const blob = await canvas.convertToBlob({ type: 'image/webp', quality });
-  return blob.size < file.size ? blob : file;      // nie größer machen
+/* ─────────────────────────────────────────────────────────────────────
+   Verschlüsselung — dieselbe AES-GCM-Machart wie crypto-core.js, damit
+   im Projekt nur ein einziges Verschlüsselungsmuster existiert.
+───────────────────────────────────────────────────────────────────── */
+async function generateFileKey() {
+  const raw = crypto.getRandomValues(new Uint8Array(32));   // AES-256
+  return raw;
 }
 
-export async function shrinkProfileImage(file) {
-  const bmp = await createImageBitmap(file).catch(() => null);
-  if (!bmp) return file;
-  const size = 128;
-  const canvas = new OffscreenCanvas(size, size);
-  const ctx = canvas.getContext('2d');
-  const s = Math.min(bmp.width, bmp.height);
-  ctx.drawImage(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s, 0, 0, size, size);
-  bmp.close?.();
-  return canvas.convertToBlob({ type: 'image/webp', quality: 0.85 });
-}
-
-/* ── Winzige Vorschau (Blurhash-ähnlich): 8×8 Pixel als Base64-PNG.
-   Kostet ~200 Byte, reist im Ratchet mit, zeigt sofort etwas an,
-   während die eigentliche Datei noch lädt. ── */
-export async function tinyPreview(file) {
-  if (!file.type.startsWith('image/')) return null;
-  const bmp = await createImageBitmap(file).catch(() => null);
-  if (!bmp) return null;
-  const canvas = new OffscreenCanvas(8, 8);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(bmp, 0, 0, 8, 8);
-  bmp.close?.();
-  const blob = await canvas.convertToBlob({ type: 'image/png' });
-  return b64(await blob.arrayBuffer());
-}
-
-/* ── Verschlüsseln + Hochladen ── */
-export async function uploadMedia(file, { uploadUrl, kind }) {
-  const limit = LIMITS[kind] || LIMITS.file;
-  if (file.size > limit)
-    throw new Error(`Datei zu groß (${(file.size/1048576).toFixed(1)} MB, Limit ${(limit/1048576).toFixed(0)} MB)`);
-
-  const fileKey = crypto.getRandomValues(new Uint8Array(32));
+async function encryptFile(fileBuf, rawKey) {
+  const key = await SC.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await crypto.subtle.importKey('raw', fileKey, 'AES-GCM', false, ['encrypt']);
-  const buf = await file.arrayBuffer();
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, buf);
+  const ct = await SC.encrypt({ name: 'AES-GCM', iv }, key, fileBuf);
+  /* iv wird VOR den Chiffretext gestellt — der Empfänger liest die
+     ersten 12 Byte als iv, den Rest als Chiffretext. Kein separates
+     Metadatenfeld nötig, eine einzige zusammenhängende Byte-Folge geht
+     zu R2. */
+  const out = new Uint8Array(iv.length + ct.byteLength);
+  out.set(iv, 0);
+  out.set(new Uint8Array(ct), iv.length);
+  return out;
+}
 
-  const path = crypto.randomUUID() + '.bin';    // kein Name, keine Endung im Speicher
+async function decryptFile(encryptedBuf, rawKey) {
+  const bytes = new Uint8Array(encryptedBuf);
+  const iv = bytes.slice(0, 12);
+  const ct = bytes.slice(12);
+  const key = await SC.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt']);
+  return SC.decrypt({ name: 'AES-GCM', iv }, key, ct);
+}
 
-  const res = await fetch(uploadUrl.replace('{path}', path), {
+/* ─────────────────────────────────────────────────────────────────────
+   Bildverkleinerung — vor dem Verschlüsseln, damit Profilbilder/
+   Anhänge nicht unnötig groß werden. Nur für Bilder relevant;
+   PDFs/Videos/etc. laufen unverändert durch encryptFile().
+───────────────────────────────────────────────────────────────────── */
+async function shrinkImage(file, maxDim = 1600, quality = 0.82) {
+  if (!file.type.startsWith('image/')) return file;   // kein Bild — unverändert lassen
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1) { bitmap.close(); return file; }    // bereits klein genug
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+  return new File([blob], file.name, { type: 'image/jpeg' });
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   Upload: Server-Presign holen, dann DIREKT zu R2 hochladen
+───────────────────────────────────────────────────────────────────── */
+async function uploadMedia(file, { apiFetch }) {
+  /* apiFetch ist der bereits mit Auth-Header ausgestattete fetch-Wrapper
+     der aufrufenden App (z. B. aus api-client.js) — media-storage.js
+     kennt selbst keine Tokens, um Kopplung gering zu halten. */
+  const presignRes = await apiFetch('/api/media/upload-url', { method: 'POST' });
+  if (!presignRes.ok) {
+    const body = await presignRes.json().catch(() => ({}));
+    throw new Error(body.error || 'Kein Medien-Upload möglich (Server antwortete ' + presignRes.status + ')');
+  }
+  const { path, uploadUrl } = await presignRes.json();
+
+  const rawKey = await generateFileKey();
+  const fileBuf = await file.arrayBuffer();
+  const encrypted = await encryptFile(fileBuf, rawKey);
+
+  const putRes = await fetch(uploadUrl, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: ct
+    body: encrypted
+    /* Bewusst KEIN Content-Type-Header hier — die Presigned URL wurde
+       ohne signierten Content-Type erzeugt (siehe r2-presign.js-
+       Kommentar: das Signieren von Content-Type lässt Browser-Uploads
+       öfter an 403 scheitern, weil der tatsächlich gesendete Header
+       nicht immer exakt dem entspricht, der beim Signieren erwartet
+       wurde). */
   });
-  if (!res.ok) throw new Error('Upload fehlgeschlagen: ' + res.status);
+  if (!putRes.ok) throw new Error('Upload zu R2 fehlgeschlagen (Status ' + putRes.status + ')');
 
-  return {
-    path, key: b64(fileKey), iv: b64(iv),
-    size: file.size, mime: file.type,
-    preview: await tinyPreview(file)
-  };
+  return { path, key: rawKey, size: encrypted.byteLength, mime: file.type, name: file.name };
 }
 
-/* ── Herunterladen + Entschlüsseln ── */
-export async function downloadMedia(ref, { downloadUrl }) {
-  const res = await fetch(downloadUrl.replace('{path}', ref.path));
-  if (!res.ok) throw new Error('Datei nicht gefunden (' + res.status + ')');
-  const ct = await res.arrayBuffer();
+/* ─────────────────────────────────────────────────────────────────────
+   Download: Server-Presign holen, Bytes laden, lokal entschlüsseln
+───────────────────────────────────────────────────────────────────── */
+async function downloadMedia(path, rawKey, { apiFetch }) {
+  const presignRes = await apiFetch('/api/media/download-url?path=' + encodeURIComponent(path));
+  if (!presignRes.ok) {
+    const body = await presignRes.json().catch(() => ({}));
+    throw new Error(body.error || 'Kein Medien-Download möglich (Server antwortete ' + presignRes.status + ')');
+  }
+  const { downloadUrl } = await presignRes.json();
 
-  const key = await crypto.subtle.importKey('raw', ub64(ref.key), 'AES-GCM', false, ['decrypt']);
-  const buf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(ref.iv) }, key, ct);
-  return new Blob([buf], { type: ref.mime || 'application/octet-stream' });
+  const getRes = await fetch(downloadUrl);
+  if (!getRes.ok) throw new Error('Herunterladen von R2 fehlgeschlagen (Status ' + getRes.status + ')');
+  const encrypted = await getRes.arrayBuffer();
+
+  return decryptFile(encrypted, rawKey);
 }
 
-/* ── Referenz, die durch Ratchet + Mixnet reist — bewusst winzig ── */
-export function mediaReference(uploaded) {
-  return {
-    path: uploaded.path, key: uploaded.key, iv: uploaded.iv,
-    size: uploaded.size, mime: uploaded.mime, preview: uploaded.preview
-  };
+/* Kompakte, weitergebbare Referenz — das ist es, was tatsächlich an
+   einen Chat-Partner geschickt wird (über den bereits verschlüsselten
+   Ratchet-Kanal, NICHT über den Server im Klartext): Pfad + Schlüssel
+   zusammen als eine einzige Zeichenkette. */
+function mediaReference(uploadResult) {
+  const keyB64 = btoa(String.fromCharCode(...uploadResult.key));
+  return `${uploadResult.path}:${keyB64}:${uploadResult.mime}:${uploadResult.name}`;
 }
+function parseMediaReference(ref) {
+  const [path, keyB64, mime, ...nameParts] = ref.split(':');
+  const key = Uint8Array.from(atob(keyB64), c => c.charCodeAt(0));
+  return { path, key, mime, name: nameParts.join(':') };
+}
+
+export {
+  generateFileKey, encryptFile, decryptFile, shrinkImage,
+  uploadMedia, downloadMedia, mediaReference, parseMediaReference
+};

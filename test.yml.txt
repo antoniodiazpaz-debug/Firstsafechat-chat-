@@ -1,0 +1,204 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Ältere Läufe desselben Branches abbrechen — spart Minuten
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════
+  # Reine Krypto-Logik, ohne Server
+  # ═══════════════════════════════════════════════════════════════
+  unit:
+    name: Krypto & Mixnet-Kern
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite braucht mindestens 22.5
+          node-version: '22'
+
+      - name: Syntaxprüfung
+        run: |
+          for f in server.js mixnet.js mix-node.js; do
+            node --check "$f" && echo "  ok  $f"
+          done
+
+      - name: Mixnet-Kern
+        run: node test-mixnet.js
+
+      - name: Protokollversion / Migration (PATH_LENGTH-Wechsel)
+        run: node test-mixnet-versioning.js
+
+      - name: Mixnet über getrennte Prozesse
+        run: node test-mix-remote.js
+        timeout-minutes: 3
+
+      - name: Medien-Verschlüsselung (Rundlauf)
+        run: node test-media-storage.mjs
+
+      - name: R2-Worker (Kontingent, Pfadprüfung, Zugriffsrechte)
+        run: node test-media-worker.mjs
+
+  # ═══════════════════════════════════════════════════════════════
+  # Vollständige Kette gegen den laufenden Server
+  # ═══════════════════════════════════════════════════════════════
+  integration:
+    name: Protokollkette
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Server starten
+        run: |
+          node server.js > server.log 2>&1 &
+          echo $! > server.pid
+          # Warten, bis er wirklich antwortet — nicht blind schlafen
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8787/api/health > /dev/null 2>&1; then
+              echo "Server bereit nach ${i}00 ms"; exit 0
+            fi
+            sleep 0.1
+          done
+          echo "Server kam nicht hoch:"; cat server.log; exit 1
+
+      - name: Protokollkette Ende zu Ende
+        run: node test-e2e.mjs
+        timeout-minutes: 3
+
+      - name: Sealed Sender
+        run: node test-sealed.mjs
+        timeout-minutes: 3
+
+      - name: Mixnet über HTTP
+        run: node test-mix-integration.mjs
+        timeout-minutes: 5
+
+      - name: Server beenden
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
+
+      - name: Serverprotokoll bei Fehlschlag
+        if: failure()
+        run: cat server.log
+
+  # ═══════════════════════════════════════════════════════════════
+  # Prüft, dass die Datenbank wirklich keinen Klartext enthält.
+  # Eigener Job, weil das die zentrale Zusicherung des Projekts ist.
+  # ═══════════════════════════════════════════════════════════════
+  no-plaintext:
+    name: Kein Klartext in der Datenbank
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Server starten und Verkehr erzeugen
+        run: |
+          node server.js > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8787/api/health > /dev/null 2>&1 && break
+            sleep 0.1
+          done
+          node test-e2e.mjs > /dev/null
+          node test-sealed.mjs > /dev/null
+          kill "$(cat server.pid)" 2>/dev/null || true
+          sleep 1
+
+      - name: Datenbank nach Klartext durchsuchen
+        run: |
+          node -e '
+            const { DatabaseSync } = require("node:sqlite");
+            const db = new DatabaseSync("./securechat.db", { readOnly: true });
+            const rows = db.prepare("SELECT * FROM envelopes").all();
+            const blob = JSON.stringify(rows);
+            // Genau die Zeichenketten, die die Tests verschicken
+            const verboten = [
+              "Hallo Bob", "geheime-nutzlast", "durch drei Mix-Knoten",
+              "Zweite Nachricht", "Antwort von Bob"
+            ];
+            let treffer = 0;
+            for (const w of verboten) {
+              if (blob.includes(w)) { console.error("GEFUNDEN:", w); treffer++; }
+            }
+            const mitAbsender = rows.filter(r => r.sealed && r.sender_id !== null);
+            if (mitAbsender.length) {
+              console.error("Versiegelte Umschläge mit Absender:", mitAbsender.length);
+              treffer++;
+            }
+            console.log(`${rows.length} Umschläge geprüft, ${treffer} Beanstandungen`);
+            process.exit(treffer ? 1 : 0);
+          '
+
+  # ═══════════════════════════════════════════════════════════════
+  # Geheimnisse und Abhängigkeiten
+  # ═══════════════════════════════════════════════════════════════
+  hygiene:
+    name: Repo-Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gesamte Historie für die Geheimnissuche
+
+      - name: Keine Schlüsseldateien eingecheckt
+        run: |
+          muster='log-signing-key.json|mixkey-.*\.json|witnesses\.json|\.pem$|\.key$|\.db$|^\.env$'
+          if git ls-files | grep -E "$muster"; then
+            echo "::error::Schlüssel- oder Datenbankdatei im Repository"
+            exit 1
+          fi
+          echo "  ok  keine Schlüsseldateien versioniert"
+
+      - name: Auch nicht in der Historie
+        run: |
+          if git log --all --diff-filter=A --name-only --pretty=format: \
+             | sort -u | grep -E 'log-signing-key\.json|mixkey-.*\.json|\.pem$'; then
+            echo "::error::Schlüssel war in der Historie — neu erzeugen und alten sperren"
+            exit 1
+          fi
+          echo "  ok  Historie sauber"
+
+      - name: Keine hartkodierten Zugangsdaten
+        run: |
+          # Supabase-Service-Keys und übliche Token-Formate
+          treffer=$(grep -rnE \
+            'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|sk_live_|SUPABASE_SERVICE_ROLE_KEY *= *["'"'"'][^"'"'"']' \
+            --include='*.js' --include='*.mjs' --include='*.html' --include='*.json' . \
+            || true)
+          if [ -n "$treffer" ]; then
+            echo "::error::Mögliche Zugangsdaten im Quelltext"
+            echo "$treffer"
+            exit 1
+          fi
+          echo "  ok  keine Zugangsdaten gefunden"
+
+      - name: Keine Fremdabhängigkeiten
+        run: |
+          # Das Projekt kommt bewusst ohne npm-Pakete aus.
+          if [ -f package.json ] && \
+             node -e 'const p=require("./package.json");
+                      process.exit(Object.keys(p.dependencies||{}).length ? 0 : 1)'; then
+            echo "::warning::Laufzeitabhängigkeiten hinzugekommen — bewusste Entscheidung?"
+          fi
+          if grep -rn "require('[^n.]" --include='*.js' server.js mixnet.js mix-node.js \
+             | grep -v "node:"; then
+            echo "::error::Import außerhalb der Node-Bordmittel"
+            exit 1
+          fi
+          echo "  ok  weiterhin abhängigkeitsfrei"
