@@ -989,10 +989,32 @@ const routes = {
     const code = String(crypto.randomInt(100000, 1000000));
     const codeHash = b64(sha256(Buffer.from(code)));
     await q.putEmailCode.run(a.user.id, codeHash, Date.now(), Date.now() + 15 * 60000);
-    await MAIL.sendVerificationCode(a.user.email, code).catch(err => {
-      throw new Error('Mailversand fehlgeschlagen: ' + err.message);
-    });
+    try {
+      await MAIL.sendVerificationCode(a.user.email, code);
+    } catch (err) {
+      /* Den genauen Fehler direkt in der Antwort zurückgeben, statt ihn
+         nur ins Log zu schreiben — spart das ständige Wechseln zwischen
+         Testseite und Fly.io-Logs während der Fehlersuche. TEMPORÄR:
+         sollte entfernt werden, sobald SMTP zuverlässig funktioniert,
+         da Fehlerdetails eines Mailservers nicht dauerhaft öffentlich
+         zugänglich sein sollten. */
+      return json(res, 500, { error: 'Mailversand fehlgeschlagen', detail: err.message });
+    }
     json(res, 200, { sent: true });
+  },
+
+  /* TEMPORÄR — nur zur Fehlersuche: zeigt, welche SMTP_*-Variablen
+     tatsächlich gesetzt sind, OHNE deren Werte preiszugeben. Nach
+     erfolgreicher SMTP-Einrichtung wieder entfernen. */
+  'GET /api/debug/smtp-config': async (req, res) => {
+    json(res, 200, {
+      SMTP_HOST: process.env.SMTP_HOST || '(nicht gesetzt)',
+      SMTP_PORT: process.env.SMTP_PORT || '(nicht gesetzt, Standard 587)',
+      SMTP_USER: process.env.SMTP_USER || '(nicht gesetzt)',
+      SMTP_PASS_gesetzt: !!process.env.SMTP_PASS,
+      SMTP_PASS_länge: process.env.SMTP_PASS ? process.env.SMTP_PASS.length : 0,
+      SMTP_FROM: process.env.SMTP_FROM || '(nicht gesetzt, nutzt SMTP_USER)'
+    });
   },
 
   /* Login auf einem BEKANNTEN Gerät (deviceId aus vorherigem Login/Pairing
