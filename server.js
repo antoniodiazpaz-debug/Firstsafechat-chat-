@@ -559,7 +559,19 @@ function consistencyProof(m, lv) {
   return subproof(m, lv, true);
 }
 const entryBytes = e => Buffer.from(['kt-v1', e.user_id, e.key_x, e.key_y, e.version].join('|'));
-const allLeaves = async () => (await q.ktLeaves.all()).map(r => ub64(r.leaf_hash));
+/* Array.from() erzwingt hier explizit ein ECHTES Array, unabhängig
+   davon, was der jeweilige Datenbanktreiber für .all() zurückgibt.
+   Grund: bei einem Wechsel von node:sqlite (liefert immer ein reines
+   Array) zu @neondatabase/serverless trat ein Fehler auf
+   ("lv.slice is not a function"), der nur erklärbar ist, wenn
+   q.ktLeaves.all() dort ein Array-ähnliches, aber kein echtes Array
+   zurückgab. .map() allein reicht nicht als Schutz, weil ein
+   .map()-Aufruf auf einem Nicht-Array-Objekt selbst schon fehlschlagen
+   würde (was hier NICHT der Fehler war) oder .map() vom jeweiligen
+   Objekt anders implementiert sein könnte. Array.from() normalisiert
+   zuverlässig auf ein natives Array, bevor die eigentliche MTH/
+   inclusionPath-Rekursion beginnt, die zwingend .slice() braucht. */
+const allLeaves = async () => Array.from(await q.ktLeaves.all()).map(r => ub64(r.leaf_hash));
 
 /* Neuen Identitätsschlüssel ins Log aufnehmen und STH veröffentlichen */
 async function ktAppend(userId, ikJwk) {
