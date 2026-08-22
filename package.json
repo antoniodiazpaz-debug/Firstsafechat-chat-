@@ -2,7 +2,7 @@
   "name": "securechat",
   "version": "1.0.0",
   "private": true,
-  "description": "Ende-zu-Ende-verschl\u00fcsselter Messenger \u2014 Server mit Turso/libSQL-Datenbank",
+  "description": "Ende-zu-Ende-verschlüsselter Messenger — Server mit Postgres/Neon-Datenbank",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,6 +11,8 @@
     "node": ">=22.5.0"
   },
   "dependencies": {
-    "@libsql/client": "^0.17.0"
+    "@neondatabase/serverless": "^1.1.0",
+    "ws": "^8.18.0",
+    "bufferutil": "^4.0.9"
   }
 }
