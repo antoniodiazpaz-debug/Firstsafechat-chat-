@@ -22,35 +22,19 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const PUSH = require('./push.js');
 const MAIL = require('./mail.js');
-const DB = require('./db-turso.js');
-const R2 = require('./r2-presign.js');
+const { DatabaseSync } = require('node:sqlite');
 const fs = require('node:fs');
 const path = require('node:path');
 
 const PORT = process.env.PORT || 8787;
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'securechat.db');
 const OPK_LOW_WATER = 5;
 
 /*───────────────────────────────────────────────────────────────────────────
   DATENBANK
-  ─────────────────────────────────────────────────────────────────────────
-  Turso/libSQL statt lokaler node:sqlite-Datei: die Datenbank überlebt
-  damit einen Neustart des Servers (wichtig z. B. bei Render, wo das
-  lokale Dateisystem flüchtig ist). TURSO_DATABASE_URL/TURSO_AUTH_TOKEN
-  kommen aus der Umgebung; ohne sie läuft eine lokale Datei (siehe
-  db-turso.js) — praktisch für Entwicklung ohne eigenes Turso-Konto.
 ───────────────────────────────────────────────────────────────────────────*/
-const db = DB.connect();
-
-/* WICHTIG: db.exec() ist jetzt asynchron (Turso/libSQL statt der
-   synchronen node:sqlite-API) — die gesamte restliche Server-Definition
-   (Statements, Routen, WebSocket-Handler, Serverstart) hängt direkt oder
-   indirekt von einer fertig aufgebauten Datenbank ab und läuft deshalb
-   innerhalb dieser async-Funktion. Das ist die zentrale strukturelle
-   Änderung der Turso-Migration: node:sqlite war komplett synchron und
-   erlaubte Top-Level-Code, Turso ist HTTP-basiert und asynchron. */
-async function main() {
-
-await db.exec(`
+const db = new DatabaseSync(DB_PATH);
+db.exec(`
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -554,30 +538,30 @@ function consistencyProof(m, lv) {
   return subproof(m, lv, true);
 }
 const entryBytes = e => Buffer.from(['kt-v1', e.user_id, e.key_x, e.key_y, e.version].join('|'));
-const allLeaves = async () => (await q.ktLeaves.all()).map(r => ub64(r.leaf_hash));
+const allLeaves = () => q.ktLeaves.all().map(r => ub64(r.leaf_hash));
 
 /* Neuen Identitätsschlüssel ins Log aufnehmen und STH veröffentlichen */
-async function ktAppend(userId, ikJwk) {
-  const prev = await q.ktLatestFor.get(userId);
+function ktAppend(userId, ikJwk) {
+  const prev = q.ktLatestFor.get(userId);
   const version = prev ? prev.version + 1 : 1;
-  const idx = (await q.ktCount.get()).n;
+  const idx = q.ktCount.get().n;
   const entry = { user_id: userId, key_x: ikJwk.x, key_y: ikJwk.y, version };
   const lh = leafHash(entryBytes(entry));
-  await q.ktAdd.run(idx, userId, ikJwk.x, ikJwk.y, version, b64(lh), Date.now());
+  q.ktAdd.run(idx, userId, ikJwk.x, ikJwk.y, version, b64(lh), Date.now());
   return publishSTH();
 }
-async function publishSTH() {
-  const lv = await allLeaves();
+function publishSTH() {
+  const lv = allLeaves();
   const size = lv.length;
   const root = MTH(lv);
   const ts = Date.now();
   const sig = signLog(['sth-v1', size, root.toString('hex'), ts].join('|'));
   const cosigs = collectCosigs({ size, root, ts });
-  await q.ktPutSTH.run(size, b64(root), ts, sig, JSON.stringify(cosigs));
+  q.ktPutSTH.run(size, b64(root), ts, sig, JSON.stringify(cosigs));
   return { size, root: b64(root), ts, sig, cosigs };
 }
-async function latestSTH() {
-  const r = await q.ktLatestSTH.get();
+function latestSTH() {
+  const r = q.ktLatestSTH.get();
   if (!r) return publishSTH();
   return { size: r.size, root: r.root, ts: r.ts, sig: r.signature, cosigs: JSON.parse(r.cosigs) };
 }
@@ -779,12 +763,12 @@ const mixNet = new MIX.MixNetwork(mixNodes, async (recipientId, payload) => {
   try { inner = JSON.parse(payload.toString('utf8')) }
   catch { return; }
   if (!inner.recipientDeviceId) return;
-  const dev = await q.deviceById.get(inner.recipientDeviceId);
+  const dev = q.deviceById.get(inner.recipientDeviceId);
   if (!dev || dev.user_id !== recipientId) return;
 
   const id = 'e' + crypto.randomBytes(10).toString('hex');
   const now = Date.now();
-  await q.putEnvelope.run(id, null, null, 1, recipientId, inner.recipientDeviceId,
+  q.putEnvelope.run(id, null, null, 1, recipientId, inner.recipientDeviceId,
     inner.convId || '', null, 'sealed', null, inner.sealed,
     inner.gossip ? JSON.stringify(inner.gossip) : null, now);
   deliverToDevice(inner.recipientDeviceId, {
@@ -822,14 +806,14 @@ const readBody = req => new Promise((resolve, reject) => {
    Gerät, nicht mehr direkt zum Nutzer. Routen, die eine Geräte-Identität
    brauchen (Prekeys, Senden), lesen device; Routen, die nur den Account
    betreffen (Profil, Kontaktliste), brauchen nur user. */
-async function auth(req) {
+function auth(req) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!token) return null;
-  const s = await q.session.get(token, Date.now());
+  const s = q.session.get(token, Date.now());
   if (!s) return null;
-  const user = await q.userById.get(s.user_id);
-  const device = await q.deviceById.get(s.device_id);
+  const user = q.userById.get(s.user_id);
+  const device = q.deviceById.get(s.device_id);
   if (!user || !device) return null;   // Gerät zwischenzeitlich entfernt
   return { user, device };
 }
@@ -878,28 +862,28 @@ const routes = {
     const b = await readBody(req);
     for (const f of ['name', 'password', 'ikDH', 'ikSign', 'spk', 'opks', 'deviceName', 'platform'])
       if (!b[f]) return json(res, 400, { error: `Feld fehlt: ${f}` });
-    if (await q.userByName.get(b.name)) return json(res, 409, { error: 'Name bereits vergeben' });
+    if (q.userByName.get(b.name)) return json(res, 409, { error: 'Name bereits vergeben' });
     if (String(b.password).length < 8) return json(res, 400, { error: 'Passwort zu kurz' });
-    if (b.email && await q.userByEmail.get(b.email)) return json(res, 409, { error: 'E-Mail bereits vergeben' });
+    if (b.email && q.userByEmail.get(b.email)) return json(res, 409, { error: 'E-Mail bereits vergeben' });
 
     const id = 'u' + crypto.randomBytes(8).toString('hex');
     const pw = hashPw(b.password);
     const now = Date.now();
-    await q.insertUser.run(id, b.name, b.phone || '', b.email || null, null, b.bio || '',
+    q.insertUser.run(id, b.name, b.phone || '', b.email || null, null, b.bio || '',
       pw.salt, pw.hash, now, now);
 
     const deviceId = 'd' + crypto.randomBytes(8).toString('hex');
-    await q.insertDevice.run(deviceId, id, b.deviceName, b.platform,
+    q.insertDevice.run(deviceId, id, b.deviceName, b.platform,
       JSON.stringify(b.ikDH), JSON.stringify(b.ikSign), 1, now, now);
-    await q.putSPK.run(deviceId, b.spk.spkId, JSON.stringify(b.spk.pub), b.spk.signature, b.spk.createdAt);
-    for (const o of b.opks) await q.addOPK.run(deviceId, o.opkId, JSON.stringify(o.pub));
+    q.putSPK.run(deviceId, b.spk.spkId, JSON.stringify(b.spk.pub), b.spk.signature, b.spk.createdAt);
+    for (const o of b.opks) q.addOPK.run(deviceId, o.opkId, JSON.stringify(o.pub));
 
     /* Das Transparenz-Log führt weiterhin über den NUTZER, nicht das
        Gerät — Kontakte verifizieren eine Person, kein einzelnes Handy.
        Bei Multi-Device zeigt der Log-Eintrag den Schlüssel des
        Hauptgeräts; jedes weitere Gerät wird separat über das Pairing
        autorisiert und bekommt keinen eigenen Log-Eintrag. */
-    const sth = await ktAppend(id, b.ikDH);
+    const sth = ktAppend(id, b.ikDH);
 
     /* Eigene Telefonnummer/E-Mail selbst hashen und unter der eigenen
        user_id hinterlegen — nur dadurch können ANDERE Nutzer diesen
@@ -908,74 +892,12 @@ const routes = {
        Treffer, weil kein Hash zum Vergleichen existierte. */
     const ownPhoneHash = contactHash(b.phone);
     const ownEmailHash = contactHash(b.email);
-    if (ownPhoneHash) await q.putSelfHash.run(id, ownPhoneHash);
-    if (ownEmailHash) await q.putSelfHash.run(id, ownEmailHash);
+    if (ownPhoneHash) q.putSelfHash.run(id, ownPhoneHash);
+    if (ownEmailHash) q.putSelfHash.run(id, ownEmailHash);
 
     const token = crypto.randomBytes(32).toString('hex');
-    await q.insertSession.run(token, id, deviceId, now, now + 30 * 864e5);
-
-    /* Verifizierungscode nur, wenn eine E-Mail angegeben wurde UND SMTP
-       konfiguriert ist. Ohne beides bleibt email_verified=0, das Konto
-       funktioniert trotzdem — siehe Kommentar an email_verifications
-       oben. Der Code selbst wird nie im Klartext gespeichert, nur sein
-       SHA-256-Hash (dieselbe Technik wie bei Passwörtern, sha256() ist
-       bereits weiter oben definiert). */
-    if (b.email && MAIL.isConfigured()) {
-      const code = String(crypto.randomInt(100000, 1000000));
-      const codeHash = b64(sha256(Buffer.from(code)));
-      await q.putEmailCode.run(id, codeHash, now, now + 15 * 60000);
-      MAIL.sendVerificationCode(b.email, code).catch(err =>
-        console.warn('Verifizierungsmail fehlgeschlagen:', err.message));
-    }
-
-    const newUser = await q.userById.get(id);
-    const newDevice = await q.deviceById.get(deviceId);
-    json(res, 201, { token, user: pub(newUser), device: pubDevice(newDevice), sth });
-  },
-
-  /* Code aus der Verifizierungsmail bestätigen. Höchstens 5 Versuche,
-     dann muss ein neuer Code angefordert werden — verhindert Erraten
-     der 6-stelligen Zahl per Brute-Force. */
-  'POST /api/verify-email': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const b = await readBody(req);
-    if (!b.code) return json(res, 400, { error: 'Code fehlt' });
-
-    const row = await q.getEmailCode.get(a.user.id);
-    if (!row) return json(res, 404, { error: 'Kein Code angefordert oder bereits verifiziert' });
-    if (row.expires_at < Date.now()) {
-      await q.dropEmailCode.run(a.user.id);
-      return json(res, 410, { error: 'Code abgelaufen — neuen anfordern' });
-    }
-    if (row.attempts >= 5) {
-      await q.dropEmailCode.run(a.user.id);
-      return json(res, 429, { error: 'Zu viele Fehlversuche — neuen Code anfordern' });
-    }
-
-    const givenHash = b64(sha256(Buffer.from(String(b.code))));
-    if (givenHash !== row.code_hash) {
-      await q.bumpEmailAttempts.run(a.user.id);
-      return json(res, 400, { error: 'Code falsch' });
-    }
-
-    await q.markEmailVerified.run(a.user.id);
-    await q.dropEmailCode.run(a.user.id);
-    json(res, 200, { verified: true });
-  },
-
-  /* Neuen Code anfordern — z. B. wenn der erste nie ankam oder abgelaufen ist. */
-  'POST /api/resend-verification': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    if (!a.user.email) return json(res, 400, { error: 'Kein E-Mail-Kontakt hinterlegt' });
-    if (!MAIL.isConfigured()) return json(res, 503, { error: 'Mailversand nicht konfiguriert' });
-
-    const code = String(crypto.randomInt(100000, 1000000));
-    const codeHash = b64(sha256(Buffer.from(code)));
-    await q.putEmailCode.run(a.user.id, codeHash, Date.now(), Date.now() + 15 * 60000);
-    await MAIL.sendVerificationCode(a.user.email, code).catch(err => {
-      throw new Error('Mailversand fehlgeschlagen: ' + err.message);
-    });
-    json(res, 200, { sent: true });
+    q.insertSession.run(token, id, deviceId, now, now + 30 * 864e5);
+    json(res, 201, { token, user: pub(q.userById.get(id)), device: pubDevice(q.deviceById.get(deviceId)), sth });
   },
 
   /* Login auf einem BEKANNTEN Gerät (deviceId aus vorherigem Login/Pairing
@@ -983,13 +905,13 @@ const routes = {
      /api/devices/pair-request ein neues Gerät anmelden. */
   'POST /api/login': async (req, res) => {
     const b = await readBody(req);
-    const u = await q.userByName.get(b.name || '');
+    const u = q.userByName.get(b.name || '');
     if (!u || !verifyPw(b.password || '', u))
       return json(res, 401, { error: 'Name oder Passwort falsch' });
 
     let device;
     if (b.deviceId) {
-      device = await q.deviceById.get(b.deviceId);
+      device = q.deviceById.get(b.deviceId);
       if (!device || device.user_id !== u.id)
         return json(res, 403, { error: 'Gerät gehört nicht zu diesem Konto oder wurde entfernt' });
     } else {
@@ -1007,89 +929,54 @@ const routes = {
 
     const token = crypto.randomBytes(32).toString('hex');
     const now = Date.now();
-    await q.insertSession.run(token, u.id, device.id, now, now + 30 * 864e5);
-    await q.touchUser.run(now, u.id);
-    await q.touchDevice.run(now, device.id);
-    json(res, 200, { token, user: pub(u), device: pubDevice(device), sth: await latestSTH() });
+    q.insertSession.run(token, u.id, device.id, now, now + 30 * 864e5);
+    q.touchUser.run(now, u.id);
+    q.touchDevice.run(now, device.id);
+    json(res, 200, { token, user: pub(u), device: pubDevice(device), sth: latestSTH() });
   },
 
   'POST /api/logout': async (req, res) => {
     const h = req.headers.authorization || '';
-    if (h.startsWith('Bearer ')) await q.dropSession.run(h.slice(7));
+    if (h.startsWith('Bearer ')) q.dropSession.run(h.slice(7));
     json(res, 200, { ok: true });
   },
 
   'GET /api/me': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const devices = await q.devicesOf.all(a.user.id);
-    const opkCount = await q.countOPK.get(a.device.id);
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     json(res, 200, {
       user: pub(a.user), device: pubDevice(a.device),
-      devices: devices.map(pubDevice),
-      opksLeft: opkCount.n
+      devices: q.devicesOf.all(a.user.id).map(pubDevice),
+      opksLeft: q.countOPK.get(a.device.id).n
     });
   },
 
   'POST /api/profile': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
-    await q.updateProfile.run(b.name || a.user.name, b.bio ?? a.user.bio, b.phone ?? a.user.phone, a.user.id);
-    json(res, 200, { user: pub(await q.userById.get(a.user.id)) });
-  },
-
-  /* Presigned-Upload-URL ausstellen: Client verschlüsselt die Datei
-     LOKAL im Browser (siehe media-storage.js), lädt sie dann DIREKT zu
-     R2 hoch — ohne Umweg über diesen Server. Der Server sieht nie den
-     Dateiinhalt, nur den (bereits eindeutigen, zufälligen) Objekt-
-     schlüssel, den er selbst vergeben hat. Ohne konfiguriertes R2
-     (R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY/R2_BUCKET)
-     liefert diese Route einen klaren 503 statt eines kryptischen
-     Absturzes — Medien-Uploads sind optional, der Rest der App bleibt
-     ohne sie voll nutzbar. */
-  'POST /api/media/upload-url': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    if (!R2.isConfigured()) return json(res, 503, { error: 'Medien-Speicher nicht konfiguriert' });
-    const key = R2.randomObjectKey();
-    const uploadUrl = R2.presign({ method: 'PUT', key, expiresInSeconds: 600 });
-    json(res, 200, { path: key, uploadUrl, expiresIn: 600 });
-  },
-
-  /* Presigned-Download-URL für einen bereits hochgeladenen Pfad —
-     nötig, weil R2-Objekte nicht standardmäßig öffentlich lesbar sind.
-     Kein Eigentumsnachweis über die Datenbank nötig: wer den (zufälligen,
-     36-stelligen UUID-artigen) Pfad kennt, hat ihn entweder selbst
-     hochgeladen oder über eine legitime Quelle bekommen (z. B. als
-     avatarPath eines Kontakts über /api/users). */
-  'GET /api/media/download-url': async (req, res, url) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    if (!R2.isConfigured()) return json(res, 503, { error: 'Medien-Speicher nicht konfiguriert' });
-    const path = url.searchParams.get('path');
-    if (!path || !/^[0-9a-f-]{36}\.bin$/.test(path))
-      return json(res, 400, { error: 'Ungültiger Medienpfad' });
-    const downloadUrl = R2.presign({ method: 'GET', key: path, expiresInSeconds: 600 });
-    json(res, 200, { downloadUrl, expiresIn: 600 });
+    q.updateProfile.run(b.name || a.user.name, b.bio ?? a.user.bio, b.phone ?? a.user.phone, a.user.id);
+    json(res, 200, { user: pub(q.userById.get(a.user.id)) });
   },
 
   /* Profilbild: Client lädt bereits verschlüsselt zu R2 hoch (siehe
      media-storage.js) und meldet hier nur den Pfad — der Server sieht
      nie das Bild selbst. */
   'POST /api/profile/avatar': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     if (!b.path || !/^[0-9a-f-]{36}\.bin$/.test(b.path))
       return json(res, 400, { error: 'Ungültiger Medienpfad' });
-    await q.updateAvatar.run(b.path, a.user.id);
-    json(res, 200, { user: pub(await q.userById.get(a.user.id)) });
+    q.updateAvatar.run(b.path, a.user.id);
+    json(res, 200, { user: pub(q.userById.get(a.user.id)) });
   },
 
   'GET /api/users': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const blockedRows = await q.blockedByMe.all(a.user.id);
-    const blocked = new Set(blockedRows.map(r => r.blocked_id));
-    const allUsersRows = await q.allUsers.all();
-    const candidates = allUsersRows.filter(x => x.id !== a.user.id && !blocked.has(x.id));
-    const users = await Promise.all(candidates.map(async x => pub(await q.userById.get(x.id))));
-    json(res, 200, { users });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const blocked = new Set(q.blockedByMe.all(a.user.id).map(r => r.blocked_id));
+    json(res, 200, {
+      users: q.allUsers.all()
+        .filter(x => x.id !== a.user.id && !blocked.has(x.id))
+        .map(x => pub(q.userById.get(x.id)))
+    });
   },
 
   /* ---- Geräte-Verwaltung (Multi-Device) ---- */
@@ -1098,10 +985,10 @@ const routes = {
      als QR. Ohne dieses Einverständnis kann sich kein zweites Gerät
      eintragen — reines Passwortwissen reicht nicht. */
   'POST /api/devices/pair-request': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const code = crypto.randomBytes(16).toString('hex');
     const now = Date.now();
-    await q.createPairing.run(code, a.user.id, now, now + 5 * 60000);   // 5 Minuten gültig
+    q.createPairing.run(code, a.user.id, now, now + 5 * 60000);   // 5 Minuten gültig
     json(res, 200, { code, expiresAt: now + 5 * 60000 });
   },
 
@@ -1113,55 +1000,50 @@ const routes = {
     for (const f of ['code', 'deviceName', 'platform', 'ikDH', 'ikSign', 'spk', 'opks'])
       if (!b[f]) return json(res, 400, { error: `Feld fehlt: ${f}` });
 
-    const pairing = await q.getPairing.get(b.code, Date.now());
+    const pairing = q.getPairing.get(b.code, Date.now());
     if (!pairing) return json(res, 410, { error: 'Code ungültig oder abgelaufen' });
-    await q.consumePairing.run(b.code);   // einmal verwendbar, auch bei Folgefehlern
+    q.consumePairing.run(b.code);   // einmal verwendbar, auch bei Folgefehlern
 
-    const user = await q.userById.get(pairing.user_id);
+    const user = q.userById.get(pairing.user_id);
     const deviceId = 'd' + crypto.randomBytes(8).toString('hex');
     const now = Date.now();
-    await q.insertDevice.run(deviceId, user.id, b.deviceName, b.platform,
+    q.insertDevice.run(deviceId, user.id, b.deviceName, b.platform,
       JSON.stringify(b.ikDH), JSON.stringify(b.ikSign), 0, now, now);
-    await q.putSPK.run(deviceId, b.spk.spkId, JSON.stringify(b.spk.pub), b.spk.signature, b.spk.createdAt);
-    for (const o of b.opks) await q.addOPK.run(deviceId, o.opkId, JSON.stringify(o.pub));
+    q.putSPK.run(deviceId, b.spk.spkId, JSON.stringify(b.spk.pub), b.spk.signature, b.spk.createdAt);
+    for (const o of b.opks) q.addOPK.run(deviceId, o.opkId, JSON.stringify(o.pub));
 
     const token = crypto.randomBytes(32).toString('hex');
-    await q.insertSession.run(token, user.id, deviceId, now, now + 30 * 864e5);
+    q.insertSession.run(token, user.id, deviceId, now, now + 30 * 864e5);
 
     /* Alle bereits angemeldeten Geräte des Nutzers informieren — vor
        allem das Hauptgerät zeigt "neues Gerät verbunden" an. */
-    const newDevicePub = pubDevice(await q.deviceById.get(deviceId));
-    const existingDevices = await q.devicesOf.all(user.id);
-    for (const d of existingDevices) {
-      if (d.id !== deviceId) deliverToDevice(d.id, { type: 'device-added', device: newDevicePub });
+    for (const d of q.devicesOf.all(user.id)) {
+      if (d.id !== deviceId) deliverToDevice(d.id, { type: 'device-added', device: pubDevice(q.deviceById.get(deviceId)) });
     }
-    json(res, 201, { token, user: pub(user), device: newDevicePub });
+    json(res, 201, { token, user: pub(user), device: pubDevice(q.deviceById.get(deviceId)) });
   },
 
   'GET /api/devices': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const devices = await q.devicesOf.all(a.user.id);
-    json(res, 200, { devices: devices.map(pubDevice), currentDeviceId: a.device.id });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    json(res, 200, { devices: q.devicesOf.all(a.user.id).map(pubDevice), currentDeviceId: a.device.id });
   },
 
   /* Gerät entfernen — jedes Gerät kann sich selbst entfernen, das
      Hauptgerät kann auch andere entfernen (verlorenes Handy usw.). */
   'POST /api/devices/revoke': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     const target = b.deviceId || a.device.id;
     if (target !== a.device.id && !a.device.is_primary)
       return json(res, 403, { error: 'Nur das Hauptgerät kann andere Geräte entfernen' });
-    const primaryCount = await q.hasPrimary.get(a.user.id);
-    if (primaryCount.n <= 1 && target === a.device.id && a.device.is_primary)
+    if (q.hasPrimary.get(a.user.id).n <= 1 && target === a.device.id && a.device.is_primary)
       return json(res, 400, { error: 'Letztes Hauptgerät kann nicht entfernt werden — Konto würde unzugänglich' });
 
-    await q.revokeDevice.run(Date.now(), target, a.user.id);
-    await q.dropDeviceSessions.run(target);
-    await q.dropPush.run(target);
+    q.revokeDevice.run(Date.now(), target, a.user.id);
+    q.dropDeviceSessions.run(target);
+    q.dropPush.run(target);
     deliverToDevice(target, { type: 'device-revoked' });
     json(res, 200, { ok: true });
-
   },
 
   /* ---- Push-Registrierung ----
@@ -1174,16 +1056,16 @@ const routes = {
     json(res, 200, { publicKey: vapidKeys.publicKey });
   },
   'POST /api/push/subscribe': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     if (!b.platform || !b.endpoint) return json(res, 400, { error: 'platform oder endpoint fehlt' });
     if (!['web', 'fcm'].includes(b.platform)) return json(res, 400, { error: 'Unbekannte Plattform' });
-    await q.putPush.run(a.device.id, b.platform, b.endpoint, b.p256dh || null, b.auth || null, Date.now());
+    q.putPush.run(a.device.id, b.platform, b.endpoint, b.p256dh || null, b.auth || null, Date.now());
     json(res, 200, { ok: true });
   },
   'POST /api/push/unsubscribe': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    await q.dropPush.run(a.device.id);
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    q.dropPush.run(a.device.id);
     json(res, 200, { ok: true });
   },
 
@@ -1193,21 +1075,21 @@ const routes = {
      Ohne Angabe: alle aktiven Geräte des Nutzers — der Client baut dann
      für jedes einzeln eine Ratchet-Sitzung auf. */
   'GET /api/bundle': async (req, res, url) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const targetUser = url.searchParams.get('user');
     const onlyDevice = url.searchParams.get('device');
-    const t = await q.userById.get(targetUser);
+    const t = q.userById.get(targetUser);
     if (!t) return json(res, 404, { error: 'Unbekannter Nutzer' });
-    if (await q.isBlocked.get(targetUser, a.user.id)) return json(res, 403, { error: 'Zustellung nicht möglich' });
+    if (q.isBlocked.get(targetUser, a.user.id)) return json(res, 403, { error: 'Zustellung nicht möglich' });
 
     const devices = onlyDevice
-      ? [await q.deviceById.get(onlyDevice)].filter(Boolean)
-      : await q.devicesOf.all(targetUser);
+      ? [q.deviceById.get(onlyDevice)].filter(Boolean)
+      : q.devicesOf.all(targetUser);
     if (!devices.length) return json(res, 404, { error: 'Kein aktives Gerät für diesen Nutzer' });
 
-    const entry = await q.ktLatestFor.get(targetUser);
-    const lv = await allLeaves();
-    const sth = await latestSTH();
+    const entry = q.ktLatestFor.get(targetUser);
+    const lv = allLeaves();
+    const sth = latestSTH();
     const ktProof = entry ? {
       entry: { userId: entry.user_id, keyX: entry.key_x, keyY: entry.key_y, version: entry.version },
       index: entry.idx, path: inclusionPath(entry.idx, lv).map(b64), sth
@@ -1215,52 +1097,42 @@ const routes = {
 
     const bundles = [];
     for (const dev of devices) {
-      const spk = await q.getSPK.get(dev.id);
+      const spk = q.getSPK.get(dev.id);
       if (!spk) continue;
-      /* WICHTIG, sicherheitsrelevant: takeOPK (auslesen) und markOPK
-         (als verbraucht markieren) müssen in dieser Reihenfolge und
-         beide vollständig abgeschlossen sein, bevor der nächste Schritt
-         läuft — sonst könnte derselbe One-Time-Prekey bei zwei schnell
-         aufeinanderfolgenden Anfragen zweimal ausgeliefert werden. Das
-         await hier stellt sicher, dass markOPK wirklich abgeschlossen
-         ist, bevor die Schleife zum nächsten Gerät weitergeht. */
-      const opk = await q.takeOPK.get(dev.id);
-      if (opk) await q.markOPK.run(Date.now(), opk.id);
-      const opksLeft = await q.countOPK.get(dev.id);
+      const opk = q.takeOPK.get(dev.id);
+      if (opk) q.markOPK.run(Date.now(), opk.id);
       bundles.push({
         deviceId: dev.id, deviceName: dev.name, isPrimary: !!dev.is_primary,
         ikDH: JSON.parse(dev.ik_dh), ikSign: JSON.parse(dev.ik_sign),
         spk: JSON.parse(spk.pub), spkId: spk.spk_id,
         spkCreatedAt: spk.created_at, spkSig: spk.signature,
         opk: opk ? JSON.parse(opk.pub) : null, opkId: opk ? opk.opk_id : null,
-        opksLeft: opksLeft.n
+        opksLeft: q.countOPK.get(dev.id).n
       });
     }
     json(res, 200, { bundles, kt: ktProof });
   },
 
   'POST /api/prekeys': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
-    if (b.spk) await q.putSPK.run(a.device.id, b.spk.spkId, JSON.stringify(b.spk.pub),
+    if (b.spk) q.putSPK.run(a.device.id, b.spk.spkId, JSON.stringify(b.spk.pub),
       b.spk.signature, b.spk.createdAt);
     let added = 0;
-    for (const o of (b.opks || [])) { await q.addOPK.run(a.device.id, o.opkId, JSON.stringify(o.pub)); added++; }
-    const available = await q.countOPK.get(a.device.id);
-    json(res, 200, { ok: true, added, available: available.n });
+    for (const o of (b.opks || [])) { q.addOPK.run(a.device.id, o.opkId, JSON.stringify(o.pub)); added++; }
+    json(res, 200, { ok: true, added, available: q.countOPK.get(a.device.id).n });
   },
-
 
   /* Rotation betrifft nur das Hauptgerät und damit den Log-Eintrag der
      Person — ein Zweitgerät hat ohnehin keinen eigenen Log-Eintrag. */
   'POST /api/rotate-identity': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     if (!a.device.is_primary)
       return json(res, 403, { error: 'Nur das Hauptgerät kann die Identität im Transparenz-Log rotieren' });
     const b = await readBody(req);
     if (!b.ikDH) return json(res, 400, { error: 'ikDH fehlt' });
-    await db.prepare('UPDATE devices SET ik_dh=? WHERE id=?').run(JSON.stringify(b.ikDH), a.device.id);
-    json(res, 200, { sth: await ktAppend(a.user.id, b.ikDH) });
+    db.prepare('UPDATE devices SET ik_dh=? WHERE id=?').run(JSON.stringify(b.ikDH), a.device.id);
+    json(res, 200, { sth: ktAppend(a.user.id, b.ikDH) });
   },
 
   /* ---- Nachrichten ---- */
@@ -1269,11 +1141,11 @@ const routes = {
      Ratchet-Zustand. Ein logischer "Send"-Aufruf des Nutzers wird also
      zu N Umschlägen, einem pro aktivem Gerät des Empfängers (Fanout). */
   'POST /api/send': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     if (!b.recipientId || !Array.isArray(b.perDevice) || !b.perDevice.length)
       return json(res, 400, { error: 'Empfänger oder perDevice-Liste fehlt' });
-    if (await q.isBlocked.get(b.recipientId, a.user.id))
+    if (q.isBlocked.get(b.recipientId, a.user.id))
       return json(res, 403, { error: 'Du wurdest von diesem Nutzer blockiert' });
 
     const now = Date.now();
@@ -1281,7 +1153,7 @@ const routes = {
     for (const d of b.perDevice) {
       if (!d.deviceId || !d.ciphertext) continue;
       const id = 'e' + crypto.randomBytes(10).toString('hex');
-      await q.putEnvelope.run(id, a.user.id, a.device.id, 0, b.recipientId, d.deviceId,
+      q.putEnvelope.run(id, a.user.id, a.device.id, 0, b.recipientId, d.deviceId,
         b.convId || '', b.groupId || null, b.kind || 'text',
         d.header ? JSON.stringify(d.header) : null, d.ciphertext,
         b.gossip ? JSON.stringify(b.gossip) : null, now);
@@ -1305,9 +1177,8 @@ const routes = {
   },
 
   'GET /api/inbox': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const pendingRows = await q.pending.all(a.device.id);
-    const rows = pendingRows.map(r => ({
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const rows = q.pending.all(a.device.id).map(r => ({
       id: r.id, senderId: r.sender_id, senderDeviceId: r.sender_device_id,
       sealed: !!r.sealed, convId: r.conv_id, groupId: r.group_id,
       kind: r.kind, header: r.header ? JSON.parse(r.header) : null,
@@ -1317,44 +1188,42 @@ const routes = {
   },
 
   'POST /api/ack': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     let n = 0;
-    for (const id of (b.ids || [])) { await q.ackEnvelope.run(Date.now(), id, a.device.id); n++; }
-    await q.purgeAcked.run(Date.now() - 7 * 864e5);
+    for (const id of (b.ids || [])) { q.ackEnvelope.run(Date.now(), id, a.device.id); n++; }
+    q.purgeAcked.run(Date.now() - 7 * 864e5);
     json(res, 200, { acked: n });
   },
 
   /* ---- Blockieren & Melden ---- */
   'POST /api/block': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     if (!b.userId) return json(res, 400, { error: 'userId fehlt' });
-    await q.addBlock.run(a.user.id, b.userId, Date.now());
+    q.addBlock.run(a.user.id, b.userId, Date.now());
     json(res, 200, { ok: true });
   },
-
   'POST /api/unblock': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
-    await q.removeBlock.run(a.user.id, b.userId || '');
+    q.removeBlock.run(a.user.id, b.userId || '');
     json(res, 200, { ok: true });
   },
   'GET /api/blocks': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const blockedRows = await q.blockedByMe.all(a.user.id);
-    json(res, 200, { blocked: blockedRows.map(r => r.blocked_id) });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    json(res, 200, { blocked: q.blockedByMe.all(a.user.id).map(r => r.blocked_id) });
   },
 
   /* Meldung überträgt NUR Kennung + Grund; Inhalt nur, wenn der Meldende
      ihn ausdrücklich beifügt — der Server hat bei E2EE sonst keinen
      Klartext (siehe reportMessage() im Client, APPSTORE-PWA.md Punkt 2). */
   'POST /api/report': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     if (!b.reportedId || !b.reason) return json(res, 400, { error: 'reportedId oder reason fehlt' });
     const id = 'rep' + crypto.randomBytes(8).toString('hex');
-    await q.addReport.run(id, a.user.id, b.reportedId, b.convId || null, b.reason,
+    q.addReport.run(id, a.user.id, b.reportedId, b.convId || null, b.reason,
       b.note || null, b.includedContent || null, Date.now());
     json(res, 200, { ok: true, id });
   },
@@ -1365,7 +1234,7 @@ const routes = {
      gegen Hash — er bekommt nie eine Nummer im Klartext, weder die
      eigenen Kontakte des Nutzers noch die anderer. */
   'POST /api/contacts/sync': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     if (!Array.isArray(b.hashes) || !b.hashes.length)
       return json(res, 400, { error: 'hashes fehlt oder leer' });
@@ -1373,20 +1242,20 @@ const routes = {
       return json(res, 400, { error: 'Zu viele Hashes auf einmal' });
 
     /* Bisherige Hashes ersetzen (Kontakte können gelöscht worden sein) */
-    await q.clearContactHashes.run(a.user.id);
+    q.clearContactHashes.run(a.user.id);
     for (const h of b.hashes) {
-      if (typeof h === 'string' && h.length <= 64) await q.putContactHash.run(a.user.id, h);
+      if (typeof h === 'string' && h.length <= 64) q.putContactHash.run(a.user.id, h);
     }
 
     /* Treffer: eigene Kontakt-Hashes, die dem SELBST-Hash eines anderen
        Nutzers entsprechen — heißt, diese Person hat diesen Nutzer im
        Adressbuch, und der andere Nutzer ist mit genau dieser Nummer/
        E-Mail registriert. */
-    const matches = await q.findByHash.all(a.user.id, a.user.id);
+    const matches = q.findByHash.all(a.user.id, a.user.id);
     const newMatches = [];
     for (const m of matches) {
-      if (!await q.wasNotified.get(a.user.id, m.matched_id)) {
-        await q.markNotified.run(a.user.id, m.matched_id, Date.now());
+      if (!q.wasNotified.get(a.user.id, m.matched_id)) {
+        q.markNotified.run(a.user.id, m.matched_id, Date.now());
         newMatches.push(m.matched_id);
       }
     }
@@ -1394,8 +1263,7 @@ const routes = {
     /* Push nur für WIRKLICH neue Treffer — sonst würde jeder erneute
        Sync (App-Start etc.) dieselbe Benachrichtigung wiederholen. */
     for (const matchedId of newMatches) {
-      const matchedDevices = await q.devicesOf.all(matchedId);
-      for (const d of matchedDevices) {
+      for (const d of q.devicesOf.all(matchedId)) {
         deliverToDevice(d.id, { type: 'contact-joined', userId: a.user.id });
         notifyOffline(d.id);
       }
@@ -1411,7 +1279,7 @@ const routes = {
 
   /* Kurzlebiges Absenderzertifikat holen (nur mit Login) */
   'GET /api/sender-certificate': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     json(res, 200, { certificate: issueSenderCertificate(a.user, a.device), logKey: logKeys.jwk, ttl: CERT_TTL });
   },
 
@@ -1419,10 +1287,10 @@ const routes = {
      Der Server speichert nur den Wert zum Vergleich — abgeleitet wird er
      clientseitig aus dem Profilschlüssel, den nur Kontakte kennen. */
   'POST /api/access-key': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     if (!b.uak) return json(res, 400, { error: 'uak fehlt' });
-    await q.setUAK.run(String(b.uak), b.allowSealed === false ? 0 : 1, a.user.id);
+    q.setUAK.run(String(b.uak), b.allowSealed === false ? 0 : 1, a.user.id);
     json(res, 200, { ok: true, allowSealed: b.allowSealed !== false });
   },
 
@@ -1439,20 +1307,20 @@ const routes = {
     if (!b.recipientId || !Array.isArray(b.perDevice) || !b.perDevice.length)
       return json(res, 400, { error: 'Empfänger oder perDevice-Liste fehlt' });
 
-    const target = await q.byUAK.get(b.recipientId, String(uak));
+    const target = q.byUAK.get(b.recipientId, String(uak));
     if (!target) return json(res, 403, { error: 'Zustellrecht ungültig oder abgelehnt' });
 
     const now = Date.now();
     const results = [];
     for (const d of b.perDevice) {
       if (!d.deviceId || !d.sealed) continue;
-      const dev = await q.deviceById.get(d.deviceId);
+      const dev = q.deviceById.get(d.deviceId);
       if (!dev || dev.user_id !== target.id) continue;   // fremdes/entferntes Gerät ignorieren
 
       const id = 'e' + crypto.randomBytes(10).toString('hex');
       /* sender_id UND sender_device_id bleiben NULL — der Server kann
          beide nicht ermitteln, das ist der ganze Zweck. */
-      await q.putEnvelope.run(id, null, null, 1, b.recipientId, d.deviceId,
+      q.putEnvelope.run(id, null, null, 1, b.recipientId, d.deviceId,
         b.convId || '', null, 'sealed', null, d.sealed,
         b.gossip ? JSON.stringify(b.gossip) : null, now);
 
@@ -1469,26 +1337,21 @@ const routes = {
     json(res, 200, { sentAt: now, results });
   },
   'POST /api/group': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     const id = 'g' + crypto.randomBytes(8).toString('hex');
-    await q.addGroup.run(id, b.name, b.avatar || '👥', a.user.id, Date.now());
-    await q.addMember.run(id, a.user.id, b.wrapped?.[a.user.id] || null, 1);
-    for (const m of (b.members || [])) await q.addMember.run(id, m, b.wrapped?.[m] || null, 0);
+    q.addGroup.run(id, b.name, b.avatar || '👥', a.user.id, Date.now());
+    q.addMember.run(id, a.user.id, b.wrapped?.[a.user.id] || null, 1);
+    for (const m of (b.members || [])) q.addMember.run(id, m, b.wrapped?.[m] || null, 0);
     json(res, 201, { groupId: id });
   },
 
   'GET /api/groups': async (req, res) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const groupRows = await q.groupsOf.all(a.user.id);
-    const gs = await Promise.all(groupRows.map(async g => {
-      const members = await q.membersOf.all(g.id);
-      const myWrapped = await q.myWrapped.get(g.id, a.user.id);
-      return {
-        id: g.id, name: g.name, avatar: g.avatar, ownerId: g.owner_id, createdAt: g.created_at,
-        members: members.map(m => ({ userId: m.user_id, isAdmin: !!m.is_admin })),
-        wrapped: myWrapped?.wrapped || null
-      };
+    const a = auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const gs = q.groupsOf.all(a.user.id).map(g => ({
+      id: g.id, name: g.name, avatar: g.avatar, ownerId: g.owner_id, createdAt: g.created_at,
+      members: q.membersOf.all(g.id).map(m => ({ userId: m.user_id, isAdmin: !!m.is_admin })),
+      wrapped: q.myWrapped.get(g.id, a.user.id)?.wrapped || null
     }));
     json(res, 200, { groups: gs });
   },
@@ -1501,35 +1364,33 @@ const routes = {
 
   'GET /api/kt/consistency': async (req, res, url) => {
     const from = parseInt(url.searchParams.get('from') || '0', 10);
-    const lv = await allLeaves();
+    const lv = allLeaves();
     json(res, 200, {
       from, to: lv.length,
       proof: consistencyProof(from, lv).map(b64),
-      sth: await latestSTH()
+      sth: latestSTH()
     });
   },
 
   'GET /api/kt/proof': async (req, res, url) => {
     const target = url.searchParams.get('user');
-    const e = await q.ktLatestFor.get(target);
+    const e = q.ktLatestFor.get(target);
     if (!e) return json(res, 404, { error: 'Kein Log-Eintrag' });
-    const lv = await allLeaves();
+    const lv = allLeaves();
     json(res, 200, {
       entry: { userId: e.user_id, keyX: e.key_x, keyY: e.key_y, version: e.version },
-      index: e.idx, path: inclusionPath(e.idx, lv).map(b64), sth: await latestSTH()
+      index: e.idx, path: inclusionPath(e.idx, lv).map(b64), sth: latestSTH()
     });
   },
 
   'GET /api/kt/history': async (req, res, url) => {
     const target = url.searchParams.get('user');
-    const lv = await allLeaves();
-    const historyRows = await q.ktByUser.all(target);
-    const sth = await latestSTH();
-    const rows = historyRows.map(e => ({
+    const lv = allLeaves();
+    const rows = q.ktByUser.all(target).map(e => ({
       version: e.version, keyX: e.key_x, keyY: e.key_y, index: e.idx,
       addedAt: e.added_at, path: inclusionPath(e.idx, lv).map(b64)
     }));
-    json(res, 200, { userId: target, entries: rows, sth });
+    json(res, 200, { userId: target, entries: rows, sth: latestSTH() });
   },
 
   /* ---- Mixnet ---- */
@@ -1583,15 +1444,11 @@ const routes = {
     nodes: mixNet.stats(), inFlight: mixNet.inFlight
   }),
 
-  'GET /api/health': async (req, res) => {
-    const allUsersRows = await q.allUsers.all();
-    const logSize = await q.ktCount.get();
-    json(res, 200, {
-      ok: true, users: allUsersRows.length,
-      logSize: logSize.n, online: live.size,
-      mixNodes: mixNodes.length, uptime: Math.round(process.uptime())
-    });
-  }
+  'GET /api/health': async (req, res) => json(res, 200, {
+    ok: true, users: q.allUsers.all().length,
+    logSize: q.ktCount.get().n, online: live.size,
+    mixNodes: mixNodes.length, uptime: Math.round(process.uptime())
+  })
 };
 
 /*───────────────────────────────────────────────────────────────────────────
@@ -1681,13 +1538,13 @@ const server = http.createServer(async (req, res) => {
 });
 
 /* WebSocket-Upgrade: Realtime-Zustellung und Präsenz */
-server.on('upgrade', async (req, sock) => {
+server.on('upgrade', (req, sock) => {
   const url = new URL(req.url, 'http://x');
   const token = url.searchParams.get('token');
-  const s = token && await q.session.get(token, Date.now());
+  const s = token && q.session.get(token, Date.now());
   const key = req.headers['sec-websocket-key'];
   if (!s || !key) { sock.end('HTTP/1.1 401 Unauthorized\r\n\r\n'); return; }
-  const device = await q.deviceById.get(s.device_id);
+  const device = q.deviceById.get(s.device_id);
   if (!device) { sock.end('HTTP/1.1 401 Unauthorized\r\n\r\n'); return; }   // Gerät entfernt
 
   sock.write(
@@ -1700,15 +1557,14 @@ server.on('upgrade', async (req, sock) => {
   if (!live.has(did)) live.set(did, new Set());
   live.get(did).add(sock);
   deviceOwner.set(did, uid);
-  await q.touchUser.run(Date.now(), uid);
-  await q.touchDevice.run(Date.now(), did);
+  q.touchUser.run(Date.now(), uid);
+  q.touchDevice.run(Date.now(), did);
   broadcastPresence(uid, true, did);
 
   /* Wartende Umschläge NUR für dieses Gerät nachliefern — jedes andere
      Gerät desselben Nutzers hat seine eigene, unabhängige Warteschlange
      (weil jedes einen eigenen Ratchet-Zustand mit dem Absender hat). */
-  const pendingRows = await q.pending.all(did);
-  for (const r of pendingRows) {
+  for (const r of q.pending.all(did)) {
     wsSend(sock, {
       type: 'envelope', id: r.id, senderId: r.sender_id, senderDeviceId: r.sender_device_id,
       sealed: !!r.sealed, convId: r.conv_id, groupId: r.group_id, kind: r.kind,
@@ -1716,22 +1572,22 @@ server.on('upgrade', async (req, sock) => {
       ciphertext: r.ciphertext, gossip: r.gossip ? JSON.parse(r.gossip) : null, sentAt: r.sent_at
     });
   }
-  wsSend(sock, { type: 'ready', userId: uid, deviceId: did, sth: await latestSTH() });
+  wsSend(sock, { type: 'ready', userId: uid, deviceId: did, sth: latestSTH() });
 
   let cleaned = false;
-  const cleanup = async () => {
+  const cleanup = () => {
     if (cleaned) return; cleaned = true;
     const set = live.get(did);
     if (set) { set.delete(sock); if (!set.size) { live.delete(did); deviceOwner.delete(did); } }
-    await q.touchUser.run(Date.now(), uid);
-    await q.touchDevice.run(Date.now(), did);
+    q.touchUser.run(Date.now(), uid);
+    q.touchDevice.run(Date.now(), did);
     broadcastPresence(uid, isOnline(uid), did);
     try { sock.destroy(); } catch {}
   };
 
-  const parse = makeWsParser(async msg => {
+  const parse = makeWsParser(msg => {
     if (msg.type === 'ack' && Array.isArray(msg.ids)) {
-      for (const id of msg.ids) await q.ackEnvelope.run(Date.now(), id, did);
+      for (const id of msg.ids) q.ackEnvelope.run(Date.now(), id, did);
     } else if (msg.type === 'typing' && msg.to) {
       deliverToUser(msg.to, { type: 'typing', from: uid, convId: msg.convId });
     } else if (msg.type === 'read' && msg.to) {
@@ -1763,14 +1619,14 @@ function broadcastPresence(uid, online, fromDeviceId) {
    deaktiviert oder Browserdaten gelöscht) wird automatisch entfernt,
    statt bei jeder künftigen Nachricht erneut ins Leere zu laufen. */
 async function notifyOffline(deviceId) {
-  const sub = await q.pushForDevice.get(deviceId);
+  const sub = q.pushForDevice.get(deviceId);
   if (!sub) return;
   try {
     let result;
     if (sub.platform === 'web') result = await sendWebPush(sub);
     else if (sub.platform === 'fcm') result = await sendFcmPush(sub);
     if (result?.expired) {
-      await q.dropPush.run(deviceId);
+      q.dropPush.run(deviceId);
       console.log('→ Abgelaufenes Push-Abo entfernt für Gerät', deviceId);
     }
   } catch (e) { console.warn('Push fehlgeschlagen:', e.message); }
@@ -1801,73 +1657,23 @@ async function sendFcmPush(sub) {
 
 /* Prekey-Pools überwachen und Clients zum Nachfüllen auffordern —
    pro GERÄT, weil jedes Gerät seinen eigenen One-Time-Prekey-Pool hat. */
-setInterval(async () => {
-  const allUsersRows = await q.allUsers.all();
-  for (const u of allUsersRows) {
-    const devices = await q.devicesOf.all(u.id);
-    for (const d of devices) {
-      const opkCount = await q.countOPK.get(d.id);
-      const n = opkCount.n;
+setInterval(() => {
+  for (const u of q.allUsers.all()) {
+    for (const d of q.devicesOf.all(u.id)) {
+      const n = q.countOPK.get(d.id).n;
       if (n < OPK_LOW_WATER) deliverToDevice(d.id, { type: 'need-prekeys', available: n });
     }
   }
 }, 60000).unref();
 
-/* Alte, bereits ZUGESTELLTE Nachrichten (inkl. Bild-/Datei-Anhänge, die
-   als Umschlag denselben envelopes-Weg nehmen) nach 7 Tagen entfernen.
-   Bewusst nur acked=1: eine Nachricht, die ein Empfänger noch nie
-   abgeholt hat (z. B. weil sein Gerät länger offline war), bleibt
-   erhalten, bis sie tatsächlich zugestellt wurde — sonst ginge sie
-   komplett verloren, bevor sie überhaupt ankam.
-
-   Lief bisher nur als Nebeneffekt von POST /api/ack (siehe dort) —
-   das heißt, ohne aktiven Client, der gerade quittiert, sammelten sich
-   alte Nachrichten unbegrenzt an. Als eigener Intervall-Job läuft das
-   Aufräumen jetzt zuverlässig, unabhängig davon, ob gerade ein Nutzer
-   aktiv ist. Einmal pro Stunde reicht bei einer Sieben-Tage-Frist völlig
-   aus; unref() verhindert, dass der Timer den Prozess am Beenden
-   hindert (Test-Skripte, sauberes Herunterfahren). */
-setInterval(async () => {
-  const cutoff = Date.now() - 7 * 864e5;
-  const result = await q.purgeAcked.run(cutoff);
-  if (result.changes > 0) {
-    console.log(`→ ${result.changes} zugestellte Nachricht(en) älter als 7 Tage entfernt`);
-  }
-}, 3600000).unref();
-
 if (require.main === module) {
-  const logSize = await q.ktCount.get();
-  /* WICHTIG: explizit auf 0.0.0.0 binden, nicht nur den Port angeben.
-     Ohne Host-Angabe kann Node je nach Container-Netzwerkkonfiguration
-     nur auf einer internen Adresse lauschen, die von außen (z. B. über
-     den Fly.io-Proxy oder Renders Load Balancer) nicht erreichbar ist —
-     0.0.0.0 bedeutet "auf allen Netzwerkschnittstellen lauschen" und ist
-     auf praktisch jeder Cloud-Plattform die richtige Bindung für einen
-     öffentlich erreichbaren Dienst. */
-  const HOST = process.env.HOST || '0.0.0.0';
-  server.listen(PORT, HOST, () => {
-    console.log(`SecureChat-Server läuft auf http://${HOST}:${PORT}`);
-    console.log(`  Datenbank : ${process.env.TURSO_DATABASE_URL || 'lokal (file:./local.db)'}`);
-    console.log(`  Log-Größe : ${logSize.n} Einträge`);
+  server.listen(PORT, () => {
+    console.log(`SecureChat-Server läuft auf http://localhost:${PORT}`);
+    console.log(`  Datenbank : ${DB_PATH}`);
+    console.log(`  Log-Größe : ${q.ktCount.get().n} Einträge`);
     console.log(`  Witnesses : ${witnesses.map(w => w.name).join(', ')}`);
   });
 }
 
-return { server, db, q, issueSenderCertificate, certBytes, MTH, inclusionPath, consistencyProof, verifyConsistency,
+module.exports = { server, db, q, issueSenderCertificate, certBytes, MTH, inclusionPath, consistencyProof, verifyConsistency,
   leafHash, entryBytes, publishSTH, latestSTH, ktAppend, hashPw, verifyPw, allLeaves };
-}   // Ende von async function main()
-
-/* main() startet den Server sofort beim Laden dieses Moduls (wie bisher
-   das Top-Level-server.listen), gibt aber gleichzeitig ein Promise
-   zurück, das die wichtigen internen Objekte enthält — nötig, damit
-   Testskripte (die vorher synchron auf module.exports.q zugreifen
-   konnten) weiterhin Zugriff bekommen, nur eben über await statt direkt.
-   module.exports selbst bleibt ein Promise, kein fertiges Objekt —
-   das ist die sichtbarste äußere Auswirkung der Async-Migration für
-   alles, was diese Datei importiert. */
-module.exports = main();
-module.exports.catch(err => {
-  console.error('Serverstart fehlgeschlagen:', err);
-  process.exit(1);
-});
-
