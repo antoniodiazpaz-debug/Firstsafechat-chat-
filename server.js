@@ -1837,8 +1837,16 @@ setInterval(async () => {
 
 if (require.main === module) {
   const logSize = await q.ktCount.get();
-  server.listen(PORT, () => {
-    console.log(`SecureChat-Server läuft auf http://localhost:${PORT}`);
+  /* WICHTIG: explizit auf 0.0.0.0 binden, nicht nur den Port angeben.
+     Ohne Host-Angabe kann Node je nach Container-Netzwerkkonfiguration
+     nur auf einer internen Adresse lauschen, die von außen (z. B. über
+     den Fly.io-Proxy oder Renders Load Balancer) nicht erreichbar ist —
+     0.0.0.0 bedeutet "auf allen Netzwerkschnittstellen lauschen" und ist
+     auf praktisch jeder Cloud-Plattform die richtige Bindung für einen
+     öffentlich erreichbaren Dienst. */
+  const HOST = process.env.HOST || '0.0.0.0';
+  server.listen(PORT, HOST, () => {
+    console.log(`SecureChat-Server läuft auf http://${HOST}:${PORT}`);
     console.log(`  Datenbank : ${process.env.TURSO_DATABASE_URL || 'lokal (file:./local.db)'}`);
     console.log(`  Log-Größe : ${logSize.n} Einträge`);
     console.log(`  Witnesses : ${witnesses.map(w => w.name).join(', ')}`);
