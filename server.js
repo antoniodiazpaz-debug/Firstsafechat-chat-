@@ -77,8 +77,8 @@ CREATE TABLE IF NOT EXISTS users (
      is_email_verified prüfen. */
   email_verified   INTEGER DEFAULT 0,
   phone_verified   INTEGER DEFAULT 0,   -- nur über WebOTP im Browser möglich, siehe unten
-  created_at    INTEGER NOT NULL,
-  last_seen     INTEGER NOT NULL
+  created_at    BIGINT NOT NULL,
+  last_seen     BIGINT NOT NULL
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -95,8 +95,8 @@ CREATE TABLE IF NOT EXISTS email_verifications (
   user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   code_hash   TEXT NOT NULL,      -- SHA-256 des Codes, nie der Code selbst
   attempts    INTEGER DEFAULT 0,
-  created_at  INTEGER NOT NULL,
-  expires_at  INTEGER NOT NULL,
+  created_at  BIGINT NOT NULL,
+  expires_at  BIGINT NOT NULL,
   PRIMARY KEY (user_id)
 );
 
@@ -124,9 +124,9 @@ CREATE TABLE IF NOT EXISTS devices (
   ik_sign       TEXT NOT NULL,       -- öffentlicher ECDSA-Signaturschlüssel dieses Geräts
   is_primary    INTEGER DEFAULT 0,
   push_token    TEXT,                -- FCM/Web-Push-Endpunkt, siehe push_subscriptions
-  created_at    INTEGER NOT NULL,
-  last_seen     INTEGER NOT NULL,
-  revoked_at    INTEGER              -- gesetzt, wenn das Gerät entfernt wurde
+  created_at    BIGINT NOT NULL,
+  last_seen     BIGINT NOT NULL,
+  revoked_at    BIGINT              -- gesetzt, wenn das Gerät entfernt wurde
 );
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id) WHERE revoked_at IS NULL;
 
@@ -134,8 +134,8 @@ CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id) WHERE revoked_at
 CREATE TABLE IF NOT EXISTS device_pairings (
   code        TEXT PRIMARY KEY,
   user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at  INTEGER NOT NULL,
-  expires_at  INTEGER NOT NULL,
+  created_at  BIGINT NOT NULL,
+  expires_at  BIGINT NOT NULL,
   consumed    INTEGER DEFAULT 0
 );
 
@@ -143,8 +143,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   token      TEXT PRIMARY KEY,
   user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   device_id  TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(device_id);
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS signed_prekeys (
   spk_id     INTEGER NOT NULL,
   pub        TEXT NOT NULL,
   signature  TEXT NOT NULL,         -- ECDSA über ikDH‖spk‖spkId‖createdAt (des Geräts)
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
 
 -- One-Time Prekeys: Pool pro Gerät
@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS one_time_prekeys (
   opk_id     INTEGER NOT NULL,
   pub        TEXT NOT NULL,
   consumed   INTEGER DEFAULT 0,
-  consumed_at INTEGER,
+  consumed_at BIGINT,
   UNIQUE(device_id, opk_id)
 );
 CREATE INDEX IF NOT EXISTS idx_opk_avail ON one_time_prekeys(device_id, consumed);
@@ -189,8 +189,8 @@ CREATE TABLE IF NOT EXISTS envelopes (
   header               TEXT,               -- Ratchet-Header; bei sealed Teil des Blobs
   ciphertext           TEXT NOT NULL,      -- Base64, für den Server undurchsichtig
   gossip               TEXT,               -- mitgereiste Log-Wurzel des Absenders
-  sent_at              INTEGER NOT NULL,
-  delivered_at         INTEGER,
+  sent_at              BIGINT NOT NULL,
+  delivered_at         BIGINT,
   acked                INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_env_recipient ON envelopes(recipient_device_id, acked);
@@ -203,14 +203,14 @@ CREATE TABLE IF NOT EXISTS kt_entries (
   key_y      TEXT NOT NULL,
   version    INTEGER NOT NULL,
   leaf_hash  TEXT NOT NULL,
-  added_at   INTEGER NOT NULL
+  added_at   BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_kt_user ON kt_entries(user_id);
 
 CREATE TABLE IF NOT EXISTS kt_sths (
   size       INTEGER PRIMARY KEY,
   root       TEXT NOT NULL,
-  ts         INTEGER NOT NULL,
+  ts         BIGINT NOT NULL,
   signature  TEXT NOT NULL,
   cosigs     TEXT NOT NULL DEFAULT '[]'
 );
@@ -220,7 +220,7 @@ CREATE TABLE IF NOT EXISTS groups_tbl (
   name       TEXT NOT NULL,
   avatar     TEXT DEFAULT '👥',
   owner_id   TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS group_members (
   group_id  TEXT NOT NULL REFERENCES groups_tbl(id) ON DELETE CASCADE,
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   endpoint    TEXT NOT NULL,         -- Web-Push-URL oder FCM-Token
   p256dh      TEXT,                  -- nur bei web
   auth        TEXT,                  -- nur bei web
-  created_at  INTEGER NOT NULL
+  created_at  BIGINT NOT NULL
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -268,7 +268,7 @@ CREATE INDEX IF NOT EXISTS idx_contact_hashes_hash ON contact_hashes(hash);
 CREATE TABLE IF NOT EXISTS contact_matches_notified (
   user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   matched_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  notified_at  INTEGER NOT NULL,
+  notified_at  BIGINT NOT NULL,
   PRIMARY KEY(user_id, matched_id)
 );
 
@@ -278,7 +278,7 @@ CREATE TABLE IF NOT EXISTS contact_matches_notified (
 CREATE TABLE IF NOT EXISTS blocks (
   blocker_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   blocked_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at  INTEGER NOT NULL,
+  created_at  BIGINT NOT NULL,
   PRIMARY KEY(blocker_id, blocked_id)
 );
 
@@ -293,7 +293,7 @@ CREATE TABLE IF NOT EXISTS reports (
   -- beifügt (siehe reportMessage() im Client) — niemals automatisch,
   -- weil der Server bei E2EE sonst gar keinen Klartext hätte.
   included_content TEXT,
-  created_at    INTEGER NOT NULL,
+  created_at    BIGINT NOT NULL,
   reviewed      INTEGER DEFAULT 0
 );
 `);
