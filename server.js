@@ -1069,6 +1069,16 @@ const routes = {
     if (!b.email) return json(res, 400, { error: 'E-Mail-Adresse erforderlich' });
 
     const u = await q.userByEmail.get(b.email);
+    /* TEMPORÄR zur Fehlersuche: zeigt im Server-Log, welcher der drei
+       stillen Fehlerfälle tatsächlich zutrifft — von außen bewusst
+       nicht unterscheidbar (siehe Kommentar unten), aber im eigenen
+       Log sichtbar zu machen verrät nichts an einen Angreifer. */
+    console.log('DEBUG recover-request:', JSON.stringify({
+      email: b.email,
+      userFound: !!u,
+      emailVerified: u ? !!u.email_verified : null,
+      mailConfigured: MAIL.isConfigured()
+    }));
     if (u && u.email_verified && MAIL.isConfigured()) {
       const code = String(crypto.randomInt(100000, 1000000));
       const codeHash = b64(sha256(Buffer.from(code)));
