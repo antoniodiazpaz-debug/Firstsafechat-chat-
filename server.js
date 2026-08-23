@@ -589,7 +589,7 @@ async function publishSTH() {
   const root = MTH(lv);
   const ts = Date.now();
   const sig = signLog(['sth-v1', size, root.toString('hex'), ts].join('|'));
-  const cosigs = collectCosigs({ size, root, ts });
+  const cosigs = collectCosigs({ size, root, ts }, lv);
   await q.ktPutSTH.run(size, b64(root), ts, sig, JSON.stringify(cosigs));
   return { size, root: b64(root), ts, sig, cosigs };
 }
@@ -625,7 +625,7 @@ if (fs.existsSync(WITNESS_FILE)) {
 const saveWitnesses = () =>
   fs.writeFileSync(WITNESS_FILE, JSON.stringify(witnesses, null, 2), { mode: 0o600 });
 
-function collectCosigs(sth) {
+function collectCosigs(sth, lv) {
   const out = [];
   const rootHex = sth.root.toString('hex');
   for (const w of witnesses) {
@@ -635,7 +635,6 @@ function collectCosigs(sth) {
       continue;
     }
     if (w.lastSize > 0 && sth.size > w.lastSize) {
-      const lv = allLeaves();
       const proof = consistencyProof(w.lastSize, lv);
       if (!verifyConsistency(w.lastSize, sth.size, proof, ub64(w.lastRoot), sth.root)) {
         w.refusals.push({ size: sth.size, at: Date.now(), reason: 'Konsistenz verletzt' });
@@ -992,29 +991,10 @@ const routes = {
     try {
       await MAIL.sendVerificationCode(a.user.email, code);
     } catch (err) {
-      /* Den genauen Fehler direkt in der Antwort zurückgeben, statt ihn
-         nur ins Log zu schreiben — spart das ständige Wechseln zwischen
-         Testseite und Fly.io-Logs während der Fehlersuche. TEMPORÄR:
-         sollte entfernt werden, sobald SMTP zuverlässig funktioniert,
-         da Fehlerdetails eines Mailservers nicht dauerhaft öffentlich
-         zugänglich sein sollten. */
-      return json(res, 500, { error: 'Mailversand fehlgeschlagen', detail: err.message });
+      console.warn('Mailversand fehlgeschlagen:', err.message);
+      return json(res, 500, { error: 'Mailversand fehlgeschlagen' });
     }
     json(res, 200, { sent: true });
-  },
-
-  /* TEMPORÄR — nur zur Fehlersuche: zeigt, welche SMTP_*-Variablen
-     tatsächlich gesetzt sind, OHNE deren Werte preiszugeben. Nach
-     erfolgreicher SMTP-Einrichtung wieder entfernen. */
-  'GET /api/debug/smtp-config': async (req, res) => {
-    json(res, 200, {
-      SMTP_HOST: process.env.SMTP_HOST || '(nicht gesetzt)',
-      SMTP_PORT: process.env.SMTP_PORT || '(nicht gesetzt, Standard 587)',
-      SMTP_USER: process.env.SMTP_USER || '(nicht gesetzt)',
-      SMTP_PASS_gesetzt: !!process.env.SMTP_PASS,
-      SMTP_PASS_länge: process.env.SMTP_PASS ? process.env.SMTP_PASS.length : 0,
-      SMTP_FROM: process.env.SMTP_FROM || '(nicht gesetzt, nutzt SMTP_USER)'
-    });
   },
 
   /* Login auf einem BEKANNTEN Gerät (deviceId aus vorherigem Login/Pairing
@@ -1777,6 +1757,33 @@ server.on('upgrade', async (req, sock) => {
       deliverToUser(msg.to, { type: 'read', from: uid, convId: msg.convId, ids: msg.ids || [] });
     } else if (msg.type === 'ping') {
       wsSend(sock, { type: 'pong', ts: Date.now() });
+
+    /* ── WebRTC-Anruf-Signalisierung ──────────────────────────────
+       Der Server reicht hier NUR das SDP-Angebot/-Antwort und die
+       ICE-Kandidaten zwischen den beiden Gesprächspartnern durch —
+       genau wie eine Telefonvermittlung, die die Verbindung herstellt,
+       aber nicht mithört. Der eigentliche Audio-/Videostrom läuft
+       danach direkt (peer-to-peer) zwischen den Browsern, nie über
+       diesen Server. callId identifiziert den Anrufversuch eindeutig,
+       damit veraltete Nachrichten eines bereits beendeten/abgelehnten
+       Anrufs nicht versehentlich einen neuen beeinflussen. */
+    } else if (msg.type === 'call-offer' && msg.to && msg.callId && msg.sdp) {
+      const online = deliverToUser(msg.to, {
+        type: 'call-offer', from: uid, fromDeviceId: did,
+        callId: msg.callId, kind: msg.kind === 'video' ? 'video' : 'audio', sdp: msg.sdp
+      });
+      /* Empfänger komplett offline -> Anrufer muss das SOFORT erfahren,
+         sonst wartet die Anruf-Oberfläche endlos auf eine Antwort, die
+         nie kommt. */
+      if (!online) wsSend(sock, { type: 'call-unavailable', callId: msg.callId });
+    } else if (msg.type === 'call-answer' && msg.to && msg.callId && msg.sdp) {
+      deliverToUser(msg.to, { type: 'call-answer', from: uid, callId: msg.callId, sdp: msg.sdp });
+    } else if (msg.type === 'call-ice' && msg.to && msg.callId && msg.candidate) {
+      deliverToUser(msg.to, { type: 'call-ice', from: uid, callId: msg.callId, candidate: msg.candidate });
+    } else if (msg.type === 'call-reject' && msg.to && msg.callId) {
+      deliverToUser(msg.to, { type: 'call-reject', from: uid, callId: msg.callId, reason: msg.reason || 'declined' });
+    } else if (msg.type === 'call-end' && msg.to && msg.callId) {
+      deliverToUser(msg.to, { type: 'call-end', from: uid, callId: msg.callId });
     }
   }, cleanup);
 

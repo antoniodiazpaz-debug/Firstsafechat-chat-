@@ -7,6 +7,8 @@ import { P, PreKeys, KT, X3DH, Ratchet, MAX_SKIP, b64, ub64, hexs, te, td } from
 import { ApiClient, hashContact } from '/api-client.js';
 import { setLocale, getLocale, t } from '/i18n.js';
 import { detectLanguage, guessDialCode, preparePhoneInput, watchForSmsCode } from '/device-info.js';
+import { initCallUI } from '/call-ui.js';
+import { Call } from '/call.js';
 
 /* Sprache sofort beim Laden setzen — vor jedem UI-Aufbau, damit auch
    die allererste gerenderte Seite (Boot/Auth) schon übersetzt ist. */
@@ -637,6 +639,7 @@ async function afterAuthOffline(deviceId, userName) {
 function wireSocketEvents() {
   api.on('envelope', onIncomingEnvelope);
   api.on('presence', onPresence);
+  initCallUI(api);
   api.on('device-added', d => toast('Neues Gerät verbunden: ' + (d.device?.name || '')));
   api.on('device-revoked', () => {
     toast('Dieses Gerät wurde entfernt. Du wirst abgemeldet.');
@@ -880,6 +883,11 @@ const appActions = {
   openConv(i) { const c = window.__conv[i]; openChat(c); },
   newChat() { openNewChatSheet(); },
   openCamera() { toast('Kamera folgt in einem späteren Schritt'); },
+  startCall(kind) {
+    if (!state.activeConv) return;
+    const conv = state.convs.get(state.activeConv.convId);
+    Call.start(state.activeConv.peerId, state.activeConv.name || conv?.name, kind);
+  },
   mainMenu(e) { openMainMenu(e); },
   closeChat() { closeChat(); },
   sendClick() { sendCurrentMessage(); },
@@ -1070,7 +1078,8 @@ function openChat(c) {
         <div class="nm">${esc(c.name || c.peerId)}</div>
         <div class="st" id="chatStatus">${c.online ? 'online' : 'offline'}</div>
       </div>
-      <button class="iconbtn">📞</button>
+      <button class="iconbtn" onclick="window.__app.startCall('audio')" aria-label="Anrufen">📞</button>
+      <button class="iconbtn" onclick="window.__app.startCall('video')" aria-label="Videoanruf">📹</button>
       <button class="iconbtn" onclick="window.__app.chatMenu(event)">⋮</button>
     </div>
     <div id="chatbody"></div>
