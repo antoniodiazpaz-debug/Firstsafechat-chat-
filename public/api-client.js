@@ -80,10 +80,43 @@ export class ApiClient {
     return this._fetch('/api/resend-verification', { method: 'POST' });
   }
 
+  /* Kontowiederherstellung — beide Aufrufe laufen bewusst OHNE
+     bestehende Anmeldung (auth: false), das ist der ganze Zweck: der
+     Nutzer hat gerade kein gültiges Sitzungstoken mehr. */
+  async recoverRequest(email) {
+    return this._fetch('/api/account/recover-request', { auth: false, method: 'POST', body: { email } });
+  }
+  async recoverVerify({ email, code, deviceName, platform, identity }) {
+    const data = await this._fetch('/api/account/recover-verify', { auth: false, method: 'POST', body: {
+      email, code, deviceName, platform,
+      ikDH: identity.IK.pubJwk, ikSign: identity.IKS.pubJwk,
+      spk: { spkId: identity.spkMeta.spkId, pub: identity.SPK.pubJwk,
+             signature: identity.spkMeta.sig, createdAt: identity.spkMeta.createdAt },
+      opks: [...identity.opks].map(([opkId, key]) => ({ opkId, pub: key.pubJwk }))
+    }});
+    this._applySession(data);
+    return data;
+  }
+
+  /* Konto endgültig löschen — das Bearer-Token allein ist der
+     Identitätsnachweis (es gibt kein Passwort mehr im System). Die
+     bewusste Bestätigung passiert client-seitig (Namen exakt eintippen,
+     siehe confirmDeleteAccount in app.js), nicht durch ein erneutes
+     Geheimnis. */
+  async deleteAccount() {
+    return this._fetch('/api/account/delete', { method: 'POST' });
+  }
+
 
   /* Erste Anmeldung auf einem GERÄT braucht deviceId aus lokalem Speicher.
      Ohne deviceId antwortet der Server mit 428 + needsPairing:true —
      der Aufrufer muss dann pairClaim() nutzen, nicht login() erneut. */
+  /* UNGENUTZT seit der Umstellung auf passwortlose Anmeldung — app.js
+     ruft diese Methode nicht mehr auf. Ein bekanntes Gerät meldet sich
+     stattdessen direkt über das im Vault gespeicherte Sitzungstoken bei
+     /api/me an (siehe renderLoginForKnownDevice). server.js akzeptiert
+     diese Route technisch weiterhin, weil sie für direkte API-Aufrufer
+     von außerhalb der App noch sinnvoll sein kann. */
   async login({ name, password, deviceId }) {
     const data = await this._fetch('/api/login', { auth: false, method: 'POST',
       body: { name, password, deviceId } });

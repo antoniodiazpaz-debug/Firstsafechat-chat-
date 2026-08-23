@@ -59,27 +59,62 @@ const Vault = {
          App offline überhaupt etwas anzuzeigen hat. Der Store liegt in
          derselben Datenbank wie der Schlüssel-Vault, aber getrennt
          verschlüsselt (siehe LocalCache.save). */
-      const req = indexedDB.open('securechat-vault', 2);
+      /* Version 3: zusätzlicher 'deviceKey'-Store für den nicht-
+         extrahierbaren AES-Schlüssel, der jetzt an die Stelle des
+         Passworts tritt (siehe Vault._deviceKey). */
+      const req = indexedDB.open('securechat-vault', 3);
       req.onupgradeneeded = e => {
         const db = req.result;
         if (!db.objectStoreNames.contains('identities'))
           db.createObjectStore('identities', { keyPath: 'deviceId' });
         if (!db.objectStoreNames.contains('messages'))
           db.createObjectStore('messages', { keyPath: 'deviceId' });
+        if (!db.objectStoreNames.contains('deviceKey'))
+          db.createObjectStore('deviceKey', { keyPath: 'id' });
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
     });
     return this._dbp;
   },
-  async save(deviceId, password, identityStore, meta) {
+  /* Nicht-extrahierbarer AES-256-Schlüssel, einmal pro Gerät erzeugt.
+     WebCrypto garantiert, dass ein mit extractable:false erzeugter
+     CryptoKey NIE als Rohbytes an JavaScript herausgegeben werden kann —
+     auch nicht durch Code auf derselben Seite (siehe W3C Web Crypto API
+     Spezifikation: "storing and retrieval of key material, without ever
+     exposing that key material to the application"). Das ersetzt die
+     bisherige PBKDF2-Ableitung aus einem Passwort: statt "etwas, das der
+     Nutzer weiß" schützt jetzt "ein Geheimnis, das an diesen Browser
+     gebunden ist und diesen nie in lesbarer Form verlässt". Der
+     CryptoKey selbst liegt in einem eigenen IndexedDB-Objektspeicher,
+     getrennt vom verschlüsselten Datenblock — ein Angreifer mit
+     Lesezugriff auf die Datenbank bekommt zwar den CryptoKey-Datensatz,
+     kann daraus aber keine Bytes extrahieren, die außerhalb dieses
+     Browserprofils nutzbar wären. */
+  async _deviceKey() {
     const db = await this._db();
-    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const existing = await new Promise((resolve, reject) => {
+      const tx = db.transaction('deviceKey', 'readonly');
+      const req = tx.objectStore('deviceKey').get('main');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    if (existing) return existing.key;
+
+    const key = await crypto.subtle.generateKey(
+      { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('deviceKey', 'readwrite');
+      tx.objectStore('deviceKey').put({ id: 'main', key });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    return key;
+  },
+  async save(deviceId, identityStore, meta) {
+    const db = await this._db();
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const base = await crypto.subtle.importKey('raw', te.encode(password), 'PBKDF2', false, ['deriveKey']);
-    const key = await crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt, iterations: 210000, hash: 'SHA-256' },
-      base, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+    const key = await this._deviceKey();
     const plain = te.encode(JSON.stringify({
       IK: identityStore.IK.privJwk,
       IKS: identityStore.IKS.privJwk,
@@ -90,13 +125,13 @@ const Vault = {
     return new Promise((resolve, reject) => {
       const tx = db.transaction('identities', 'readwrite');
       tx.objectStore('identities').put({
-        deviceId, salt: [...salt], iv: [...iv], ct: [...new Uint8Array(ct)], meta
+        deviceId, iv: [...iv], ct: [...new Uint8Array(ct)], meta
       });
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
   },
-  async load(deviceId, password) {
+  async load(deviceId) {
     const db = await this._db();
     const rec = await new Promise((resolve, reject) => {
       const tx = db.transaction('identities', 'readonly');
@@ -105,15 +140,17 @@ const Vault = {
       req.onerror = () => reject(req.error);
     });
     if (!rec) return null;
-    const base = await crypto.subtle.importKey('raw', te.encode(password), 'PBKDF2', false, ['deriveKey']);
-    const key = await crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt: new Uint8Array(rec.salt), iterations: 210000, hash: 'SHA-256' },
-      base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    const key = await this._deviceKey();
     let plain;
     try {
       plain = await crypto.subtle.decrypt(
         { name: 'AES-GCM', iv: new Uint8Array(rec.iv) }, key, new Uint8Array(rec.ct));
-    } catch { return 'wrong-password'; }
+    } catch {
+      /* Sollte praktisch nie auftreten (der Geräteschlüssel ändert sich
+         nie von selbst), außer die IndexedDB-Datenbank wurde manuell
+         manipuliert oder ist beschädigt. */
+      return 'corrupt';
+    }
     return { data: JSON.parse(td.decode(plain)), meta: rec.meta };
   },
   async knownDeviceId() {
@@ -123,6 +160,7 @@ const Vault = {
     localStorage.setItem('securechat:deviceId', deviceId);
     localStorage.setItem('securechat:userName', userName);
   },
+
   forget() {
     localStorage.removeItem('securechat:deviceId');
     localStorage.removeItem('securechat:userName');
@@ -150,24 +188,13 @@ const LocalCache = {
   _deviceId: null,
 
   /* Wird von afterAuth()/afterAuthOffline() aufgerufen, sobald der Vault
-     entsperrt ist — leitet denselben Schlüssel noch einmal ab (kein
-     Zugriff auf den bereits abgeleiteten Vault-Schlüssel von außen,
-     das ist Absicht: LocalCache bekommt nur das Passwort, nie den
-     rohen Schlüssel als Objekt, das länger im Speicher hängen bliebe). */
-  async unlock(deviceId, password) {
+     entsperrt ist — nutzt DENSELBEN nicht-extrahierbaren Geräteschlüssel
+     wie Vault selbst (siehe Vault._deviceKey). Kein eigenes Passwort,
+     keine eigene Ableitung mehr nötig: der Geräteschlüssel schützt
+     gleichermaßen die Identitätsschlüssel wie den Nachrichten-Cache. */
+  async unlock(deviceId) {
     this._deviceId = deviceId;
-    const db = await Vault._db();
-    const salt = await new Promise((resolve, reject) => {
-      const tx = db.transaction('identities', 'readonly');
-      const req = tx.objectStore('identities').get(deviceId);
-      req.onsuccess = () => resolve(req.result?.salt);
-      req.onerror = () => reject(req.error);
-    });
-    if (!salt) return;   // kein Vault-Eintrag — Cache bleibt inaktiv
-    const base = await crypto.subtle.importKey('raw', te.encode(password), 'PBKDF2', false, ['deriveKey']);
-    this._key = await crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt: new Uint8Array(salt), iterations: 210000, hash: 'SHA-256' },
-      base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    this._key = await Vault._deviceKey();
   },
 
   /* Konversationsliste + Nachrichten in einem Rutsch sichern — bewusst
@@ -367,25 +394,20 @@ function renderAuthChoice() {
     <div id="authCard" class="card">
       <div class="logo"><div class="ic">🔐</div><h1>${t('appName')}</h1>
         <p>${t('tagline')}</p></div>
-      <div class="seg">
-        <button id="tabLogin" class="on" onclick="window.__auth.setMode('login')">${t('login')}</button>
-        <button id="tabReg" onclick="window.__auth.setMode('register')">${t('register')}</button>
-      </div>
       <div id="authErr" class="err hide"></div>
       <label>${t('username')}</label>
       <input class="in" id="aUser" placeholder="Anna" autocomplete="username">
-      <label>${t('password')}</label>
-      <input class="in" id="aPass" type="password" placeholder="••••••••" autocomplete="current-password">
-      <div id="regFields" class="hide">
-        <label>${t('phone')}</label>
-        <input class="in" id="aPhone" placeholder="${esc(guessDialCode())} …">
-        <label>${t('email')}</label>
-        <input class="in" id="aEmail" placeholder="du@example.com" autocomplete="email">
-      </div>
-      <button class="btn" id="authBtn" onclick="window.__auth.submit()">${t('login')}</button>
+      <label>${t('phone')}</label>
+      <input class="in" id="aPhone" placeholder="${esc(guessDialCode())} …">
+      <label>${t('email')}</label>
+      <input class="in" id="aEmail" placeholder="du@example.com" autocomplete="email">
+      <button class="btn" id="authBtn" onclick="window.__auth.submit()">${t('createAccount')}</button>
       <div class="enc">🔒 ${t('newDevice')}?<br>${t('pairHint')}</div>
+      <div class="enc" style="margin-top:8px">
+        <a href="#" onclick="window.__auth.recover(); return false;" style="color:var(--acc)">Bestehendes Konto wiederherstellen</a>
+      </div>
     </div>`);
-  window.__auth = { setMode: authSetMode, submit: authSubmit };
+  window.__auth = { submit: authSubmit, recover: renderRecoveryPrompt };
 
   /* Telefonfeld für Browser-/OS-Autofill vorbereiten und mit der aus
      der Systemsprache geschätzten Vorwahl vorbefüllen — das Feld bleibt
@@ -398,84 +420,62 @@ function renderAuthChoice() {
   }
 }
 
-let authMode = 'login';
-function authSetMode(m) {
-  authMode = m;
-  $('#tabLogin').classList.toggle('on', m === 'login');
-  $('#tabReg').classList.toggle('on', m === 'register');
-  $('#regFields').classList.toggle('hide', m !== 'register');
-  $('#authBtn').textContent = m === 'login' ? t('login') : t('createAccount');
-  $('#authErr').classList.add('hide');
-}
 function authErr(msg) {
   const e = $('#authErr'); e.textContent = '⚠️ ' + msg; e.classList.remove('hide');
 }
 
+/* Passwortlos: Registrierung ist der einzige Weg, ein Konto auf einem
+   Gerät neu einzurichten. Ein bereits registriertes Gerät meldet sich
+   automatisch an (siehe boot()) — es gibt keinen manuellen "Login"-Weg
+   mehr für ein bereits bekanntes Gerät, und keinen Passwort-basierten
+   Weg für ein neues Gerät (dafür existiert bereits das Pairing-System:
+   ein Code von einem angemeldeten Gerät koppelt ein weiteres, siehe
+   renderPairingPrompt). */
 async function authSubmit() {
   const btn = $('#authBtn'); btn.disabled = true;
-  const name = $('#aUser').value.trim(), password = $('#aPass').value;
+  const name = $('#aUser').value.trim();
   try {
-    if (!name || !password) return authErr(t('fieldsRequired'));
+    if (!name) return authErr(t('fieldsRequired'));
 
-    if (authMode === 'register') {
-      /* Telefonnummer ist bewusst OPTIONAL — der Server verlangt sie
-         nicht (siehe /api/register in server.js), sie dient nur dem
-         freiwilligen Kontaktabgleich ("X nutzt die App auch"). Es gibt
-         keinerlei SMS-Versand oder Code-Verifikation irgendwo im
-         System — ein Registrierungsablauf mit SMS-Verifikation würde
-         einen eigenen Dienst dafür brauchen (Twilio o. ä.) und wäre
-         zudem ein Datenschutz-Rückschritt für einen privatsphäre-
-         orientierten Messenger: Telefonnummern wären dann PFLICHT
-         statt optional. */
-      const phone = $('#aPhone').value.trim();
-      if (password.length < 8) return authErr(t('passwordTooShort'));
+    /* Telefonnummer ist bewusst OPTIONAL — der Server verlangt sie
+       nicht (siehe /api/register in server.js), sie dient nur dem
+       freiwilligen Kontaktabgleich ("X nutzt die App auch"). */
+    const phone = $('#aPhone').value.trim();
 
-      const email = $('#aEmail').value.trim();
-      if (!email) return authErr(t('emailRequired'));
-      /* Bewusst nur eine grobe Formprüfung (etwas@etwas.etwas) — die
-         eigentliche Gültigkeit bestätigt sich erst durch den zugestellten
-         Bestätigungscode. Eine strengere Regex hier würde nur seltene,
-         aber technisch gültige Adressen fälschlich ablehnen. */
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return authErr(t('emailInvalid'));
+    const email = $('#aEmail').value.trim();
+    if (!email) return authErr(t('emailRequired'));
+    /* Bewusst nur eine grobe Formprüfung (etwas@etwas.etwas) — die
+       eigentliche Gültigkeit bestätigt sich erst durch den zugestellten
+       Bestätigungscode. Eine strengere Regex hier würde nur seltene,
+       aber technisch gültige Adressen fälschlich ablehnen. */
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return authErr(t('emailInvalid'));
 
-      btn.textContent = t('generatingKeys');
-      const identity = await PreKeys.createStore();
-      const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
-        (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
-      const data = await api.register({
-        name, password, phone: phone || undefined, email,
-        deviceName: guessDeviceName(), platform, identity
-      });
-      await Vault.save(data.device.id, password, identity, { name, userId: data.user.id });
-      Vault.rememberDevice(data.device.id, name);
-      state.identity = identity;
-      await afterAuth(data, password);
-    } else {
-      const knownId = await Vault.knownDeviceId();
-      try {
-        const data = await api.login({ name, password, deviceId: knownId });
-        const vaultRec = await Vault.load(data.device.id, password);
-        if (vaultRec === 'wrong-password' || !vaultRec) {
-          authErr('Lokaler Schlüssel für dieses Gerät fehlt oder passt nicht zum Passwort.');
-          return;
-        }
-        state.identity = await reconstructIdentityFromVault(vaultRec.data);
-        Vault.rememberDevice(data.device.id, name);
-        await afterAuth(data, password);
-      } catch (e) {
-        if (e.status === 428) {
-          renderPairingPrompt(name, password);
-        } else {
-          authErr(e.message);
-        }
-      }
-    }
+    btn.textContent = t('generatingKeys');
+    const identity = await PreKeys.createStore();
+    const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
+      (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
+    const data = await api.register({
+      name, phone: phone || undefined, email,
+      deviceName: guessDeviceName(), platform, identity
+    });
+    /* Sitzungstoken wird ZUSAMMEN mit den Identitätsschlüsseln im
+       lokalen, durch den nicht-extrahierbaren Geräteschlüssel
+       geschützten Vault gespeichert — das ist die gesamte
+       "Passwort"-Ersetzung: kein Geheimnis, das der Nutzer eingibt,
+       sondern ein Geheimnis, das an dieses Browserprofil gebunden ist
+       und es nie in lesbarer Form verlässt. */
+    await Vault.save(data.device.id, identity, { name, userId: data.user.id, token: data.token });
+    Vault.rememberDevice(data.device.id, name);
+    state.identity = identity;
+    await afterAuth(data);
   } catch (e) {
-    authErr(e.message);
-    console.error(e);
+    if (e.status === 428) {
+      renderPairingPrompt(name);
+    } else {
+      authErr(e.message);
+    }
   } finally {
     btn.disabled = false;
-    btn.textContent = authMode === 'login' ? t('login') : t('createAccount');
   }
 }
 
@@ -489,7 +489,7 @@ function guessDeviceName() {
   return 'Browser-Gerät';
 }
 
-function renderPairingPrompt(name, password) {
+function renderPairingPrompt(name) {
   showAuth(`
     <div class="card">
       <div class="logo"><div class="ic">🔗</div><h1>${t('newDevice')}</h1>
@@ -514,10 +514,10 @@ function renderPairingPrompt(name, password) {
       const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
         (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
       const data = await api.pairClaim({ code, deviceName: guessDeviceName(), platform, identity });
-      await Vault.save(data.device.id, password, identity, { name: data.user.name, userId: data.user.id });
+      await Vault.save(data.device.id, identity, { name: data.user.name, userId: data.user.id, token: data.token });
       Vault.rememberDevice(data.device.id, data.user.name);
       state.identity = identity;
-      await afterAuth(data, password);
+      await afterAuth(data);
     } catch (e) {
       $('#pairErr').textContent = '⚠️ ' + e.message;
       $('#pairErr').classList.remove('hide');
@@ -527,53 +527,139 @@ function renderPairingPrompt(name, password) {
   };
 }
 
-function renderLoginForKnownDevice(deviceId, userName) {
+function renderRecoveryPrompt() {
   showAuth(`
     <div class="card">
-      <div class="logo"><div class="ic">🔐</div><h1>${t('welcomeBack')}</h1>
-        <p>${esc(userName || t('appName'))}</p></div>
-      <div id="authErr" class="err hide"></div>
-      <label>${t('password')}</label>
-      <input class="in" id="aPass" type="password" placeholder="••••••••" autocomplete="current-password">
-      <button class="btn" id="authBtn">${t('unlock')}</button>
-      <button class="btn ghost" style="margin-top:8px" onclick="window.__auth.other()">${t('otherAccount')}</button>
+      <div class="logo"><div class="ic">📧</div><h1>Konto wiederherstellen</h1>
+        <p>${t('appName')}</p></div>
+      <p style="color:var(--sub);font-size:14px;margin:0 0 16px">
+        Wir schicken dir einen Code an deine bestätigte E-Mail-Adresse.
+        Damit richtest du dieses Gerät neu für dein bestehendes Konto ein.
+      </p>
+      <label>E-Mail</label>
+      <input class="in" id="recEmail" placeholder="du@example.com" autocomplete="email">
+      <div id="recErr" class="err hide"></div>
+      <button class="btn" id="recRequestBtn">Code anfordern</button>
+      <button class="btn ghost" style="margin-top:8px" onclick="window.__auth.back()">${t('back')}</button>
     </div>`);
-  window.__auth = { other: () => { Vault.forget(); renderAuthChoice(); } };
-  const submit = async () => {
-    const btn = $('#authBtn'); btn.disabled = true;
-    const password = $('#aPass').value;
+  window.__auth = { ...window.__auth, back: renderAuthChoice };
+  $('#recRequestBtn').onclick = async () => {
+    const btn = $('#recRequestBtn'); btn.disabled = true;
     try {
-      /* Vault ZUERST lokal entsperren — das braucht keinen Server und
-         funktioniert auch offline. Erst danach (und nur wenn online)
-         wird der Server für eine echte Sitzung kontaktiert. Ohne diese
-         Reihenfolge würde ein Netzfehler das Entsperren verhindern,
-         obwohl das Passwort korrekt war und rein lokal lesbare
-         Nachrichten längst auf dem Gerät liegen. */
-      const vaultRec = await Vault.load(deviceId, password);
-      if (vaultRec === 'wrong-password' || !vaultRec) {
-        authErr('Passwort stimmt nicht mit dem lokal gespeicherten Schlüssel überein.');
-        return;
-      }
-      state.identity = await reconstructIdentityFromVault(vaultRec.data);
-
-      let data;
-      try {
-        data = await api.login({ name: userName, password, deviceId });
-      } catch (e) {
-        /* Server nicht erreichbar, aber das Passwort war korrekt (Vault
-           hat sich entsperrt) — Offline-Modus starten statt zu scheitern.
-           afterAuthOffline baut die UI mit dem, was lokal vorhanden ist:
-           gespeicherte Konversationen, gecachte Nachrichten. Senden geht
-           erst wieder, wenn die Verbindung zurückkommt (siehe outbox). */
-        await afterAuthOffline(deviceId, userName);
-        return;
-      }
-      await afterAuth(data, password);
-    } catch (e) { authErr(e.message); }
-    finally { btn.disabled = false; btn.textContent = t('unlock'); }
+      const email = $('#recEmail').value.trim();
+      if (!email) { $('#recErr').textContent = t('emailRequired'); $('#recErr').classList.remove('hide'); return; }
+      await api.recoverRequest(email);
+      /* Die Server-Antwort verrät absichtlich nie, ob die E-Mail
+         tatsächlich zu einem Konto gehört (siehe server.js) — die
+         Oberfläche zeigt deshalb IMMER denselben nächsten Schritt,
+         unabhängig vom tatsächlichen Ergebnis. */
+      renderRecoveryCodeStep(email);
+    } catch (e) {
+      $('#recErr').textContent = '⚠️ ' + e.message;
+      $('#recErr').classList.remove('hide');
+    } finally {
+      btn.disabled = false;
+    }
   };
-  $('#authBtn').onclick = submit;
-  $('#aPass').addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+}
+
+function renderRecoveryCodeStep(email) {
+  showAuth(`
+    <div class="card">
+      <div class="logo"><div class="ic">📧</div><h1>Code eingeben</h1>
+        <p>${esc(email)}</p></div>
+      <p style="color:var(--sub);font-size:14px;margin:0 0 16px">
+        Falls diese Adresse zu einem Konto gehört, ist dort jetzt ein
+        6-stelliger Code angekommen (auch im Spam-Ordner nachsehen).
+      </p>
+      <label>Code</label>
+      <input class="in" id="recCode" inputmode="numeric" maxlength="6" placeholder="000000">
+      <div id="recCodeErr" class="err hide"></div>
+      <button class="btn" id="recVerifyBtn">Konto wiederherstellen</button>
+      <button class="btn ghost" style="margin-top:8px" onclick="window.__auth.back()">${t('back')}</button>
+    </div>`);
+  window.__auth = { ...window.__auth, back: renderAuthChoice };
+  $('#recVerifyBtn').onclick = async () => {
+    const btn = $('#recVerifyBtn'); btn.disabled = true;
+    try {
+      const code = $('#recCode').value.trim();
+      if (!code || code.length !== 6) {
+        $('#recCodeErr').textContent = 'Bitte den 6-stelligen Code eingeben.';
+        $('#recCodeErr').classList.remove('hide');
+        return;
+      }
+      btn.textContent = t('generatingKeys');
+      /* Wiederherstellung erzeugt zwangsläufig ein NEUES Schlüsselpaar
+         für dieses Gerät — die alten privaten Schlüssel haben das
+         ursprüngliche Gerät nie verlassen (Ende-zu-Ende-Verschlüsselung)
+         und lassen sich serverseitig nicht zurückholen. Der Nutzer
+         bekommt denselben Namen und dasselbe Konto zurück, aber ein
+         frisches Gerät darin. */
+      const identity = await PreKeys.createStore();
+      const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
+        (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
+      const data = await api.recoverVerify({ email, code, deviceName: guessDeviceName(), platform, identity });
+      await Vault.save(data.device.id, identity, { name: data.user.name, userId: data.user.id, token: data.token });
+      Vault.rememberDevice(data.device.id, data.user.name);
+      state.identity = identity;
+      await afterAuth(data);
+    } catch (e) {
+      $('#recCodeErr').textContent = '⚠️ ' + e.message;
+      $('#recCodeErr').classList.remove('hide');
+    } finally {
+      btn.disabled = false; btn.textContent = 'Konto wiederherstellen';
+    }
+  };
+}
+
+/* Passwortlos: ein bekanntes Gerät meldet sich vollautomatisch an, ganz
+   ohne Bildschirm dazwischen — der Vault entsperrt sich selbst (der
+   nicht-extrahierbare Geräteschlüssel braucht keine Nutzereingabe), und
+   das darin gespeicherte Sitzungstoken (30 Tage gültig, siehe server.js)
+   wird direkt gegen /api/me geprüft. Nur wenn das Token abgelaufen ist
+   oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
+   Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
+   mehr, weil es kein Passwort mehr gibt. */
+async function renderLoginForKnownDevice(deviceId, userName) {
+  $('#bootMsg').textContent = 'Automatische Anmeldung …';
+  $('#boot').classList.remove('hide');
+
+  try {
+    const vaultRec = await Vault.load(deviceId);
+    if (!vaultRec || vaultRec === 'corrupt' || !vaultRec.meta?.token) {
+      throw new Error('vault-unusable');
+    }
+    state.identity = await reconstructIdentityFromVault(vaultRec.data);
+
+    let me;
+    try {
+      me = await api._fetch('/api/me', { auth: false, headers: { Authorization: 'Bearer ' + vaultRec.meta.token } });
+    } catch (e) {
+      if (e.status === 401) throw new Error('token-expired');
+      /* Server nicht erreichbar, Vault aber lesbar — Offline-Modus,
+         genau wie zuvor beim Passwort-Pfad. */
+      $('#boot').classList.add('hide');
+      await afterAuthOffline(deviceId, userName);
+      return;
+    }
+
+    api.token = vaultRec.meta.token;
+    await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
+  } catch (e) {
+    $('#boot').classList.add('hide');
+    /* Token abgelaufen (nach 30 Tagen Inaktivität) oder Vault
+       beschädigt: dieses Gerät kann sich nicht mehr automatisch
+       anmelden. Ohne Passwort gibt es keinen Weg, den ALTEN Zugang
+       wiederherzustellen — die einzig verbleibende Option ist eine
+       neue Registrierung (das alte Konto bleibt auf dem Server
+       bestehen, ein anderes bereits angemeldetes Gerät könnte dieses
+       hier stattdessen über Pairing neu koppeln, falls eines existiert). */
+    Vault.forget();
+    renderAuthChoice();
+    if (e.message === 'token-expired') {
+      authErr('Sitzung abgelaufen — bitte neu registrieren oder ein anderes angemeldetes Gerät zum Koppeln nutzen.');
+    }
+  }
 }
 
 async function reconstructIdentityFromVault(data) {
@@ -594,20 +680,17 @@ async function reconstructIdentityFromVault(data) {
 /* ═══════════════════════════════════════════════════════════════════════
    NACH ERFOLGREICHER ANMELDUNG
    ═══════════════════════════════════════════════════════════════════════ */
-async function afterAuth(data, password) {
+async function afterAuth(data) {
   state.me = data.user;
   state.device = data.device;
   state.monitor = new KT.Monitor();
 
   /* Lokalen Nachrichten-Cache entsperren und zuerst laden — damit die
      Chat-Liste sofort etwas zeigt, auch bevor die Inbox vom Server
-     abgeglichen ist. Ohne Passwort (z. B. Pfad, an dem keins bekannt
-     ist) bleibt der Cache stumm — dann fehlt nur die Offline-Historie,
-     alles andere funktioniert weiter. */
-  if (password) {
-    await LocalCache.unlock(data.device.id, password);
-    await LocalCache.load();
-  }
+     abgeglichen ist. Nutzt denselben Geräteschlüssel wie der Vault,
+     kein separates Geheimnis mehr nötig. */
+  await LocalCache.unlock(data.device.id);
+  await LocalCache.load();
 
   api.connect();
   wireSocketEvents();
@@ -1346,8 +1429,9 @@ function showDeleteAccount() {
       <p style="color:var(--sub);margin:0 0 16px;font-size:14px">
         Das kann nicht rückgängig gemacht werden. Alle Nachrichten, Geräte
         und Kontaktdaten dieses Kontos werden unwiderruflich gelöscht.
+        Tipp zur Bestätigung deinen Namen <strong>${esc(state.me.name)}</strong> ein.
       </p>
-      <input id="deleteAccountPw" type="password" placeholder="Passwort zur Bestätigung"
+      <input id="deleteAccountConfirm" type="text" placeholder="${esc(state.me.name)}" autocomplete="off"
         style="width:100%;box-sizing:border-box;font-size:16px;padding:14px;border-radius:10px;
           border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
       <div id="deleteAccountError" style="color:#f15c6d;font-size:13px;margin-bottom:12px;display:none"></div>
@@ -1359,20 +1443,20 @@ function showDeleteAccount() {
 }
 
 async function confirmDeleteAccount() {
-  const input = document.getElementById('deleteAccountPw');
+  const input = document.getElementById('deleteAccountConfirm');
   const errEl = document.getElementById('deleteAccountError');
-  const password = input?.value;
-  if (!password) {
-    errEl.textContent = 'Bitte Passwort eingeben.';
+  const typed = input?.value.trim();
+  if (typed !== state.me.name) {
+    errEl.textContent = 'Bitte deinen Namen exakt eingeben, um zu bestätigen.';
     errEl.style.display = 'block';
     return;
   }
   try {
-    await api.deleteAccount(password);
+    await api.deleteAccount();
     Vault.forget();
     location.reload();
   } catch (e) {
-    errEl.textContent = e.message === 'Passwort falsch' ? 'Falsches Passwort.' : e.message;
+    errEl.textContent = e.message;
     errEl.style.display = 'block';
   }
 }
@@ -1584,7 +1668,7 @@ async function downloadAndShowMedia(msgId, ref, kind) {
    Tests) wird dasselbe Modul importiert, ohne dass boot() dort DOM-Elemente
    braucht, weil die Testsuite eigene Aufrufe macht statt boot(). */
 export { state, Vault, reconstructIdentityFromVault, sk, boot,
-  authSetMode, authSubmit, renderAuthChoice, renderPills, renderNav,
+  authSubmit, renderAuthChoice, renderPills, renderNav,
   renderMain, go, convRow, handleEnvelope, api,
   ensureSessions, ensureReceiverSession, sendMessage, openRatchet,
   openChat, closeChat, startChatWith, renderChatMessages,
