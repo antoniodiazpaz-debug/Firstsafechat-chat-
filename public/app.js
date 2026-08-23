@@ -685,6 +685,17 @@ async function afterAuth(data) {
   state.device = data.device;
   state.monitor = new KT.Monitor();
 
+  /* WICHTIG: window.__app muss HIER gesetzt werden, nicht erst in
+     renderShell() — die E-Mail-Verifizierung (Pflicht, siehe unten)
+     kann einen frühen return auslösen, BEVOR renderShell() je läuft.
+     Das Verifizierungs-Overlay braucht window.__app.submitEmailCode()
+     aber bereits an diesem Punkt — ohne diese Zeile hier bleiben seine
+     Buttons wirkungslos (window.__app wäre schlicht undefined), was
+     sich als "auf den Buttons passiert nichts" zeigt, ganz ohne
+     sichtbaren Fehler, weil das onclick-Attribut selbst still auf
+     einer nicht existierenden Eigenschaft scheitert. */
+  window.__app = appActions;
+
   /* Lokalen Nachrichten-Cache entsperren und zuerst laden — damit die
      Chat-Liste sofort etwas zeigt, auch bevor die Inbox vom Server
      abgeglichen ist. Nutzt denselben Geräteschlüssel wie der Vault,
