@@ -29,6 +29,13 @@ const path = require('node:path');
 
 const PORT = process.env.PORT || 8787;
 const OPK_LOW_WATER = 5;
+/* 19 Jahre statt der früheren 30 Tage — mit der Umstellung auf
+   passwortlose Anmeldung gibt es ohne ein noch gültiges Token keinen
+   Weg zurück ins Konto außer über Pairing von einem anderen Gerät oder
+   die E-Mail-Wiederherstellung (siehe /api/account/recover). Eine
+   kurze Ablaufzeit hätte bedeutet, dass ein Konto nach 30 Tagen
+   Inaktivität faktisch verloren ist. */
+const SESSION_LIFETIME_MS = 19 * 365 * 864e5;
 
 /*───────────────────────────────────────────────────────────────────────────
   DATENBANK
@@ -63,8 +70,13 @@ CREATE TABLE IF NOT EXISTS users (
   email         TEXT,
   avatar_path   TEXT,        -- Verweis auf R2, das Bild selbst liegt nie in der DB
   bio           TEXT DEFAULT '',
-  pw_salt       TEXT NOT NULL,
-  pw_hash       TEXT NOT NULL,
+  /* NULLABLE seit der Umstellung auf passwortlose Anmeldung — bleiben
+     als Spalten bestehen (nicht per ALTER TABLE entfernt), um keine
+     weitere Schema-Migration auf bestehenden Datenbanken zu erzwingen,
+     genau das Problem, das die frühere BIGINT-Umstellung schon einmal
+     verursacht hat. Neue Registrierungen befüllen sie einfach nicht. */
+  pw_salt       TEXT,
+  pw_hash       TEXT,
   uak           TEXT,
   allow_sealed  INTEGER DEFAULT 1,
   /* Ohne SMS-Versanddienst gibt es keinen Weg, eine Telefonnummer
@@ -94,6 +106,24 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS email_verifications (
   user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   code_hash   TEXT NOT NULL,      -- SHA-256 des Codes, nie der Code selbst
+  attempts    INTEGER DEFAULT 0,
+  created_at  BIGINT NOT NULL,
+  expires_at  BIGINT NOT NULL,
+  PRIMARY KEY (user_id)
+);
+
+/* Kontowiederherstellung: falls das lokale Sitzungstoken verloren geht
+   (Browser-Daten gelöscht, neues Gerät ohne Möglichkeit zu koppeln),
+   ist die verifizierte E-Mail-Adresse der einzige verbleibende Weg
+   zurück ins bestehende Konto — es gibt kein Passwort mehr, das
+   alternativ abgefragt werden könnte. Bewusst eine EIGENE Tabelle statt
+   Wiederverwendung von email_verifications: die beiden Codes haben
+   unterschiedliche Tragweite (E-Mail bestätigen vs. tatsächlichen
+   Kontenzugriff gewähren) und sollen nie versehentlich gegeneinander
+   austauschbar sein. */
+CREATE TABLE IF NOT EXISTS account_recovery (
+  user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash   TEXT NOT NULL,
   attempts    INTEGER DEFAULT 0,
   created_at  BIGINT NOT NULL,
   expires_at  BIGINT NOT NULL,
@@ -326,6 +356,14 @@ const q = {
   bumpEmailAttempts: db.prepare('UPDATE email_verifications SET attempts=attempts+1 WHERE user_id=?'),
   dropEmailCode: db.prepare('DELETE FROM email_verifications WHERE user_id=?'),
 
+  /* ---- Kontowiederherstellung ---- */
+  putRecoveryCode: db.prepare(`INSERT INTO account_recovery (user_id,code_hash,attempts,created_at,expires_at)
+    VALUES (?,?,0,?,?) ON CONFLICT(user_id) DO UPDATE SET
+    code_hash=excluded.code_hash, attempts=0, created_at=excluded.created_at, expires_at=excluded.expires_at`),
+  getRecoveryCode: db.prepare('SELECT * FROM account_recovery WHERE user_id=?'),
+  bumpRecoveryAttempts: db.prepare('UPDATE account_recovery SET attempts=attempts+1 WHERE user_id=?'),
+  dropRecoveryCode: db.prepare('DELETE FROM account_recovery WHERE user_id=?'),
+
   /* ---- Geräte ---- */
   insertDevice: db.prepare(`INSERT INTO devices
     (id,user_id,name,platform,ik_dh,ik_sign,is_primary,created_at,last_seen)
@@ -430,7 +468,10 @@ const sha256 = b => crypto.createHash('sha256').update(b).digest();
 const b64 = b => Buffer.from(b).toString('base64');
 const ub64 = s => Buffer.from(s, 'base64');
 
-/* Passwörter: scrypt, serverseitig zusätzlich zum clientseitigen PBKDF2 */
+/* UNGENUTZT seit der Umstellung auf passwortlose Anmeldung — keine
+   Route ruft diese Funktionen mehr auf. Bleiben bestehen (nicht
+   gelöscht), weil sie am Ende der Datei exportiert werden und
+   möglicherweise von externen Testdateien referenziert werden. */
 function hashPw(pw, saltB64) {
   const salt = saltB64 ? ub64(saltB64) : crypto.randomBytes(16);
   const hash = crypto.scryptSync(pw, salt, 64, { N: 16384, r: 8, p: 1 });
@@ -899,18 +940,16 @@ const routes = {
      Konto ohne mindestens ein Gerät kann nichts entschlüsseln. */
   'POST /api/register': async (req, res) => {
     const b = await readBody(req);
-    for (const f of ['name', 'password', 'email', 'ikDH', 'ikSign', 'spk', 'opks', 'deviceName', 'platform'])
+    for (const f of ['name', 'email', 'ikDH', 'ikSign', 'spk', 'opks', 'deviceName', 'platform'])
       if (!b[f]) return json(res, 400, { error: `Feld fehlt: ${f}` });
     if (await q.userByName.get(b.name)) return json(res, 409, { error: 'Name bereits vergeben' });
-    if (String(b.password).length < 8) return json(res, 400, { error: 'Passwort zu kurz' });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.email)) return json(res, 400, { error: 'Ungültige E-Mail-Adresse' });
     if (await q.userByEmail.get(b.email)) return json(res, 409, { error: 'E-Mail bereits vergeben' });
 
     const id = 'u' + crypto.randomBytes(8).toString('hex');
-    const pw = hashPw(b.password);
     const now = Date.now();
     await q.insertUser.run(id, b.name, b.phone || '', b.email || null, null, b.bio || '',
-      pw.salt, pw.hash, now, now);
+      null, null, now, now);
 
     const deviceId = 'd' + crypto.randomBytes(8).toString('hex');
     await q.insertDevice.run(deviceId, id, b.deviceName, b.platform,
@@ -936,7 +975,7 @@ const routes = {
     if (ownEmailHash) await q.putSelfHash.run(id, ownEmailHash);
 
     const token = crypto.randomBytes(32).toString('hex');
-    await q.insertSession.run(token, id, deviceId, now, now + 30 * 864e5);
+    await q.insertSession.run(token, id, deviceId, now, now + SESSION_LIFETIME_MS);
 
     /* E-Mail ist jetzt Pflichtfeld (siehe Feld-Prüfung oben) — der
        Verifizierungscode wird deshalb IMMER verschickt, nicht mehr nur
@@ -1014,39 +1053,99 @@ const routes = {
     json(res, 200, { sent: true });
   },
 
-  /* Login auf einem BEKANNTEN Gerät (deviceId aus vorherigem Login/Pairing
-     im lokalen Speicher). Ein Login ohne bekanntes Gerät muss zuerst über
-     /api/devices/pair-request ein neues Gerät anmelden. */
-  'POST /api/login': async (req, res) => {
-    const b = await readBody(req);
-    const u = await q.userByName.get(b.name || '');
-    if (!u || !verifyPw(b.password || '', u))
-      return json(res, 401, { error: 'Name oder Passwort falsch' });
+  /* ---- Kontowiederherstellung ---- */
+  /* Läuft OHNE bestehende Anmeldung — genau dafür ist sie da: das lokale
+     Sitzungstoken ist verloren (Browser-Daten gelöscht, neues Gerät),
+     die verifizierte E-Mail ist der letzte verbleibende Nachweis.
 
-    let device;
-    if (b.deviceId) {
-      device = await q.deviceById.get(b.deviceId);
-      if (!device || device.user_id !== u.id)
-        return json(res, 403, { error: 'Gerät gehört nicht zu diesem Konto oder wurde entfernt' });
-    } else {
-      /* Kein bekanntes Gerät: nur erlaubt, wenn es NOCH KEIN Gerät für
-         dieses Konto gibt (allererste Anmeldung nach Registrierung auf
-         einem anderen Client, z. B. Passwort-Reset-Flow). Für ein
-         zusätzliches Gerät ist immer Pairing über das Hauptgerät nötig —
-         sonst könnte sich jeder mit dem Passwort allein unbemerkt ein
-         zweites, nicht autorisiertes Gerät eintragen. */
-      return json(res, 428, {
-        error: 'Kein Gerät angegeben — neues Gerät muss über Pairing autorisiert werden',
-        needsPairing: true
-      });
+     WICHTIG: liefert bewusst IMMER dieselbe generische Erfolgsmeldung,
+     unabhängig davon, ob die E-Mail-Adresse tatsächlich zu einem Konto
+     gehört. Ohne dieses Verhalten ließe sich dieser Endpunkt missbrauchen,
+     um herauszufinden, welche E-Mail-Adressen bei diesem Dienst
+     registriert sind — bei einem privatsphäre-orientierten Messenger ist
+     das selbst eine sensible Information, unabhängig vom Kontoinhalt. */
+  'POST /api/account/recover-request': async (req, res) => {
+    const b = await readBody(req);
+    if (!b.email) return json(res, 400, { error: 'E-Mail-Adresse erforderlich' });
+
+    const u = await q.userByEmail.get(b.email);
+    if (u && u.email_verified && MAIL.isConfigured()) {
+      const code = String(crypto.randomInt(100000, 1000000));
+      const codeHash = b64(sha256(Buffer.from(code)));
+      await q.putRecoveryCode.run(u.id, codeHash, Date.now(), Date.now() + 15 * 60000);
+      MAIL.sendVerificationCode(b.email, code).catch(err =>
+        console.warn('Wiederherstellungsmail fehlgeschlagen:', err.message));
+    }
+    /* Absichtlich identische Antwort in JEDEM Fall — siehe Kommentar oben. */
+    json(res, 200, { sent: true });
+  },
+
+  /* Code einreichen, neues Sitzungstoken bekommen. Das neue Token gilt
+     für ein NEUES Gerät (siehe deviceName/platform/identity im Body) —
+     die alten Identitätsschlüssel des verlorenen Geräts lassen sich
+     serverseitig nicht wiederherstellen (sie haben das ursprüngliche
+     Gerät nie verlassen, das ist der ganze Sinn von Ende-zu-Ende-
+     Verschlüsselung). Wiederherstellung stellt also den KONTOZUGRIFF
+     wieder her, nicht die alte lokale Sitzung — der Nutzer bekommt ein
+     frisches Gerät im selben Konto, mit demselben Namen und derselben
+     Kontakthistorie serverseitig, aber einem neuen Schlüsselpaar. */
+  'POST /api/account/recover-verify': async (req, res) => {
+    const b = await readBody(req);
+    if (!b.email || !b.code || !b.deviceName || !b.platform || !b.ikDH || !b.ikSign || !b.spk || !b.opks)
+      return json(res, 400, { error: 'Felder fehlen' });
+
+    const u = await q.userByEmail.get(b.email);
+    if (!u) return json(res, 400, { error: 'Code ungültig oder abgelaufen' });
+
+    const row = await q.getRecoveryCode.get(u.id);
+    if (!row) return json(res, 400, { error: 'Code ungültig oder abgelaufen' });
+    if (row.expires_at < Date.now()) {
+      await q.dropRecoveryCode.run(u.id);
+      return json(res, 400, { error: 'Code ungültig oder abgelaufen' });
+    }
+    if (row.attempts >= 5) {
+      await q.dropRecoveryCode.run(u.id);
+      return json(res, 429, { error: 'Zu viele Fehlversuche — neuen Code anfordern' });
     }
 
-    const token = crypto.randomBytes(32).toString('hex');
+    const givenHash = b64(sha256(Buffer.from(String(b.code))));
+    if (givenHash !== row.code_hash) {
+      await q.bumpRecoveryAttempts.run(u.id);
+      return json(res, 400, { error: 'Code ungültig oder abgelaufen' });
+    }
+    await q.dropRecoveryCode.run(u.id);
+
     const now = Date.now();
-    await q.insertSession.run(token, u.id, device.id, now, now + 30 * 864e5);
+    const deviceId = 'd' + crypto.randomBytes(8).toString('hex');
+    await q.insertDevice.run(deviceId, u.id, b.deviceName, b.platform,
+      JSON.stringify(b.ikDH), JSON.stringify(b.ikSign), 1, now, now);
+    await q.putSPK.run(deviceId, b.spk.spkId, JSON.stringify(b.spk.pub), b.spk.signature, b.spk.createdAt);
+    for (const o of b.opks) await q.addOPK.run(deviceId, o.opkId, JSON.stringify(o.pub));
+
+    const token = crypto.randomBytes(32).toString('hex');
+    await q.insertSession.run(token, u.id, deviceId, now, now + SESSION_LIFETIME_MS);
     await q.touchUser.run(now, u.id);
-    await q.touchDevice.run(now, device.id);
-    json(res, 200, { token, user: pub(u), device: pubDevice(device), sth: await latestSTH() });
+
+    const newDevice = await q.deviceById.get(deviceId);
+    json(res, 200, { token, user: pub(u), device: pubDevice(newDevice), sth: await latestSTH() });
+  },
+
+  /* DEAKTIVIERT seit der Umstellung auf passwortlose Anmeldung. Ohne
+     Passwort wäre eine Prüfung, die nur auf "name" beruht, ein echtes
+     Sicherheitsloch: Nutzernamen sind öffentlich sichtbar (siehe
+     /api/users), jeder könnte sich sonst als jeder andere ausgeben.
+     Die App ruft diese Route nicht mehr auf — ein bekanntes Gerät meldet
+     sich über /api/me mit dem lokal gespeicherten Sitzungstoken an, ein
+     neues Gerät ausschließlich über Pairing (das einen Code von einem
+     bereits angemeldeten Gerät braucht, kein bloßes Erraten eines
+     Namens). Route bleibt als klar abgelehnter Pfad bestehen, statt sie
+     ersatzlos zu entfernen — falls irgendein alter Client sie noch
+     aufruft, bekommt er eine eindeutige Fehlermeldung statt eines
+     stillen Absturzes. */
+  'POST /api/login': async (req, res) => {
+    return json(res, 410, {
+      error: 'Passwort-Login ist entfernt worden. Bitte über Pairing anmelden oder das Konto neu registrieren.'
+    });
   },
 
   'POST /api/logout': async (req, res) => {
@@ -1062,11 +1161,16 @@ const routes = {
      user_id-Fremdschlüsseltabelle räumt Geräte, Sitzungen, Nachrichten,
      Kontakt-Hashes, Blocks und Meldungen automatisch mit ab — kein
      Nachfassen an anderer Stelle nötig. */
+  /* Konto endgültig löschen. Ein gültiges Bearer-Token ist der alleinige
+     Identitätsnachweis (es gibt kein Passwort mehr im System). Die
+     bewusste Bestätigung passiert client-seitig (Namen exakt eintippen,
+     siehe confirmDeleteAccount in app.js) — auf Serverseite reicht ein
+     angemeldetes Gerät, um sein eigenes Konto zu löschen. ON DELETE
+     CASCADE auf jeder user_id-Fremdschlüsseltabelle räumt Geräte,
+     Sitzungen, Nachrichten, Kontakt-Hashes, Blocks und Meldungen
+     automatisch mit ab — kein Nachfassen an anderer Stelle nötig. */
   'POST /api/account/delete': async (req, res) => {
     const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    const b = await readBody(req);
-    if (!verifyPw(b.password || '', a.user))
-      return json(res, 403, { error: 'Passwort falsch' });
     await q.deleteUser.run(a.user.id);
     json(res, 200, { ok: true });
   },
@@ -1178,7 +1282,7 @@ const routes = {
     for (const o of b.opks) await q.addOPK.run(deviceId, o.opkId, JSON.stringify(o.pub));
 
     const token = crypto.randomBytes(32).toString('hex');
-    await q.insertSession.run(token, user.id, deviceId, now, now + 30 * 864e5);
+    await q.insertSession.run(token, user.id, deviceId, now, now + SESSION_LIFETIME_MS);
 
     /* Alle bereits angemeldeten Geräte des Nutzers informieren — vor
        allem das Hauptgerät zeigt "neues Gerät verbunden" an. */
