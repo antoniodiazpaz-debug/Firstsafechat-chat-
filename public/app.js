@@ -687,14 +687,22 @@ async function afterAuth(data) {
 
   /* WICHTIG: window.__app muss HIER gesetzt werden, nicht erst in
      renderShell() — die E-Mail-Verifizierung (Pflicht, siehe unten)
-     kann einen frühen return auslösen, BEVOR renderShell() je läuft.
-     Das Verifizierungs-Overlay braucht window.__app.submitEmailCode()
-     aber bereits an diesem Punkt — ohne diese Zeile hier bleiben seine
-     Buttons wirkungslos (window.__app wäre schlicht undefined), was
-     sich als "auf den Buttons passiert nichts" zeigt, ganz ohne
-     sichtbaren Fehler, weil das onclick-Attribut selbst still auf
-     einer nicht existierenden Eigenschaft scheitert. */
+     kann einen frühen return auslösen, BEVOR renderShell() je läuft. */
   window.__app = appActions;
+
+  /* E-Mail-Verifizierung ist PFLICHT — deshalb hier GANZ AM ANFANG
+     geprüft, VOR jedem anderen await (LocalCache, WebSocket, Inbox,
+     Blockliste). Grund: jeder dieser Aufrufe könnte theoretisch werfen
+     und ohne umgebendes try/catch die gesamte Funktion abbrechen, bevor
+     die Verifizierungsprüfung je erreicht wird — das würde sich exakt
+     als "Overlay erscheint (aus einem früheren, noch im DOM hängenden
+     Aufruf), aber neue Klicks bewirken nichts" zeigen, weil kein neuer
+     Aufruf von showEmailVerifyPrompt() mehr stattfindet und somit auch
+     keine frischen Event-Listener registriert werden. */
+  if (!state.me.emailVerified) {
+    showEmailVerifyPrompt(true);
+    return;
+  }
 
   /* Lokalen Nachrichten-Cache entsperren und zuerst laden — damit die
      Chat-Liste sofort etwas zeigt, auch bevor die Inbox vom Server
@@ -710,15 +718,6 @@ async function afterAuth(data) {
   await loadBlockList();
   await refreshInbox();
 
-  /* E-Mail-Verifizierung ist jetzt PFLICHT (siehe server.js — Registrierung
-     ohne verifizierbare E-Mail schlägt dort bereits fehl) — deshalb hier
-     VOR dem Rendern der Hauptoberfläche prüfen, nicht danach. Ein Konto
-     ohne bestätigte E-Mail kommt gar nicht erst in die App hinein. */
-  if (!state.me.emailVerified) {
-    showEmailVerifyPrompt(true);
-    return;
-  }
-
   $('#auth').classList.add('hide');
   $('#app').classList.remove('hide');
   renderShell();
@@ -727,6 +726,15 @@ async function afterAuth(data) {
 }
 
 function showEmailVerifyPrompt(blocking) {
+  /* Ein eventuell noch vorhandenes altes Sheet zuerst entfernen — sonst
+     könnten zwei Elemente mit derselben id="verifySheet" im DOM landen,
+     falls diese Funktion mehr als einmal aufgerufen wird. getElementById
+     würde dann nur das ERSTE (möglicherweise alte, verwaiste) Element
+     finden, während visuell das neue obenauf liegt — die Event-Listener
+     hingen dann am falschen Element, was sich exakt als "sichtbares
+     Overlay, aber Klicks bewirken nichts" zeigen würde. */
+  document.getElementById('verifySheet')?.remove();
+
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'verifySheet';
   /* Bei PFLICHT-Verifizierung (blocking=true) gibt es bewusst keinen
@@ -758,10 +766,25 @@ function showEmailVerifyPrompt(blocking) {
      Funktionen hier direkt referenziert werden, ohne den Umweg über
      das globale Objekt. Robuster als der Inline-Ansatz, unabhängig
      davon, wann/ob window.__app zu diesem Zeitpunkt bereits gesetzt
-     wurde. */
-  document.getElementById('verifySubmitBtn').addEventListener('click', submitEmailCode);
-  document.getElementById('verifyResendBtn').addEventListener('click', resendEmailCode);
-  document.getElementById('verifyDismissBtn')?.addEventListener('click', dismissEmailVerify);
+     wurde.
+
+     DEFENSIV mit ?. abgesichert: falls eines der Elemente aus
+     irgendeinem Grund null ist, würde ein direkter .addEventListener()-
+     Aufruf sofort werfen und ALLE folgenden Listener-Registrierungen in
+     dieser Funktion verhindern — das würde exakt zum gemeldeten Symptom
+     passen ("Buttons sehen normal aus, reagieren aber auf nichts",
+     weil gar kein Listener je registriert wurde). document.title wird
+     zusätzlich als TEMPORÄRES Diagnosesignal genutzt, weil selbst
+     alert() im Feld nicht sichtbar zuverlässig ankam — eine Änderung
+     des Tab-Titels lässt sich im Browser-Tab-Umschalter oder in der
+     Adressleiste erkennen, ganz ohne Konsolenzugriff. */
+  const submitBtn = document.getElementById('verifySubmitBtn');
+  const resendBtn = document.getElementById('verifyResendBtn');
+  const dismissBtn = document.getElementById('verifyDismissBtn');
+  document.title = 'DIAG: submitBtn=' + !!submitBtn + ' resendBtn=' + !!resendBtn;
+  submitBtn?.addEventListener('click', submitEmailCode);
+  resendBtn?.addEventListener('click', resendEmailCode);
+  dismissBtn?.addEventListener('click', dismissEmailVerify);
 }
 
 async function submitEmailCode() {
