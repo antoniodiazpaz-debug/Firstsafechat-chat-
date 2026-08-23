@@ -306,6 +306,12 @@ const q = {
   insertUser:   db.prepare(`INSERT INTO users
     (id,name,phone,email,avatar_path,bio,pw_salt,pw_hash,created_at,last_seen)
     VALUES (?,?,?,?,?,?,?,?,?,?)`),
+  /* ON DELETE CASCADE ist auf JEDER Tabelle mit user_id-Fremdschlüssel
+     bereits gesetzt (devices, sessions, envelopes, contact_hashes,
+     blocks, reports, ...) — ein einziges DELETE hier räumt daher das
+     komplette Konto vollständig ab, ohne dass server.js jede Tabelle
+     einzeln einzeln durchgehen muss. */
+  deleteUser:   db.prepare('DELETE FROM users WHERE id=?'),
   touchUser:    db.prepare('UPDATE users SET last_seen=? WHERE id=?'),
   updateProfile:db.prepare('UPDATE users SET name=?,bio=?,phone=? WHERE id=?'),
   updateAvatar: db.prepare('UPDATE users SET avatar_path=? WHERE id=?'),
@@ -851,6 +857,7 @@ async function auth(req) {
 }
 const pub = u => u && ({
   id: u.id, name: u.name, avatarPath: u.avatar_path, bio: u.bio, phone: u.phone,
+  email: u.email, emailVerified: !!u.email_verified,
   lastSeen: u.last_seen, online: isOnline(u.id)
 });
 const pubDevice = d => d && ({
@@ -892,11 +899,12 @@ const routes = {
      Konto ohne mindestens ein Gerät kann nichts entschlüsseln. */
   'POST /api/register': async (req, res) => {
     const b = await readBody(req);
-    for (const f of ['name', 'password', 'ikDH', 'ikSign', 'spk', 'opks', 'deviceName', 'platform'])
+    for (const f of ['name', 'password', 'email', 'ikDH', 'ikSign', 'spk', 'opks', 'deviceName', 'platform'])
       if (!b[f]) return json(res, 400, { error: `Feld fehlt: ${f}` });
     if (await q.userByName.get(b.name)) return json(res, 409, { error: 'Name bereits vergeben' });
     if (String(b.password).length < 8) return json(res, 400, { error: 'Passwort zu kurz' });
-    if (b.email && await q.userByEmail.get(b.email)) return json(res, 409, { error: 'E-Mail bereits vergeben' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.email)) return json(res, 400, { error: 'Ungültige E-Mail-Adresse' });
+    if (await q.userByEmail.get(b.email)) return json(res, 409, { error: 'E-Mail bereits vergeben' });
 
     const id = 'u' + crypto.randomBytes(8).toString('hex');
     const pw = hashPw(b.password);
@@ -930,18 +938,27 @@ const routes = {
     const token = crypto.randomBytes(32).toString('hex');
     await q.insertSession.run(token, id, deviceId, now, now + 30 * 864e5);
 
-    /* Verifizierungscode nur, wenn eine E-Mail angegeben wurde UND SMTP
-       konfiguriert ist. Ohne beides bleibt email_verified=0, das Konto
-       funktioniert trotzdem — siehe Kommentar an email_verifications
-       oben. Der Code selbst wird nie im Klartext gespeichert, nur sein
-       SHA-256-Hash (dieselbe Technik wie bei Passwörtern, sha256() ist
-       bereits weiter oben definiert). */
-    if (b.email && MAIL.isConfigured()) {
-      const code = String(crypto.randomInt(100000, 1000000));
-      const codeHash = b64(sha256(Buffer.from(code)));
-      await q.putEmailCode.run(id, codeHash, now, now + 15 * 60000);
-      MAIL.sendVerificationCode(b.email, code).catch(err =>
-        console.warn('Verifizierungsmail fehlgeschlagen:', err.message));
+    /* E-Mail ist jetzt Pflichtfeld (siehe Feld-Prüfung oben) — der
+       Verifizierungscode wird deshalb IMMER verschickt, nicht mehr nur
+       versuchsweise. Schlägt der Versand fehl, wird die gesamte
+       Registrierung zurückgerollt (Konto + Gerät + Sitzung gelöscht),
+       statt ein Konto zu erzeugen, das seinen Code nie bekommen hat
+       und sich damit nie verifizieren lassen könnte. Der Code selbst
+       wird nie im Klartext gespeichert, nur sein SHA-256-Hash
+       (dieselbe Technik wie bei Passwörtern, sha256() ist bereits
+       weiter oben definiert). */
+    if (!MAIL.isConfigured()) {
+      await q.deleteUser.run(id);
+      return json(res, 503, { error: 'Registrierung derzeit nicht möglich — Mailversand nicht konfiguriert' });
+    }
+    const code = String(crypto.randomInt(100000, 1000000));
+    const codeHash = b64(sha256(Buffer.from(code)));
+    await q.putEmailCode.run(id, codeHash, now, now + 15 * 60000);
+    try {
+      await MAIL.sendVerificationCode(b.email, code);
+    } catch (err) {
+      await q.deleteUser.run(id);
+      return json(res, 500, { error: 'Bestätigungsmail konnte nicht verschickt werden — bitte E-Mail-Adresse prüfen' });
     }
 
     const newUser = await q.userById.get(id);
@@ -1035,6 +1052,22 @@ const routes = {
   'POST /api/logout': async (req, res) => {
     const h = req.headers.authorization || '';
     if (h.startsWith('Bearer ')) await q.dropSession.run(h.slice(7));
+    json(res, 200, { ok: true });
+  },
+
+  /* Konto endgültig löschen. Passwort-Bestätigung ist Pflicht — ein
+     gestohlener/geleakter Sitzungstoken allein darf nicht reichen, um
+     ein Konto zu vernichten, das ist eine deutlich schwerwiegendere
+     Aktion als z. B. nur ausloggen. ON DELETE CASCADE auf jeder
+     user_id-Fremdschlüsseltabelle räumt Geräte, Sitzungen, Nachrichten,
+     Kontakt-Hashes, Blocks und Meldungen automatisch mit ab — kein
+     Nachfassen an anderer Stelle nötig. */
+  'POST /api/account/delete': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!verifyPw(b.password || '', a.user))
+      return json(res, 403, { error: 'Passwort falsch' });
+    await q.deleteUser.run(a.user.id);
     json(res, 200, { ok: true });
   },
 
