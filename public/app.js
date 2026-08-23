@@ -765,38 +765,51 @@ function showEmailVerifyPrompt(blocking) {
 }
 
 async function submitEmailCode() {
-  const input = document.getElementById('verifyCodeInput');
-  const errEl = document.getElementById('verifyError');
-  const code = input?.value.trim();
-  if (!code || code.length !== 6) {
-    errEl.textContent = 'Bitte den 6-stelligen Code eingeben.';
-    errEl.style.display = 'block';
-    return;
-  }
   try {
-    await api.verifyEmail(code);
-    state.me.emailVerified = true;
-    document.getElementById('verifySheet')?.remove();
-    toast('✓ E-Mail bestätigt');
-
-    /* Bei Pflicht-Verifizierung war die Hauptoberfläche bisher noch nie
-       aufgebaut — jetzt automatisch weiterleiten, ohne dass ein
-       erneuter Login-Schritt nötig wäre. Das Sitzungstoken aus der
-       Registrierung ist bereits gültig; der Nutzer ist im
-       API-/WebSocket-Sinn längst angemeldet, es fehlte nur die
-       Freischaltung der Oberfläche. */
-    if ($('#app').classList.contains('hide')) {
-      $('#auth').classList.add('hide');
-      $('#app').classList.remove('hide');
-      renderShell();
-      go('chats');
-      toast('Willkommen, ' + state.me.name + ' 🔐');
+    const input = document.getElementById('verifyCodeInput');
+    const errEl = document.getElementById('verifyError');
+    const code = input?.value.trim();
+    if (!code || code.length !== 6) {
+      if (errEl) { errEl.textContent = 'Bitte den 6-stelligen Code eingeben.'; errEl.style.display = 'block'; }
+      else alert('DIAGNOSE: errEl nicht gefunden, Code war: ' + code);
+      return;
     }
-  } catch (e) {
-    errEl.textContent = e.message === 'Code falsch' ? 'Falscher Code — bitte prüfen.'
-      : e.message === 'Code abgelaufen — neuen anfordern' ? 'Code abgelaufen — tipp auf "Code erneut senden".'
-      : e.message;
-    errEl.style.display = 'block';
+    try {
+      await api.verifyEmail(code);
+      state.me.emailVerified = true;
+      document.getElementById('verifySheet')?.remove();
+      toast('✓ E-Mail bestätigt');
+
+      /* Bei Pflicht-Verifizierung war die Hauptoberfläche bisher noch nie
+         aufgebaut — jetzt automatisch weiterleiten, ohne dass ein
+         erneuter Login-Schritt nötig wäre. Das Sitzungstoken aus der
+         Registrierung ist bereits gültig; der Nutzer ist im
+         API-/WebSocket-Sinn längst angemeldet, es fehlte nur die
+         Freischaltung der Oberfläche. */
+      if ($('#app').classList.contains('hide')) {
+        $('#auth').classList.add('hide');
+        $('#app').classList.remove('hide');
+        renderShell();
+        go('chats');
+        toast('Willkommen, ' + state.me.name + ' 🔐');
+      }
+    } catch (e) {
+      const msg = e.message === 'Code falsch' ? 'Falscher Code — bitte prüfen.'
+        : e.message === 'Code abgelaufen — neuen anfordern' ? 'Code abgelaufen — tipp auf "Code erneut senden".'
+        : e.message;
+      if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+      else alert('DIAGNOSE: errEl nicht gefunden. Fehler war: ' + msg);
+    }
+  } catch (outerErr) {
+    /* TEMPORÄR zur Fehlersuche: fängt JEDEN unerwarteten Fehler ab, der
+       außerhalb des inneren try/catch auftritt (z. B. wenn $('#app')
+       selbst wirft, oder renderShell()/go() einen Fehler hat) — ohne
+       dieses äußere Netz würde ein solcher Fehler komplett lautlos
+       bleiben, exakt das gemeldete Symptom "Buttons reagieren, aber
+       nichts passiert". alert() ist hier bewusst blockierend gewählt,
+       damit die Meldung garantiert gesehen wird, auch ohne Zugriff auf
+       die Browser-Konsole. */
+    alert('DIAGNOSE — unerwarteter Fehler in submitEmailCode: ' + outerErr.message + '\n\n' + outerErr.stack);
   }
 }
 
