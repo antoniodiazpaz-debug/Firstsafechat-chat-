@@ -69,6 +69,18 @@ export class ApiClient {
     return data;
   }
 
+  /* E-Mail-Bestätigungscode einreichen — wirft bei falschem/abgelaufenem
+     Code, der Aufrufer fängt das ab und zeigt die Fehlermeldung an. */
+  async verifyEmail(code) {
+    return this._fetch('/api/verify-email', { method: 'POST', body: { code } });
+  }
+
+  /* Neuen Code anfordern, z. B. wenn der erste nie ankam. */
+  async resendVerification() {
+    return this._fetch('/api/resend-verification', { method: 'POST' });
+  }
+
+
   /* Erste Anmeldung auf einem GERÄT braucht deviceId aus lokalem Speicher.
      Ohne deviceId antwortet der Server mit 428 + needsPairing:true —
      der Aufrufer muss dann pairClaim() nutzen, nicht login() erneut. */

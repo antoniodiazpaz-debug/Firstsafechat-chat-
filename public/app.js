@@ -43,19 +43,6 @@ function toast(msg, ms = 2300) {
 const API_BASE = window.SECURECHAT_CONFIG?.apiBase || location.origin;
 const api = new ApiClient(API_BASE);
 
-/* media-storage.js braucht ein fetch()-förmiges apiFetch (mit .ok/.json()),
-   anders als api-client.js's eigenes _fetch(), das direkt geparstes JSON
-   zurückgibt — dieser dünne Adapter überbrückt das, ohne api-client.js
-   selbst umzubauen. Nutzt denselben Bearer-Token wie alle anderen
-   authentifizierten Aufrufe. */
-function authedFetch(path, opts = {}) {
-  return fetch(API_BASE + path, {
-    ...opts,
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}),
-      ...(api.token ? { Authorization: 'Bearer ' + api.token } : {}) }
-  });
-}
-
 /* ═══════════════════════════════════════════════════════════════════════
    LOKALER VAULT — verschlüsselte Schlüsselspeicherung (IndexedDB)
    Der private Schlüssel eines Geräts verlässt dieses Gerät nie. Er wird
@@ -443,12 +430,20 @@ async function authSubmit() {
       const phone = $('#aPhone').value.trim();
       if (password.length < 8) return authErr(t('passwordTooShort'));
 
+      const email = $('#aEmail').value.trim();
+      if (!email) return authErr(t('emailRequired'));
+      /* Bewusst nur eine grobe Formprüfung (etwas@etwas.etwas) — die
+         eigentliche Gültigkeit bestätigt sich erst durch den zugestellten
+         Bestätigungscode. Eine strengere Regex hier würde nur seltene,
+         aber technisch gültige Adressen fälschlich ablehnen. */
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return authErr(t('emailInvalid'));
+
       btn.textContent = t('generatingKeys');
       const identity = await PreKeys.createStore();
       const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
         (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
       const data = await api.register({
-        name, password, phone: phone || undefined, email: $('#aEmail').value.trim() || undefined,
+        name, password, phone: phone || undefined, email,
         deviceName: guessDeviceName(), platform, identity
       });
       await Vault.save(data.device.id, password, identity, { name, userId: data.user.id });
@@ -621,11 +616,97 @@ async function afterAuth(data, password) {
   await loadBlockList();
   await refreshInbox();
 
+  /* E-Mail-Verifizierung ist jetzt PFLICHT (siehe server.js — Registrierung
+     ohne verifizierbare E-Mail schlägt dort bereits fehl) — deshalb hier
+     VOR dem Rendern der Hauptoberfläche prüfen, nicht danach. Ein Konto
+     ohne bestätigte E-Mail kommt gar nicht erst in die App hinein. */
+  if (!state.me.emailVerified) {
+    showEmailVerifyPrompt(true);
+    return;
+  }
+
   $('#auth').classList.add('hide');
   $('#app').classList.remove('hide');
   renderShell();
   go('chats');
   toast('Willkommen, ' + state.me.name + ' 🔐');
+}
+
+function showEmailVerifyPrompt(blocking) {
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'verifySheet';
+  /* Bei PFLICHT-Verifizierung (blocking=true) gibt es bewusst keinen
+     "Später"-Button und keinen Klick-außerhalb-zum-Schließen — das
+     Konto kommt sonst nie zur eigentlichen App durch, siehe server.js,
+     wo die Registrierung selbst ohne erfolgreichen Mailversand schon
+     zurückgerollt wird. */
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 8px">E-Mail bestätigen</h3>
+      <p style="color:var(--sub);margin:0 0 16px;font-size:14px">
+        Wir haben einen 6-stelligen Code an ${esc(state.me.email)} geschickt.
+        ${blocking ? 'Die Bestätigung ist erforderlich, um fortzufahren.' : ''}
+      </p>
+      <input id="verifyCodeInput" inputmode="numeric" maxlength="6" placeholder="000000"
+        style="width:100%;box-sizing:border-box;font-size:24px;letter-spacing:8px;text-align:center;
+          padding:14px;border-radius:10px;border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
+      <div id="verifyError" style="color:#f15c6d;font-size:13px;margin-bottom:12px;display:none"></div>
+      <button class="btn" style="width:100%;margin-bottom:8px" onclick="window.__app.submitEmailCode()">Bestätigen</button>
+      <button class="btn ghost" style="width:100%${blocking ? '' : ';margin-bottom:8px'}" onclick="window.__app.resendEmailCode()">Code erneut senden</button>
+      ${blocking ? '' : '<button class="btn ghost" style="width:100%" onclick="window.__app.dismissEmailVerify()">Später</button>'}
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+  document.getElementById('verifyCodeInput')?.focus();
+}
+
+async function submitEmailCode() {
+  const input = document.getElementById('verifyCodeInput');
+  const errEl = document.getElementById('verifyError');
+  const code = input?.value.trim();
+  if (!code || code.length !== 6) {
+    errEl.textContent = 'Bitte den 6-stelligen Code eingeben.';
+    errEl.style.display = 'block';
+    return;
+  }
+  try {
+    await api.verifyEmail(code);
+    state.me.emailVerified = true;
+    document.getElementById('verifySheet')?.remove();
+    toast('✓ E-Mail bestätigt');
+
+    /* Bei Pflicht-Verifizierung war die Hauptoberfläche bisher noch nie
+       aufgebaut — jetzt automatisch weiterleiten, ohne dass ein
+       erneuter Login-Schritt nötig wäre. Das Sitzungstoken aus der
+       Registrierung ist bereits gültig; der Nutzer ist im
+       API-/WebSocket-Sinn längst angemeldet, es fehlte nur die
+       Freischaltung der Oberfläche. */
+    if ($('#app').classList.contains('hide')) {
+      $('#auth').classList.add('hide');
+      $('#app').classList.remove('hide');
+      renderShell();
+      go('chats');
+      toast('Willkommen, ' + state.me.name + ' 🔐');
+    }
+  } catch (e) {
+    errEl.textContent = e.message === 'Code falsch' ? 'Falscher Code — bitte prüfen.'
+      : e.message === 'Code abgelaufen — neuen anfordern' ? 'Code abgelaufen — tipp auf "Code erneut senden".'
+      : e.message;
+    errEl.style.display = 'block';
+  }
+}
+
+async function resendEmailCode() {
+  try {
+    await api.resendVerification();
+    toast('📧 Neuer Code verschickt — bitte Postfach prüfen');
+  } catch (e) {
+    toast('⚠️ ' + e.message);
+  }
+}
+
+function dismissEmailVerify() {
+  document.getElementById('verifySheet')?.remove();
 }
 
 /* Server nicht erreichbar, aber der Vault hat sich lokal mit dem
@@ -901,6 +982,12 @@ const appActions = {
     const conv = state.convs.get(state.activeConv.convId);
     Call.start(state.activeConv.peerId, state.activeConv.name || conv?.name, kind);
   },
+  submitEmailCode() { submitEmailCode(); },
+  resendEmailCode() { resendEmailCode(); },
+  dismissEmailVerify() { dismissEmailVerify(); },
+  logoutClick() { logoutClick(); },
+  showDeleteAccount() { showDeleteAccount(); },
+  confirmDeleteAccount() { confirmDeleteAccount(); },
   mainMenu(e) { openMainMenu(e); },
   closeChat() { closeChat(); },
   sendClick() { sendCurrentMessage(); },
@@ -1220,7 +1307,75 @@ function startChatWith(userId) {
   openChat(conv);
 }
 
-function openMainMenu(e) { toast('Menü folgt im nächsten Schritt'); }
+function openMainMenu(e) {
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'mainMenuSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <div class="row" style="padding:8px 0">
+        <div class="av">${esc((state.me.name || '?')[0].toUpperCase())}</div>
+        <div class="meta" style="border-bottom:none">
+          <div class="l1"><span class="nm">${esc(state.me.name)}</span></div>
+          <div class="l2" style="color:var(--sub);font-size:13px">${esc(state.me.email || '')}</div>
+        </div>
+      </div>
+      <button class="btn ghost" style="width:100%;margin-top:16px" onclick="window.__app.logoutClick()">Abmelden</button>
+      <button class="btn ghost" style="width:100%;margin-top:8px;color:#f15c6d" onclick="window.__app.showDeleteAccount()">Konto löschen</button>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+
+async function logoutClick() {
+  document.getElementById('mainMenuSheet')?.remove();
+  try { await api.logout(); } catch {}
+  Vault.forget();
+  location.reload();
+}
+
+function showDeleteAccount() {
+  document.getElementById('mainMenuSheet')?.remove();
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'deleteAccountSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 8px;color:#f15c6d">Konto endgültig löschen</h3>
+      <p style="color:var(--sub);margin:0 0 16px;font-size:14px">
+        Das kann nicht rückgängig gemacht werden. Alle Nachrichten, Geräte
+        und Kontaktdaten dieses Kontos werden unwiderruflich gelöscht.
+      </p>
+      <input id="deleteAccountPw" type="password" placeholder="Passwort zur Bestätigung"
+        style="width:100%;box-sizing:border-box;font-size:16px;padding:14px;border-radius:10px;
+          border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
+      <div id="deleteAccountError" style="color:#f15c6d;font-size:13px;margin-bottom:12px;display:none"></div>
+      <button class="btn" style="width:100%;margin-bottom:8px;background:#f15c6d"
+        onclick="window.__app.confirmDeleteAccount()">Konto endgültig löschen</button>
+      <button class="btn ghost" style="width:100%" onclick="document.getElementById('deleteAccountSheet').remove()">Abbrechen</button>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+
+async function confirmDeleteAccount() {
+  const input = document.getElementById('deleteAccountPw');
+  const errEl = document.getElementById('deleteAccountError');
+  const password = input?.value;
+  if (!password) {
+    errEl.textContent = 'Bitte Passwort eingeben.';
+    errEl.style.display = 'block';
+    return;
+  }
+  try {
+    await api.deleteAccount(password);
+    Vault.forget();
+    location.reload();
+  } catch (e) {
+    errEl.textContent = e.message === 'Passwort falsch' ? 'Falsches Passwort.' : e.message;
+    errEl.style.display = 'block';
+  }
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
    CHAT-MENÜ — Blockieren & Melden
@@ -1322,10 +1477,8 @@ async function submitReport() {
    media-storage.js). Sie werden separat verschlüsselt zu R2 hochgeladen;
    nur Pfad+Schlüssel (~250 Byte) reisen durch den geschützten Weg. Dabei
    ist der Absender für den Speicherdienst sichtbar — anders als beim
-   reinen Textpfad. Ohne serverseitig konfiguriertes R2 (R2_ACCOUNT_ID
-   etc. bei Fly.io, siehe r2-presign.js) bleibt Textversand voll nutzbar,
-   der Server liefert dann einen klaren 503 statt eines Absturzes,
-   wenn ein Anhang versendet werden soll.
+   reinen Textpfad. Ohne konfigurierten Medienspeicher (window.MEDIA_CONFIG)
+   bleibt Textversand voll nutzbar, nur Anhänge sind dann deaktiviert.
    ═══════════════════════════════════════════════════════════════════════ */
 function attachSheet() {
   const sheet = document.createElement('div');
@@ -1364,8 +1517,8 @@ function pickMedia(accept, kind) {
 
 async function sendMediaMessage(file, kind) {
   if (!state.activeConv) return;
-  if (!window.MediaStorage) {
-    toast('⚠️ Medienspeicher nicht verfügbar — media-storage.js fehlt');
+  if (!window.MediaStorage || !window.MEDIA_CONFIG?.uploadUrl) {
+    toast('⚠️ Kein Medienspeicher konfiguriert — siehe media-storage.js/config.js');
     return;
   }
   toast('📎 Wird hochgeladen…', 4000);
@@ -1375,7 +1528,7 @@ async function sendMediaMessage(file, kind) {
       try { toUpload = await window.MediaStorage.shrinkImage(file); } catch {}
     }
     const uploaded = await window.MediaStorage.uploadMedia(toUpload,
-      { apiFetch: authedFetch, kind });
+      { uploadUrl: window.MEDIA_CONFIG.uploadUrl, kind });
     const ref = window.MediaStorage.mediaReference(uploaded);
 
     /* Nur die winzige Referenz (~250 Byte) geht durch den geschützten
@@ -1409,13 +1562,12 @@ function parseIncomingMedia(text) {
 }
 
 async function downloadAndShowMedia(msgId, ref, kind) {
-  if (!window.MediaStorage) {
-    toast('⚠️ Medienspeicher nicht verfügbar'); return;
+  if (!window.MediaStorage || !window.MEDIA_CONFIG?.downloadUrl) {
+    toast('⚠️ Kein Medienspeicher konfiguriert'); return;
   }
   toast('⬇️ Wird geladen…', 3000);
   try {
-    const { path, key } = window.MediaStorage.parseMediaReference(ref);
-    const blob = await window.MediaStorage.downloadMedia(path, key, { apiFetch: authedFetch });
+    const blob = await window.MediaStorage.downloadMedia(ref, { downloadUrl: window.MEDIA_CONFIG.downloadUrl });
     const url = URL.createObjectURL(blob);
     for (const list of state.messages.values()) {
       const m = list.find(x => x.id === msgId);
