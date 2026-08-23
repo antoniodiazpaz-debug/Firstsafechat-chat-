@@ -746,12 +746,22 @@ function showEmailVerifyPrompt(blocking) {
         style="width:100%;box-sizing:border-box;font-size:24px;letter-spacing:8px;text-align:center;
           padding:14px;border-radius:10px;border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
       <div id="verifyError" style="color:#f15c6d;font-size:13px;margin-bottom:12px;display:none"></div>
-      <button class="btn" style="width:100%;margin-bottom:8px" onclick="window.__app.submitEmailCode()">Bestätigen</button>
-      <button class="btn ghost" style="width:100%${blocking ? '' : ';margin-bottom:8px'}" onclick="window.__app.resendEmailCode()">Code erneut senden</button>
-      ${blocking ? '' : '<button class="btn ghost" style="width:100%" onclick="window.__app.dismissEmailVerify()">Später</button>'}
+      <button class="btn" id="verifySubmitBtn" style="width:100%;margin-bottom:8px">Bestätigen</button>
+      <button class="btn ghost" id="verifyResendBtn" style="width:100%${blocking ? '' : ';margin-bottom:8px'}">Code erneut senden</button>
+      ${blocking ? '' : '<button class="btn ghost" id="verifyDismissBtn" style="width:100%">Später</button>'}
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
   document.getElementById('verifyCodeInput')?.focus();
+
+  /* Direkte Event-Listener statt onclick="window.__app...()" — das
+     umgeht JEDES Timing-Problem mit window.__app komplett, weil die
+     Funktionen hier direkt referenziert werden, ohne den Umweg über
+     das globale Objekt. Robuster als der Inline-Ansatz, unabhängig
+     davon, wann/ob window.__app zu diesem Zeitpunkt bereits gesetzt
+     wurde. */
+  document.getElementById('verifySubmitBtn').addEventListener('click', submitEmailCode);
+  document.getElementById('verifyResendBtn').addEventListener('click', resendEmailCode);
+  document.getElementById('verifyDismissBtn')?.addEventListener('click', dismissEmailVerify);
 }
 
 async function submitEmailCode() {
