@@ -670,16 +670,35 @@ async function renderLoginForKnownDevice(deviceId, userName) {
 }
 
 async function reconstructIdentityFromVault(data) {
+  /* TEMPORÄR zur Fehlersuche: zeigt die tatsächliche Struktur der
+     gespeicherten Daten, bevor der Import versucht wird — damit wir
+     sehen, welches Feld genau fehlerhaft ist, statt nur zu wissen,
+     dass IRGENDWO in dieser Funktion ein Fehler auftritt. */
+  document.title = 'DIAG data.IK: ' + JSON.stringify(data.IK).slice(0, 80);
+  await new Promise(r => setTimeout(r, 1500));
+  document.title = 'DIAG data.IKS: ' + JSON.stringify(data.IKS).slice(0, 80);
+  await new Promise(r => setTimeout(r, 1500));
+  document.title = 'DIAG data.SPK: ' + JSON.stringify(data.SPK).slice(0, 80);
+  await new Promise(r => setTimeout(r, 1500));
+  document.title = 'DIAG data.opks: ' + JSON.stringify(data.opks).slice(0, 80);
+  await new Promise(r => setTimeout(r, 1500));
+
   const importDH = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
   const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
   const pubOnly = jwk => { const c = { ...jwk }; delete c.d; return c; };
+
+  document.title = 'DIAG: importiere IK...';
   const IK = { priv: await importDH(data.IK), privJwk: data.IK, pubJwk: pubOnly(data.IK) };
+  document.title = 'DIAG: IK OK, importiere IKS...';
   const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
+  document.title = 'DIAG: IKS OK, importiere SPK...';
   const SPK = { priv: await importDH(data.SPK), privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
+  document.title = 'DIAG: SPK OK, importiere opks...';
   const opks = new Map();
   for (const [id, jwk] of data.opks) {
     opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
   }
+  document.title = 'DIAG: alles erfolgreich importiert';
   return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0,
     spkMeta: { spkId: 1, createdAt: Date.now(), sig: null } };
 }
