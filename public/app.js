@@ -467,6 +467,14 @@ async function authSubmit() {
        und es nie in lesbarer Form verlässt. */
     await Vault.save(data.device.id, identity, { name, userId: data.user.id, token: data.token });
     Vault.rememberDevice(data.device.id, name);
+    /* TEMPORÄR zur Fehlersuche: sofort nach dem Schreiben direkt wieder
+       auslesen, um zu prüfen, ob localStorage.setItem in DIESEM Moment
+       überhaupt funktioniert — falls hier schon "KEINS" steht, liegt
+       das Problem beim Schreiben selbst, nicht erst beim späteren
+       Wiedereröffnen der App (z. B. Speicherzugriff blockiert, Storage-
+       Kontingent voll, Browser-Einstellung verhindert Persistenz). */
+    document.title = 'DIAG sofort nach rememberDevice: ' + (localStorage.getItem('securechat:deviceId') || 'KEINS') + ' | href=' + location.href.slice(0, 50);
+    await new Promise(r => setTimeout(r, 3000));
     state.identity = identity;
     await afterAuth(data);
   } catch (e) {
