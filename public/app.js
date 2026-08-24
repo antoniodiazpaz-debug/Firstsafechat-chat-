@@ -72,8 +72,18 @@ const Vault = {
         if (!db.objectStoreNames.contains('deviceKey'))
           db.createObjectStore('deviceKey', { keyPath: 'id' });
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      /* OHNE diesen Handler bleibt indexedDB.open() UNBEGRENZT hängen
+         (weder resolve noch reject), falls eine ÄLTERE Verbindung zu
+         dieser Datenbank noch in einem anderen Tab offen ist (z. B. ein
+         alter, nie geschlossener Tab von einem früheren Testlauf) — das
+         zeigt sich exakt als endlos drehender Ladebildschirm, weil der
+         äußere try/catch nie greift: das await selbst kehrt nie zurück.
+         Der Timeout ist eine zusätzliche Absicherung für den Fall, dass
+         onblocked aus irgendeinem Grund selbst nicht feuert. */
+      req.onblocked = () => reject(new Error('db-blocked (anderer Tab noch offen — bitte alle anderen Tabs mit dieser App schließen)'));
+      const timeoutId = setTimeout(() => reject(new Error('db-open-timeout')), 8000);
+      req.onsuccess = () => { clearTimeout(timeoutId); resolve(req.result); };
+      req.onerror = () => { clearTimeout(timeoutId); reject(req.error); };
     });
     return this._dbp;
   },
@@ -655,6 +665,28 @@ async function renderLoginForKnownDevice(deviceId, userName) {
     await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
   } catch (e) {
     $('#boot').classList.add('hide');
+
+    if (e.message === 'db-blocked' || e.message === 'db-open-timeout') {
+      /* Rein technisches, VORÜBERGEHENDES Problem (meist ein alter,
+         noch offener Tab, der die Datenbankverbindung blockiert) — hat
+         nichts mit dem Konto selbst zu tun. Vault NICHT vergessen und
+         NICHT zur Registrierung zwingen, das würde ein völlig
+         funktionsfähiges Konto grundlos verlieren lassen. Stattdessen
+         klar erklären, was zu tun ist. */
+      $('#auth').classList.remove('hide');
+      $('#auth').innerHTML = `
+        <div class="card">
+          <div class="logo"><div class="ic">⚠️</div><h1>Verbindung blockiert</h1></div>
+          <p style="color:var(--sub);font-size:14px;margin:0 0 16px">
+            Ein anderer offener Tab mit dieser App verhindert gerade den Zugriff
+            auf den lokalen Schlüsselspeicher. Bitte schließe alle anderen Tabs
+            mit dieser Seite und lade dann neu.
+          </p>
+          <button class="btn" onclick="location.reload()">Erneut versuchen</button>
+        </div>`;
+      return;
+    }
+
     /* Token abgelaufen oder Vault beschädigt: dieses Gerät kann sich
        nicht mehr automatisch anmelden. Ohne Passwort gibt es keinen Weg,
        den ALTEN Zugang wiederherzustellen — die einzig verbleibenden
