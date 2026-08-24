@@ -467,14 +467,6 @@ async function authSubmit() {
        und es nie in lesbarer Form verlässt. */
     await Vault.save(data.device.id, identity, { name, userId: data.user.id, token: data.token });
     Vault.rememberDevice(data.device.id, name);
-    /* TEMPORÄR zur Fehlersuche: sofort nach dem Schreiben direkt wieder
-       auslesen, um zu prüfen, ob localStorage.setItem in DIESEM Moment
-       überhaupt funktioniert — falls hier schon "KEINS" steht, liegt
-       das Problem beim Schreiben selbst, nicht erst beim späteren
-       Wiedereröffnen der App (z. B. Speicherzugriff blockiert, Storage-
-       Kontingent voll, Browser-Einstellung verhindert Persistenz). */
-    document.title = 'DIAG sofort nach rememberDevice: ' + (localStorage.getItem('securechat:deviceId') || 'KEINS') + ' | href=' + location.href.slice(0, 50);
-    await new Promise(r => setTimeout(r, 3000));
     state.identity = identity;
     await afterAuth(data);
   } catch (e) {
@@ -629,46 +621,64 @@ function renderRecoveryCodeStep(email) {
    oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
    Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
    mehr, weil es kein Passwort mehr gibt. */
+function showDiagPanel(text) {
+  document.getElementById('diagPanel')?.remove();
+  const panel = document.createElement('div');
+  panel.id = 'diagPanel';
+  panel.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;color:#0f0;' +
+    'font-family:monospace;font-size:13px;padding:16px;overflow:auto;white-space:pre-wrap;' +
+    'word-break:break-word;user-select:text;-webkit-user-select:text';
+  panel.textContent = text;
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕ Schließen';
+  closeBtn.style.cssText = 'position:sticky;top:0;background:#f15c6d;color:#fff;border:none;' +
+    'padding:10px 16px;border-radius:8px;margin-bottom:12px;font-size:14px;display:block';
+  closeBtn.onclick = () => panel.remove();
+  panel.prepend(closeBtn);
+  document.body.appendChild(panel);
+}
+
 async function renderLoginForKnownDevice(deviceId, userName) {
   $('#bootMsg').textContent = 'Automatische Anmeldung …';
   $('#boot').classList.remove('hide');
 
+  const log = [];
+  const step = (msg) => { log.push(msg); };
+
   try {
-    document.title = 'DIAG: lade Vault für ' + deviceId.slice(0, 8);
+    step('1. Lade Vault für Gerät: ' + deviceId);
     const vaultRec = await Vault.load(deviceId);
-    document.title = 'DIAG: vaultRec=' + (vaultRec === null ? 'null' : vaultRec === 'corrupt' ? 'corrupt' : 'OK, hasToken=' + !!vaultRec.meta?.token);
+    step('2. vaultRec = ' + (vaultRec === null ? 'null' : vaultRec === 'corrupt' ? 'corrupt'
+      : 'Objekt mit meta=' + JSON.stringify(vaultRec.meta) + ', data-Schlüssel=' + Object.keys(vaultRec.data || {}).join(',')));
     if (!vaultRec || vaultRec === 'corrupt' || !vaultRec.meta?.token) {
-      throw new Error('vault-unusable');
+      throw new Error('vault-unusable (vaultRec war ' + (vaultRec === null ? 'null' : vaultRec) + ')');
     }
+    step('3. Rekonstruiere Identität aus: ' + JSON.stringify(vaultRec.data).slice(0, 300));
     state.identity = await reconstructIdentityFromVault(vaultRec.data);
-    document.title = 'DIAG: identity rekonstruiert, rufe /api/me auf';
+    step('4. Identität erfolgreich rekonstruiert');
 
     let me;
     try {
+      step('5. Rufe /api/me auf mit Token: ' + vaultRec.meta.token.slice(0, 12) + '...');
       me = await api._fetch('/api/me', { auth: false, headers: { Authorization: 'Bearer ' + vaultRec.meta.token } });
-      document.title = 'DIAG: /api/me erfolgreich, user=' + me.user?.name;
+      step('6. /api/me erfolgreich: ' + JSON.stringify(me).slice(0, 200));
     } catch (e) {
-      document.title = 'DIAG: /api/me FEHLER, status=' + e.status + ' msg=' + e.message;
+      step('6. /api/me FEHLER: status=' + e.status + ' message=' + e.message);
       if (e.status === 401) throw new Error('token-expired');
-      /* Server nicht erreichbar, Vault aber lesbar — Offline-Modus,
-         genau wie zuvor beim Passwort-Pfad. */
       $('#boot').classList.add('hide');
       await afterAuthOffline(deviceId, userName);
       return;
     }
 
     api.token = vaultRec.meta.token;
+    step('7. Rufe afterAuth auf...');
     await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
+    step('8. afterAuth abgeschlossen');
   } catch (e) {
-    document.title = 'DIAG: renderLoginForKnownDevice FEHLER: ' + e.message;
+    step('FEHLER GEFANGEN: ' + e.message);
+    step('STACK: ' + e.stack);
+    showDiagPanel(log.join('\n\n'));
     $('#boot').classList.add('hide');
-    /* Token abgelaufen (nach 30 Tagen Inaktivität) oder Vault
-       beschädigt: dieses Gerät kann sich nicht mehr automatisch
-       anmelden. Ohne Passwort gibt es keinen Weg, den ALTEN Zugang
-       wiederherzustellen — die einzig verbleibende Option ist eine
-       neue Registrierung (das alte Konto bleibt auf dem Server
-       bestehen, ein anderes bereits angemeldetes Gerät könnte dieses
-       hier stattdessen über Pairing neu koppeln, falls eines existiert). */
     Vault.forget();
     renderAuthChoice();
     if (e.message === 'token-expired') {
@@ -678,35 +688,16 @@ async function renderLoginForKnownDevice(deviceId, userName) {
 }
 
 async function reconstructIdentityFromVault(data) {
-  /* TEMPORÄR zur Fehlersuche: zeigt die tatsächliche Struktur der
-     gespeicherten Daten, bevor der Import versucht wird — damit wir
-     sehen, welches Feld genau fehlerhaft ist, statt nur zu wissen,
-     dass IRGENDWO in dieser Funktion ein Fehler auftritt. */
-  document.title = 'DIAG data.IK: ' + JSON.stringify(data.IK).slice(0, 80);
-  await new Promise(r => setTimeout(r, 1500));
-  document.title = 'DIAG data.IKS: ' + JSON.stringify(data.IKS).slice(0, 80);
-  await new Promise(r => setTimeout(r, 1500));
-  document.title = 'DIAG data.SPK: ' + JSON.stringify(data.SPK).slice(0, 80);
-  await new Promise(r => setTimeout(r, 1500));
-  document.title = 'DIAG data.opks: ' + JSON.stringify(data.opks).slice(0, 80);
-  await new Promise(r => setTimeout(r, 1500));
-
   const importDH = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
   const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
   const pubOnly = jwk => { const c = { ...jwk }; delete c.d; return c; };
-
-  document.title = 'DIAG: importiere IK...';
   const IK = { priv: await importDH(data.IK), privJwk: data.IK, pubJwk: pubOnly(data.IK) };
-  document.title = 'DIAG: IK OK, importiere IKS...';
   const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
-  document.title = 'DIAG: IKS OK, importiere SPK...';
   const SPK = { priv: await importDH(data.SPK), privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
-  document.title = 'DIAG: SPK OK, importiere opks...';
   const opks = new Map();
   for (const [id, jwk] of data.opks) {
     opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
   }
-  document.title = 'DIAG: alles erfolgreich importiert';
   return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0,
     spkMeta: { spkId: 1, createdAt: Date.now(), sig: null } };
 }
