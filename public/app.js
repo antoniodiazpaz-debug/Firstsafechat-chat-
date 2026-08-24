@@ -371,6 +371,7 @@ async function boot() {
   }
 
   const knownDevice = await Vault.knownDeviceId();
+  document.title = 'DIAG: boot() knownDevice=' + (knownDevice || 'KEINS');
   $('#boot').classList.add('hide');
 
   if (knownDevice) {
@@ -625,16 +626,21 @@ async function renderLoginForKnownDevice(deviceId, userName) {
   $('#boot').classList.remove('hide');
 
   try {
+    document.title = 'DIAG: lade Vault für ' + deviceId.slice(0, 8);
     const vaultRec = await Vault.load(deviceId);
+    document.title = 'DIAG: vaultRec=' + (vaultRec === null ? 'null' : vaultRec === 'corrupt' ? 'corrupt' : 'OK, hasToken=' + !!vaultRec.meta?.token);
     if (!vaultRec || vaultRec === 'corrupt' || !vaultRec.meta?.token) {
       throw new Error('vault-unusable');
     }
     state.identity = await reconstructIdentityFromVault(vaultRec.data);
+    document.title = 'DIAG: identity rekonstruiert, rufe /api/me auf';
 
     let me;
     try {
       me = await api._fetch('/api/me', { auth: false, headers: { Authorization: 'Bearer ' + vaultRec.meta.token } });
+      document.title = 'DIAG: /api/me erfolgreich, user=' + me.user?.name;
     } catch (e) {
+      document.title = 'DIAG: /api/me FEHLER, status=' + e.status + ' msg=' + e.message;
       if (e.status === 401) throw new Error('token-expired');
       /* Server nicht erreichbar, Vault aber lesbar — Offline-Modus,
          genau wie zuvor beim Passwort-Pfad. */
@@ -646,6 +652,7 @@ async function renderLoginForKnownDevice(deviceId, userName) {
     api.token = vaultRec.meta.token;
     await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
   } catch (e) {
+    document.title = 'DIAG: renderLoginForKnownDevice FEHLER: ' + e.message;
     $('#boot').classList.add('hide');
     /* Token abgelaufen (nach 30 Tagen Inaktivität) oder Vault
        beschädigt: dieses Gerät kann sich nicht mehr automatisch
