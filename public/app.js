@@ -371,7 +371,6 @@ async function boot() {
   }
 
   const knownDevice = await Vault.knownDeviceId();
-  document.title = 'DIAG: boot() knownDevice=' + (knownDevice || 'KEINS');
   $('#boot').classList.add('hide');
 
   if (knownDevice) {
@@ -621,68 +620,50 @@ function renderRecoveryCodeStep(email) {
    oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
    Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
    mehr, weil es kein Passwort mehr gibt. */
-function showDiagPanel(text) {
-  document.getElementById('diagPanel')?.remove();
-  const panel = document.createElement('div');
-  panel.id = 'diagPanel';
-  panel.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;color:#0f0;' +
-    'font-family:monospace;font-size:13px;padding:16px;overflow:auto;white-space:pre-wrap;' +
-    'word-break:break-word;user-select:text;-webkit-user-select:text';
-  panel.textContent = text;
-  const closeBtn = document.createElement('button');
-  closeBtn.textContent = '✕ Schließen';
-  closeBtn.style.cssText = 'position:sticky;top:0;background:#f15c6d;color:#fff;border:none;' +
-    'padding:10px 16px;border-radius:8px;margin-bottom:12px;font-size:14px;display:block';
-  closeBtn.onclick = () => panel.remove();
-  panel.prepend(closeBtn);
-  document.body.appendChild(panel);
-}
-
+/* Passwortlos: ein bekanntes Gerät meldet sich vollautomatisch an, ganz
+   ohne Bildschirm dazwischen — der Vault entsperrt sich selbst (der
+   nicht-extrahierbare Geräteschlüssel braucht keine Nutzereingabe), und
+   das darin gespeicherte Sitzungstoken (19 Jahre gültig, siehe server.js)
+   wird direkt gegen /api/me geprüft. Nur wenn das Token abgelaufen ist
+   oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
+   Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
+   mehr, weil es kein Passwort mehr gibt. */
 async function renderLoginForKnownDevice(deviceId, userName) {
   $('#bootMsg').textContent = 'Automatische Anmeldung …';
   $('#boot').classList.remove('hide');
 
-  const log = [];
-  const step = (msg) => { log.push(msg); };
-
   try {
-    step('1. Lade Vault für Gerät: ' + deviceId);
     const vaultRec = await Vault.load(deviceId);
-    step('2. vaultRec = ' + (vaultRec === null ? 'null' : vaultRec === 'corrupt' ? 'corrupt'
-      : 'Objekt mit meta=' + JSON.stringify(vaultRec.meta) + ', data-Schlüssel=' + Object.keys(vaultRec.data || {}).join(',')));
     if (!vaultRec || vaultRec === 'corrupt' || !vaultRec.meta?.token) {
-      throw new Error('vault-unusable (vaultRec war ' + (vaultRec === null ? 'null' : vaultRec) + ')');
+      throw new Error('vault-unusable');
     }
-    step('3. Rekonstruiere Identität aus: ' + JSON.stringify(vaultRec.data).slice(0, 300));
     state.identity = await reconstructIdentityFromVault(vaultRec.data);
-    step('4. Identität erfolgreich rekonstruiert');
 
     let me;
     try {
-      step('5. Rufe /api/me auf mit Token: ' + vaultRec.meta.token.slice(0, 12) + '...');
       me = await api._fetch('/api/me', { auth: false, headers: { Authorization: 'Bearer ' + vaultRec.meta.token } });
-      step('6. /api/me erfolgreich: ' + JSON.stringify(me).slice(0, 200));
     } catch (e) {
-      step('6. /api/me FEHLER: status=' + e.status + ' message=' + e.message);
       if (e.status === 401) throw new Error('token-expired');
+      /* Server nicht erreichbar, Vault aber lesbar — Offline-Modus,
+         genau wie zuvor beim Passwort-Pfad. */
       $('#boot').classList.add('hide');
       await afterAuthOffline(deviceId, userName);
       return;
     }
 
     api.token = vaultRec.meta.token;
-    step('7. Rufe afterAuth auf...');
     await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
-    step('8. afterAuth abgeschlossen');
   } catch (e) {
-    step('FEHLER GEFANGEN: ' + e.message);
-    step('STACK: ' + e.stack);
-    showDiagPanel(log.join('\n\n'));
     $('#boot').classList.add('hide');
+    /* Token abgelaufen oder Vault beschädigt: dieses Gerät kann sich
+       nicht mehr automatisch anmelden. Ohne Passwort gibt es keinen Weg,
+       den ALTEN Zugang wiederherzustellen — die einzig verbleibenden
+       Optionen sind eine neue Registrierung, Pairing von einem anderen
+       angemeldeten Gerät, oder die E-Mail-Wiederherstellung. */
     Vault.forget();
     renderAuthChoice();
     if (e.message === 'token-expired') {
-      authErr('Sitzung abgelaufen — bitte neu registrieren oder ein anderes angemeldetes Gerät zum Koppeln nutzen.');
+      authErr('Sitzung abgelaufen — bitte neu registrieren, ein anderes angemeldetes Gerät zum Koppeln nutzen, oder das Konto per E-Mail wiederherstellen.');
     }
   }
 }

@@ -56,7 +56,8 @@ const P = {
   async genSign(){
     const kp = await SC.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']);
     return {priv:kp.privateKey, pub:kp.publicKey,
-            pubJwk: await SC.exportKey('jwk',kp.publicKey)};
+            pubJwk: await SC.exportKey('jwk',kp.publicKey),
+            privJwk: await SC.exportKey('jwk',kp.privateKey)};
   },
   impVerify: jwk => SC.importKey('jwk',jwk,{name:'ECDSA',namedCurve:'P-256'},true,['verify']),
   sign: (priv,data) => SC.sign({name:'ECDSA',hash:'SHA-256'}, priv, data),
