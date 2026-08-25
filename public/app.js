@@ -66,139 +66,38 @@ function showDiagPanel(text) {
   document.body.appendChild(panel);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   LOKALER VAULT — localStorage-basiert (kein IndexedDB)
+   Identitätsschlüssel werden mit AES-256-GCM verschlüsselt und als
+   Base64 in localStorage gespeichert. Der AES-Schlüssel selbst wird
+   ebenfalls als exportierter JWK in localStorage gehalten — weniger
+   sicher als ein nicht-extrahierbarer IndexedDB-Key, aber zuverlässig
+   auf allen Android-Geräten ohne Hang-Risiko.
+   ═══════════════════════════════════════════════════════════════════════ */
 const Vault = {
-  _dbp: null,
-  _db() {
-    if (this._dbp) return this._dbp;
-    this._dbp = new Promise((resolve) => {
-      const bootMsgEl = document.getElementById('bootMsg');
-      if (bootMsgEl) bootMsgEl.textContent = 'DIAG: rufe indexedDB.open auf...';
+  _keyCache: null,
 
-      /* settled verhindert, dass mehrere Events (z. B. onblocked + onsuccess)
-         doppelt resolven — was bei manchen Android-WebViews vorkommen kann. */
-      let settled = false;
-      const finish = (db) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeoutId);
-        if (!db) this._dbFallback = true;
-        resolve(db);
-      };
-
-      /* Fallback nach 5 s: App startet trotzdem, Vault nutzt In-Memory-Schlüssel.
-         resolve(null) statt reject() — so stürzt die App nicht ab, sondern
-         läuft mit eingeschränkter Persistenz weiter. */
-      const timeoutId = setTimeout(() => {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: TIMEOUT — In-Memory-Fallback aktiv';
-        finish(null);
-      }, 5000);
-
-      let req;
-      try {
-        req = indexedDB.open('securechat-vault', 3);
-      } catch (e) {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: indexedDB.open() Ausnahme: ' + e.message;
-        finish(null);
-        return;
-      }
-
-      req.onupgradeneeded = e => {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded gefeuert, oldVersion=' + e.oldVersion;
-        try {
-          const db = req.result;
-          if (!db.objectStoreNames.contains('identities'))
-            db.createObjectStore('identities', { keyPath: 'deviceId' });
-          if (!db.objectStoreNames.contains('messages'))
-            db.createObjectStore('messages', { keyPath: 'deviceId' });
-          if (!db.objectStoreNames.contains('deviceKey'))
-            db.createObjectStore('deviceKey', { keyPath: 'id' });
-          if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded Stores angelegt';
-        } catch (upgradeErr) {
-          if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded FEHLER: ' + upgradeErr.message;
-          finish(null);
-        }
-      };
-
-      /* onblocked bedeutet: ein anderer Tab hat die DB noch offen.
-         NICHT sofort abbrechen — der andere Tab könnte sich gleich
-         schließen und dann feuert onsuccess noch. Nur loggen. */
-      req.onblocked = () => {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onblocked — warte auf anderen Tab…';
-        /* kein finish() hier — Timeout übernimmt als Sicherheitsnetz */
-      };
-
-      req.onsuccess = () => {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onsuccess gefeuert';
-        finish(req.result);
-      };
-
-      req.onerror = () => {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onerror: ' + req.error?.message;
-        finish(null);
-      };
-    });
-    return this._dbp;
-  },
-  /* Nicht-extrahierbarer AES-256-Schlüssel, einmal pro Gerät erzeugt.
-     WebCrypto garantiert, dass ein mit extractable:false erzeugter
-     CryptoKey NIE als Rohbytes an JavaScript herausgegeben werden kann —
-     auch nicht durch Code auf derselben Seite (siehe W3C Web Crypto API
-     Spezifikation: "storing and retrieval of key material, without ever
-     exposing that key material to the application"). Das ersetzt die
-     bisherige PBKDF2-Ableitung aus einem Passwort: statt "etwas, das der
-     Nutzer weiß" schützt jetzt "ein Geheimnis, das an diesen Browser
-     gebunden ist und diesen nie in lesbarer Form verlässt". Der
-     CryptoKey selbst liegt in einem eigenen IndexedDB-Objektspeicher,
-     getrennt vom verschlüsselten Datenblock — ein Angreifer mit
-     Lesezugriff auf die Datenbank bekommt zwar den CryptoKey-Datensatz,
-     kann daraus aber keine Bytes extrahieren, die außerhalb dieses
-     Browserprofils nutzbar wären. */
   async _deviceKey() {
-    /* Fallback: IndexedDB nicht verfügbar — In-Memory-Schlüssel.
-       Geht bei Reload verloren, verhindert aber den kompletten Hang.
-       Solange _dbFallback gesetzt ist, wird kein Persistenz-Versuch
-       unternommen, der die App erneut einfrieren würde. */
-    if (this._dbFallback) {
-      if (!this._memKey) {
-        this._memKey = await crypto.subtle.generateKey(
-          { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-      }
-      return this._memKey;
+    if (this._keyCache) return this._keyCache;
+    const stored = localStorage.getItem('securechat:deviceKey');
+    if (stored) {
+      this._keyCache = await crypto.subtle.importKey(
+        'jwk', JSON.parse(stored), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+      return this._keyCache;
     }
-
-    const db = await this._db();
-    if (!db) {
-      /* _db() hat null zurückgegeben (Fallback) — In-Memory-Pfad */
-      if (!this._memKey) {
-        this._memKey = await crypto.subtle.generateKey(
-          { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-      }
-      return this._memKey;
-    }
-
-    const existing = await new Promise((resolve, reject) => {
-      const tx = db.transaction('deviceKey', 'readonly');
-      const req = tx.objectStore('deviceKey').get('main');
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-    if (existing) return existing.key;
-
     const key = await crypto.subtle.generateKey(
-      { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction('deviceKey', 'readwrite');
-      tx.objectStore('deviceKey').put({ id: 'main', key });
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+      { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const jwk = await crypto.subtle.exportKey('jwk', key);
+    localStorage.setItem('securechat:deviceKey', JSON.stringify(jwk));
+    this._keyCache = key;
     return key;
   },
+
   async save(deviceId, identityStore, meta) {
-    const db = await this._db();
-    if (!db) return; /* Fallback-Modus: kein Persistieren möglich */
-    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const bootMsgEl = document.getElementById('bootMsg');
+    if (bootMsgEl) bootMsgEl.textContent = 'Vault: speichere Identität…';
     const key = await this._deviceKey();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
     const plain = te.encode(JSON.stringify({
       IK: identityStore.IK.privJwk,
       IKS: identityStore.IKS.privJwk,
@@ -206,77 +105,37 @@ const Vault = {
       opks: [...identityStore.opks].map(([id, k]) => [id, k.privJwk])
     }));
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction('identities', 'readwrite');
-      tx.objectStore('identities').put({
-        deviceId, iv: [...iv], ct: [...new Uint8Array(ct)], meta
-      });
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+    const rec = {
+      iv: b64(iv),
+      ct: b64(new Uint8Array(ct)),
+      meta,
+      savedAt: Date.now()
+    };
+    localStorage.setItem('securechat:vault:' + deviceId, JSON.stringify(rec));
+    if (bootMsgEl) bootMsgEl.textContent = 'Vault: gespeichert ✓';
   },
-  async load(deviceId) {
-    const log = [];
-    const step = (msg) => { log.push(new Date().toISOString().slice(11,23) + ' — ' + msg); };
 
-    step('Vault.load gestartet, _dbp existiert bereits: ' + !!this._dbp);
-    const db = await this._db();
-    if (!db) {
-      step('_db() zurückgegeben: null (Fallback-Modus) — kein gespeicherter Vault vorhanden');
+  async load(deviceId) {
+    const bootMsgEl = document.getElementById('bootMsg');
+    if (bootMsgEl) bootMsgEl.textContent = 'Vault: lade Identität…';
+    const raw = localStorage.getItem('securechat:vault:' + deviceId);
+    if (!raw) {
+      if (bootMsgEl) bootMsgEl.textContent = 'Vault: kein gespeicherter Eintrag';
       return null;
     }
-    step('_db() OK, Stores=' + Array.from(db.objectStoreNames).join(',') + ', deviceId=' + deviceId);
-
-    let rec;
-    try {
-      rec = await new Promise((resolve) => {
-        let txSettled = false;
-        const txFinish = (val) => { if (!txSettled) { txSettled = true; clearTimeout(timeoutId); resolve(val); } };
-
-        const timeoutId = setTimeout(() => {
-          step('TIMEOUT nach 6s — Transaktion hat nie geantwortet, resolve mit null');
-          txFinish(null);
-        }, 6000);
-        try {
-          step('erstelle Transaktion...');
-          const tx = db.transaction('identities', 'readonly');
-          tx.onabort = () => { step('tx.onabort gefeuert'); txFinish(null); };
-          step('Transaktion erstellt, hole objectStore...');
-          const store = tx.objectStore('identities');
-          step('objectStore geholt, rufe get() auf...');
-          const req = store.get(deviceId);
-          req.onsuccess = () => {
-            step('A: onsuccess-Callback betreten');
-            step('B: rufe resolve auf mit result=' + !!req.result);
-            txFinish(req.result ?? null);
-          };
-          req.onerror = () => {
-            step('get() onerror: ' + req.error?.message);
-            txFinish(null);
-          };
-        } catch (syncErr) {
-          step('synchroner FEHLER: ' + syncErr.message);
-          txFinish(null);
-        }
-      });
-    } catch (e) {
-      showDiagPanel(log.join('\n') + '\n\nFEHLER: ' + e.message);
-      throw e;
-    }
-    if (!rec) return null;
+    const rec = JSON.parse(raw);
     const key = await this._deviceKey();
     let plain;
     try {
       plain = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: new Uint8Array(rec.iv) }, key, new Uint8Array(rec.ct));
+        { name: 'AES-GCM', iv: ub64(rec.iv) }, key, ub64(rec.ct));
     } catch {
-      /* Sollte praktisch nie auftreten (der Geräteschlüssel ändert sich
-         nie von selbst), außer die IndexedDB-Datenbank wurde manuell
-         manipuliert oder ist beschädigt. */
       return 'corrupt';
     }
+    if (bootMsgEl) bootMsgEl.textContent = 'Vault: geladen ✓';
     return { data: JSON.parse(td.decode(plain)), meta: rec.meta };
   },
+
   async knownDeviceId() {
     return localStorage.getItem('securechat:deviceId');
   },
@@ -284,11 +143,14 @@ const Vault = {
     localStorage.setItem('securechat:deviceId', deviceId);
     localStorage.setItem('securechat:userName', userName);
   },
-
   forget() {
     localStorage.removeItem('securechat:deviceId');
     localStorage.removeItem('securechat:userName');
-  }
+  },
+
+  /* Für LocalCache-Kompatibilität: _db() gibt null zurück,
+     damit LocalCache.save/load sofort den Fallback-Pfad nimmt. */
+  async _db() { return null; }
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
