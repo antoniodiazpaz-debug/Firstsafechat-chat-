@@ -49,55 +49,75 @@ const api = new ApiClient(API_BASE);
    mit einem aus dem Passwort abgeleiteten Schlüssel verschlüsselt lokal
    gespeichert, damit ein Reload nicht die ganze Identität verliert.
    ═══════════════════════════════════════════════════════════════════════ */
+function showDiagPanel(text) {
+  document.getElementById('diagPanel')?.remove();
+  const panel = document.createElement('div');
+  panel.id = 'diagPanel';
+  panel.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;color:#0f0;' +
+    'font-family:monospace;font-size:13px;padding:16px;overflow:auto;white-space:pre-wrap;' +
+    'word-break:break-word;user-select:text;-webkit-user-select:text';
+  panel.textContent = text;
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕ Schließen';
+  closeBtn.style.cssText = 'position:sticky;top:0;background:#f15c6d;color:#fff;border:none;' +
+    'padding:10px 16px;border-radius:8px;margin-bottom:12px;font-size:14px;display:block';
+  closeBtn.onclick = () => panel.remove();
+  panel.prepend(closeBtn);
+  document.body.appendChild(panel);
+}
+
 const Vault = {
   _dbp: null,
   _db() {
     if (this._dbp) return this._dbp;
     this._dbp = new Promise((resolve, reject) => {
-      /* Version 2: zusätzlicher 'messages'-Store für den lokalen
-         Nachrichten-Cache (siehe LocalCache unten) — nötig, damit die
-         App offline überhaupt etwas anzuzeigen hat. Der Store liegt in
-         derselben Datenbank wie der Schlüssel-Vault, aber getrennt
-         verschlüsselt (siehe LocalCache.save). */
-      /* Version 3: zusätzlicher 'deviceKey'-Store für den nicht-
-         extrahierbaren AES-Schlüssel, der jetzt an die Stelle des
-         Passworts tritt (siehe Vault._deviceKey). */
-      const req = indexedDB.open('securechat-vault', 3);
-      req.onupgradeneeded = e => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains('identities'))
-          db.createObjectStore('identities', { keyPath: 'deviceId' });
-        if (!db.objectStoreNames.contains('messages'))
-          db.createObjectStore('messages', { keyPath: 'deviceId' });
-        if (!db.objectStoreNames.contains('deviceKey'))
-          db.createObjectStore('deviceKey', { keyPath: 'id' });
-      };
-      /* OHNE diesen Handler bleibt indexedDB.open() UNBEGRENZT hängen
-         (weder resolve noch reject), falls eine ÄLTERE Verbindung zu
-         dieser Datenbank noch in einem anderen Tab offen ist (z. B. ein
-         alter, nie geschlossener Tab von einem früheren Testlauf) — das
-         zeigt sich exakt als endlos drehender Ladebildschirm, weil der
-         äußere try/catch nie greift: das await selbst kehrt nie zurück.
-         Der Timeout ist eine zusätzliche Absicherung für den Fall, dass
-         onblocked aus irgendeinem Grund selbst nicht feuert. */
-      req.onblocked = () => reject(new Error('db-blocked (anderer Tab noch offen — bitte alle anderen Tabs mit dieser App schließen)'));
-
-      /* Sichtbarer Countdown auf dem Ladebildschirm — zeigt, ob das
-         Timeout-Sicherheitsnetz tatsächlich läuft, oder ob die Seite
-         schon VOR diesem Punkt (z. B. beim allerersten Skript-Parsing)
-         komplett eingefroren ist, was ein anderes Symptom mit anderer
-         Ursache wäre. */
-      let secondsLeft = 8;
       const bootMsgEl = document.getElementById('bootMsg');
-      const countdownInterval = setInterval(() => {
-        secondsLeft--;
-        if (bootMsgEl) bootMsgEl.textContent = 'Automatische Anmeldung … (' + secondsLeft + 's)';
-        if (secondsLeft <= 0) clearInterval(countdownInterval);
-      }, 1000);
+      if (bootMsgEl) bootMsgEl.textContent = 'DIAG: rufe indexedDB.open auf...';
 
-      const timeoutId = setTimeout(() => { clearInterval(countdownInterval); reject(new Error('db-open-timeout')); }, 8000);
-      req.onsuccess = () => { clearTimeout(timeoutId); clearInterval(countdownInterval); resolve(req.result); };
-      req.onerror = () => { clearTimeout(timeoutId); clearInterval(countdownInterval); reject(req.error); };
+      const req = indexedDB.open('securechat-vault', 3);
+
+      req.onupgradeneeded = e => {
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded gefeuert, oldVersion=' + e.oldVersion;
+        try {
+          const db = req.result;
+          if (!db.objectStoreNames.contains('identities'))
+            db.createObjectStore('identities', { keyPath: 'deviceId' });
+          if (!db.objectStoreNames.contains('messages'))
+            db.createObjectStore('messages', { keyPath: 'deviceId' });
+          if (!db.objectStoreNames.contains('deviceKey'))
+            db.createObjectStore('deviceKey', { keyPath: 'id' });
+          if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded Stores angelegt';
+        } catch (upgradeErr) {
+          /* Ein Fehler HIER würde ohne dieses try/catch die gesamte
+             Transaktion in einen unklaren Zustand bringen — mit diesem
+             Fang wird der Fehler wenigstens sichtbar, statt lautlos zu
+             verschwinden und weder onsuccess noch onerror zuverlässig
+             auszulösen. */
+          if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded FEHLER: ' + upgradeErr.message;
+          reject(upgradeErr);
+        }
+      };
+
+      req.onblocked = () => {
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onblocked gefeuert';
+        reject(new Error('db-blocked (anderer Tab noch offen — bitte alle anderen Tabs mit dieser App schließen)'));
+      };
+
+      const timeoutId = setTimeout(() => {
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: TIMEOUT nach 8s — keines der Events feuerte';
+        reject(new Error('db-open-timeout'));
+      }, 8000);
+
+      req.onsuccess = () => {
+        clearTimeout(timeoutId);
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onsuccess gefeuert';
+        resolve(req.result);
+      };
+      req.onerror = () => {
+        clearTimeout(timeoutId);
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onerror gefeuert: ' + req.error?.message;
+        reject(req.error);
+      };
     });
     return this._dbp;
   },
@@ -156,18 +176,50 @@ const Vault = {
     });
   },
   async load(deviceId) {
-    const bootMsgEl = document.getElementById('bootMsg');
-    if (bootMsgEl) bootMsgEl.textContent = 'DIAG: Vault.load gestartet, _dbp existiert bereits: ' + !!this._dbp;
-    await new Promise(r => setTimeout(r, 2000));
+    const log = [];
+    const step = (msg) => { log.push(new Date().toISOString().slice(11,23) + ' — ' + msg); };
+
+    step('Vault.load gestartet, _dbp existiert bereits: ' + !!this._dbp);
     const db = await this._db();
-    if (bootMsgEl) bootMsgEl.textContent = 'DIAG: _db() zurückgekehrt, öffne Transaktion...';
-    await new Promise(r => setTimeout(r, 2000));
-    const rec = await new Promise((resolve, reject) => {
-      const tx = db.transaction('identities', 'readonly');
-      const req = tx.objectStore('identities').get(deviceId);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
+    step('_db() OK, Stores=' + Array.from(db.objectStoreNames).join(',') + ', deviceId=' + deviceId);
+
+    let rec;
+    try {
+      rec = await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          step('TIMEOUT nach 6s — Transaktion hat nie geantwortet');
+          reject(new Error('tx-timeout'));
+        }, 6000);
+        try {
+          step('erstelle Transaktion...');
+          const tx = db.transaction('identities', 'readonly');
+          step('Transaktion erstellt, hole objectStore...');
+          const store = tx.objectStore('identities');
+          step('objectStore geholt, rufe get() auf...');
+          const req = store.get(deviceId);
+          req.onsuccess = () => {
+            clearTimeout(timeoutId);
+            step('get() onsuccess, Ergebnis vorhanden: ' + !!req.result);
+            resolve(req.result);
+          };
+          req.onerror = () => {
+            clearTimeout(timeoutId);
+            step('get() onerror: ' + req.error?.message);
+            reject(req.error);
+          };
+        } catch (syncErr) {
+          clearTimeout(timeoutId);
+          step('synchroner FEHLER: ' + syncErr.message);
+          reject(syncErr);
+        }
+      });
+    } catch (e) {
+      /* Alles gesammelte Log AUF EINMAL anzeigen, statt einzelner
+         Meldungen, die man in Echtzeit erwischen muss — deutlich
+         einfacher zu lesen und zu kopieren. */
+      showDiagPanel(log.join('\n') + '\n\nFEHLER: ' + e.message);
+      throw e;
+    }
     if (!rec) return null;
     const key = await this._deviceKey();
     let plain;
@@ -697,7 +749,12 @@ async function renderLoginForKnownDevice(deviceId, userName) {
   } catch (e) {
     $('#boot').classList.add('hide');
 
-    if (e.message === 'db-blocked' || e.message === 'db-open-timeout') {
+    if (e.message === 'db-blocked' || e.message === 'db-open-timeout' || e.message === 'tx-timeout') {
+      /* Für tx-timeout bleibt das bereits von showDiagPanel() angezeigte
+         Log sichtbar (siehe Vault.load) — hier NICHT renderAuthChoice()
+         aufrufen, das würde das Panel sofort wieder überschreiben,
+         bevor es gelesen werden kann. */
+      if (e.message === 'tx-timeout') return;
       /* Rein technisches, VORÜBERGEHENDES Problem (meist ein alter,
          noch offener Tab, der die Datenbankverbindung blockiert) — hat
          nichts mit dem Konto selbst zu tun. Vault NICHT vergessen und
