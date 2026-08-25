@@ -337,29 +337,15 @@ async function flushOutbox() {
    BOOT
    ═══════════════════════════════════════════════════════════════════════ */
 async function boot() {
-  /* ALLERERSTE Zeile in boot() — falls dieser Text NIE erscheint,
-     hängt die Ausführung bereits VOR boot() (z. B. beim Laden/Parsen
-     eines importierten Moduls), nicht innerhalb der Funktion selbst. */
   const bootMsgEarly = document.getElementById('bootMsg');
-  if (bootMsgEarly) bootMsgEarly.textContent = 'DIAG: boot() gestartet';
-  await new Promise(r => setTimeout(r, 2000));
+  if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
   setupOfflineDetection();
   updateOfflineBanner();
 
-  $('#bootMsg').textContent = 'DIAG: vor /api/health';
-  await new Promise(r => setTimeout(r, 2000));
   try {
     await api._fetch('/api/health', { auth: false });
-    $('#bootMsg').textContent = 'DIAG: /api/health erfolgreich';
-    await new Promise(r => setTimeout(r, 2000));
   } catch (e) {
-    /* Kein Server erreichbar heißt nicht zwangsläufig "App unbenutzbar".
-       Ist bereits ein Gerät bekannt (localStorage), kann der Nutzer
-       trotzdem seinen Vault öffnen und bereits empfangene Nachrichten
-       lesen — nur Senden/Empfangen bleibt bis zur Verbindung aus. Nur
-       wenn NICHTS bekannt ist (erster Start), ist ohne Server nichts
-       möglich, weil Registrierung zwingend online passieren muss. */
     const knownDevice = await Vault.knownDeviceId();
     if (!knownDevice) {
       $('#bootMsg').textContent = 'Server nicht erreichbar. Bitte später erneut versuchen.';
@@ -369,8 +355,6 @@ async function boot() {
   }
 
   const knownDevice = await Vault.knownDeviceId();
-  $('#bootMsg').textContent = 'DIAG: knownDevice=' + (knownDevice ? knownDevice.slice(0,8) : 'KEINS');
-  await new Promise(r => setTimeout(r, 2000));
   $('#boot').classList.add('hide');
 
   if (knownDevice) {
