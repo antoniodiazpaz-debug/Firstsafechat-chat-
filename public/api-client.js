@@ -39,9 +39,34 @@ export class ApiClient {
   async _fetch(path, { method = 'GET', body, headers = {}, auth = true } = {}) {
     const h = { 'Content-Type': 'application/json', ...headers };
     if (auth && this.token) h.Authorization = 'Bearer ' + this.token;
-    const res = await fetch(this.base + path, {
-      method, headers: h, body: body ? JSON.stringify(body) : undefined
-    });
+
+    /* OHNE Timeout kann fetch() auf manchen Mobilfunkverbindungen (z. B.
+       bei einem Wechsel zwischen WLAN und Mobilfunk mitten in der
+       Anfrage, oder bei bestimmten DNS-Problemen) UNBEGRENZT hängen
+       bleiben — die Fetch-API selbst hat keinen eingebauten Timeout.
+       Das zeigt sich exakt als endlos drehender Ladebildschirm, noch
+       bevor jeglicher nachgelagerter Code (IndexedDB, Countdown-Anzeige
+       o. Ä.) je erreicht wird, weil das await hier selbst nie zurückkehrt. */
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    let res;
+    try {
+      res = await fetch(this.base + path, {
+        method, headers: h, body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal
+      });
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        const timeoutErr = new Error('Zeitüberschreitung — Server antwortet nicht');
+        timeoutErr.status = 0;
+        throw timeoutErr;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
     let data;
     try { data = await res.json(); } catch { data = null; }
     if (!res.ok) {
