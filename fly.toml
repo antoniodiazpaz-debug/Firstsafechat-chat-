@@ -1,4 +1,4 @@
-app = "firstsafechatserveer"
+app = "firstsafechatserver"
 primary_region = "fra"
 
 [build]
