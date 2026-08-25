@@ -156,7 +156,12 @@ const Vault = {
     });
   },
   async load(deviceId) {
+    const bootMsgEl = document.getElementById('bootMsg');
+    if (bootMsgEl) bootMsgEl.textContent = 'DIAG: Vault.load gestartet, _dbp existiert bereits: ' + !!this._dbp;
+    await new Promise(r => setTimeout(r, 2000));
     const db = await this._db();
+    if (bootMsgEl) bootMsgEl.textContent = 'DIAG: _db() zurückgekehrt, öffne Transaktion...';
+    await new Promise(r => setTimeout(r, 2000));
     const rec = await new Promise((resolve, reject) => {
       const tx = db.transaction('identities', 'readonly');
       const req = tx.objectStore('identities').get(deviceId);
