@@ -229,61 +229,37 @@ const Vault = {
 
     let rec;
     try {
-      rec = await new Promise((resolve, reject) => {
+      rec = await new Promise((resolve) => {
+        let txSettled = false;
+        const txFinish = (val) => { if (!txSettled) { txSettled = true; clearTimeout(timeoutId); resolve(val); } };
+
         const timeoutId = setTimeout(() => {
-          step('TIMEOUT nach 6s — Transaktion hat nie geantwortet');
-          reject(new Error('tx-timeout'));
+          step('TIMEOUT nach 6s — Transaktion hat nie geantwortet, resolve mit null');
+          txFinish(null);
         }, 6000);
         try {
           step('erstelle Transaktion...');
           const tx = db.transaction('identities', 'readonly');
+          tx.onabort = () => { step('tx.onabort gefeuert'); txFinish(null); };
           step('Transaktion erstellt, hole objectStore...');
           const store = tx.objectStore('identities');
           step('objectStore geholt, rufe get() auf...');
           const req = store.get(deviceId);
           req.onsuccess = () => {
             step('A: onsuccess-Callback betreten');
-            const innerTimeoutId = setTimeout(() => {
-              step('INNERER TIMEOUT nach 3s — irgendwo zwischen A und E hängt es fest');
-              showDiagPanel(log.join('\n'));
-            }, 3000);
-            clearTimeout(timeoutId);
-            step('B: timeout gecleart');
-            let hasResult;
-            try {
-              hasResult = !!req.result;
-              step('C: !!req.result ausgewertet = ' + hasResult);
-            } catch (accessErr) {
-              step('C-FEHLER beim Zugriff auf req.result: ' + accessErr.message);
-              showDiagPanel(log.join('\n'));
-              return;
-            }
-            step('D: rufe resolve() auf...');
-            try {
-              resolve(req.result);
-              step('E: resolve() zurückgekehrt (sollte NIE erscheinen, falls await sofort weiterläuft)');
-            } catch (resolveErr) {
-              step('E-FEHLER bei resolve(): ' + resolveErr.message);
-              showDiagPanel(log.join('\n'));
-            } finally {
-              clearTimeout(innerTimeoutId);
-            }
+            step('B: rufe resolve auf mit result=' + !!req.result);
+            txFinish(req.result ?? null);
           };
           req.onerror = () => {
-            clearTimeout(timeoutId);
             step('get() onerror: ' + req.error?.message);
-            reject(req.error);
+            txFinish(null);
           };
         } catch (syncErr) {
-          clearTimeout(timeoutId);
           step('synchroner FEHLER: ' + syncErr.message);
-          reject(syncErr);
+          txFinish(null);
         }
       });
     } catch (e) {
-      /* Alles gesammelte Log AUF EINMAL anzeigen, statt einzelner
-         Meldungen, die man in Echtzeit erwischen muss — deutlich
-         einfacher zu lesen und zu kopieren. */
       showDiagPanel(log.join('\n') + '\n\nFEHLER: ' + e.message);
       throw e;
     }
