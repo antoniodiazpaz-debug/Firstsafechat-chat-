@@ -789,18 +789,46 @@ async function renderLoginForKnownDevice(deviceId, userName) {
 }
 
 async function reconstructIdentityFromVault(data) {
-  const importDH = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-  const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
-  const pubOnly = jwk => { const c = { ...jwk }; delete c.d; return c; };
-  const IK = { priv: await importDH(data.IK), privJwk: data.IK, pubJwk: pubOnly(data.IK) };
-  const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
-  const SPK = { priv: await importDH(data.SPK), privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
-  const opks = new Map();
-  for (const [id, jwk] of data.opks) {
-    opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
+  const log = [];
+  const step = (msg) => { log.push(new Date().toISOString().slice(11,23) + ' — ' + msg); };
+
+  step('reconstructIdentityFromVault gestartet');
+  step('data.IK vorhanden: ' + !!data.IK + ', kty=' + data.IK?.kty);
+  step('data.IKS vorhanden: ' + !!data.IKS + ', kty=' + data.IKS?.kty);
+  step('data.SPK vorhanden: ' + !!data.SPK + ', kty=' + data.SPK?.kty);
+  step('data.opks vorhanden: ' + !!data.opks + ', Länge=' + data.opks?.length);
+
+  const timeoutId = setTimeout(() => {
+    step('TIMEOUT nach 6s — Import-Vorgang hat nie geantwortet');
+    showDiagPanel(log.join('\n'));
+  }, 6000);
+
+  try {
+    const importDH = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+    const pubOnly = jwk => { const c = { ...jwk }; delete c.d; return c; };
+
+    step('importiere IK...');
+    const IK = { priv: await importDH(data.IK), privJwk: data.IK, pubJwk: pubOnly(data.IK) };
+    step('IK OK, importiere IKS...');
+    const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
+    step('IKS OK, importiere SPK...');
+    const SPK = { priv: await importDH(data.SPK), privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
+    step('SPK OK, importiere opks...');
+    const opks = new Map();
+    for (const [id, jwk] of data.opks) {
+      opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
+    }
+    step('alle Schlüssel erfolgreich importiert');
+    clearTimeout(timeoutId);
+    return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0,
+      spkMeta: { spkId: 1, createdAt: Date.now(), sig: null } };
+  } catch (e) {
+    clearTimeout(timeoutId);
+    step('FEHLER: ' + e.message);
+    showDiagPanel(log.join('\n'));
+    throw e;
   }
-  return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0,
-    spkMeta: { spkId: 1, createdAt: Date.now(), sig: null } };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
