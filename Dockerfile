@@ -11,7 +11,7 @@ RUN npm install --omit=dev
 # Restlichen Projektcode kopieren
 COPY . .
 
-ENV NODE_ENV=production
+ENV NODE_ENV=production 
 EXPOSE 8787
 
 CMD ["node", "server.js"]
