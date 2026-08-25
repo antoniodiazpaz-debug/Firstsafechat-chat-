@@ -81,9 +81,23 @@ const Vault = {
          Der Timeout ist eine zusätzliche Absicherung für den Fall, dass
          onblocked aus irgendeinem Grund selbst nicht feuert. */
       req.onblocked = () => reject(new Error('db-blocked (anderer Tab noch offen — bitte alle anderen Tabs mit dieser App schließen)'));
-      const timeoutId = setTimeout(() => reject(new Error('db-open-timeout')), 8000);
-      req.onsuccess = () => { clearTimeout(timeoutId); resolve(req.result); };
-      req.onerror = () => { clearTimeout(timeoutId); reject(req.error); };
+
+      /* Sichtbarer Countdown auf dem Ladebildschirm — zeigt, ob das
+         Timeout-Sicherheitsnetz tatsächlich läuft, oder ob die Seite
+         schon VOR diesem Punkt (z. B. beim allerersten Skript-Parsing)
+         komplett eingefroren ist, was ein anderes Symptom mit anderer
+         Ursache wäre. */
+      let secondsLeft = 8;
+      const bootMsgEl = document.getElementById('bootMsg');
+      const countdownInterval = setInterval(() => {
+        secondsLeft--;
+        if (bootMsgEl) bootMsgEl.textContent = 'Automatische Anmeldung … (' + secondsLeft + 's)';
+        if (secondsLeft <= 0) clearInterval(countdownInterval);
+      }, 1000);
+
+      const timeoutId = setTimeout(() => { clearInterval(countdownInterval); reject(new Error('db-open-timeout')); }, 8000);
+      req.onsuccess = () => { clearTimeout(timeoutId); clearInterval(countdownInterval); resolve(req.result); };
+      req.onerror = () => { clearTimeout(timeoutId); clearInterval(countdownInterval); reject(req.error); };
     });
     return this._dbp;
   },
