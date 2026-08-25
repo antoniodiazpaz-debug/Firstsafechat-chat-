@@ -198,9 +198,32 @@ const Vault = {
           step('objectStore geholt, rufe get() auf...');
           const req = store.get(deviceId);
           req.onsuccess = () => {
+            step('A: onsuccess-Callback betreten');
+            const innerTimeoutId = setTimeout(() => {
+              step('INNERER TIMEOUT nach 3s — irgendwo zwischen A und E hängt es fest');
+              showDiagPanel(log.join('\n'));
+            }, 3000);
             clearTimeout(timeoutId);
-            step('get() onsuccess, Ergebnis vorhanden: ' + !!req.result);
-            resolve(req.result);
+            step('B: timeout gecleart');
+            let hasResult;
+            try {
+              hasResult = !!req.result;
+              step('C: !!req.result ausgewertet = ' + hasResult);
+            } catch (accessErr) {
+              step('C-FEHLER beim Zugriff auf req.result: ' + accessErr.message);
+              showDiagPanel(log.join('\n'));
+              return;
+            }
+            step('D: rufe resolve() auf...');
+            try {
+              resolve(req.result);
+              step('E: resolve() zurückgekehrt (sollte NIE erscheinen, falls await sofort weiterläuft)');
+            } catch (resolveErr) {
+              step('E-FEHLER bei resolve(): ' + resolveErr.message);
+              showDiagPanel(log.join('\n'));
+            } finally {
+              clearTimeout(innerTimeoutId);
+            }
           };
           req.onerror = () => {
             clearTimeout(timeoutId);
