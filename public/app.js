@@ -70,11 +70,37 @@ const Vault = {
   _dbp: null,
   _db() {
     if (this._dbp) return this._dbp;
-    this._dbp = new Promise((resolve, reject) => {
+    this._dbp = new Promise((resolve) => {
       const bootMsgEl = document.getElementById('bootMsg');
       if (bootMsgEl) bootMsgEl.textContent = 'DIAG: rufe indexedDB.open auf...';
 
-      const req = indexedDB.open('securechat-vault', 3);
+      /* settled verhindert, dass mehrere Events (z. B. onblocked + onsuccess)
+         doppelt resolven — was bei manchen Android-WebViews vorkommen kann. */
+      let settled = false;
+      const finish = (db) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        if (!db) this._dbFallback = true;
+        resolve(db);
+      };
+
+      /* Fallback nach 5 s: App startet trotzdem, Vault nutzt In-Memory-Schlüssel.
+         resolve(null) statt reject() — so stürzt die App nicht ab, sondern
+         läuft mit eingeschränkter Persistenz weiter. */
+      const timeoutId = setTimeout(() => {
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: TIMEOUT — In-Memory-Fallback aktiv';
+        finish(null);
+      }, 5000);
+
+      let req;
+      try {
+        req = indexedDB.open('securechat-vault', 3);
+      } catch (e) {
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: indexedDB.open() Ausnahme: ' + e.message;
+        finish(null);
+        return;
+      }
 
       req.onupgradeneeded = e => {
         if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded gefeuert, oldVersion=' + e.oldVersion;
@@ -88,35 +114,27 @@ const Vault = {
             db.createObjectStore('deviceKey', { keyPath: 'id' });
           if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded Stores angelegt';
         } catch (upgradeErr) {
-          /* Ein Fehler HIER würde ohne dieses try/catch die gesamte
-             Transaktion in einen unklaren Zustand bringen — mit diesem
-             Fang wird der Fehler wenigstens sichtbar, statt lautlos zu
-             verschwinden und weder onsuccess noch onerror zuverlässig
-             auszulösen. */
           if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onupgradeneeded FEHLER: ' + upgradeErr.message;
-          reject(upgradeErr);
+          finish(null);
         }
       };
 
+      /* onblocked bedeutet: ein anderer Tab hat die DB noch offen.
+         NICHT sofort abbrechen — der andere Tab könnte sich gleich
+         schließen und dann feuert onsuccess noch. Nur loggen. */
       req.onblocked = () => {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onblocked gefeuert';
-        reject(new Error('db-blocked (anderer Tab noch offen — bitte alle anderen Tabs mit dieser App schließen)'));
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onblocked — warte auf anderen Tab…';
+        /* kein finish() hier — Timeout übernimmt als Sicherheitsnetz */
       };
-
-      const timeoutId = setTimeout(() => {
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: TIMEOUT nach 8s — keines der Events feuerte';
-        reject(new Error('db-open-timeout'));
-      }, 8000);
 
       req.onsuccess = () => {
-        clearTimeout(timeoutId);
         if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onsuccess gefeuert';
-        resolve(req.result);
+        finish(req.result);
       };
+
       req.onerror = () => {
-        clearTimeout(timeoutId);
-        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onerror gefeuert: ' + req.error?.message;
-        reject(req.error);
+        if (bootMsgEl) bootMsgEl.textContent = 'DIAG: onerror: ' + req.error?.message;
+        finish(null);
       };
     });
     return this._dbp;
@@ -136,7 +154,28 @@ const Vault = {
      kann daraus aber keine Bytes extrahieren, die außerhalb dieses
      Browserprofils nutzbar wären. */
   async _deviceKey() {
+    /* Fallback: IndexedDB nicht verfügbar — In-Memory-Schlüssel.
+       Geht bei Reload verloren, verhindert aber den kompletten Hang.
+       Solange _dbFallback gesetzt ist, wird kein Persistenz-Versuch
+       unternommen, der die App erneut einfrieren würde. */
+    if (this._dbFallback) {
+      if (!this._memKey) {
+        this._memKey = await crypto.subtle.generateKey(
+          { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      }
+      return this._memKey;
+    }
+
     const db = await this._db();
+    if (!db) {
+      /* _db() hat null zurückgegeben (Fallback) — In-Memory-Pfad */
+      if (!this._memKey) {
+        this._memKey = await crypto.subtle.generateKey(
+          { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      }
+      return this._memKey;
+    }
+
     const existing = await new Promise((resolve, reject) => {
       const tx = db.transaction('deviceKey', 'readonly');
       const req = tx.objectStore('deviceKey').get('main');
@@ -157,6 +196,7 @@ const Vault = {
   },
   async save(deviceId, identityStore, meta) {
     const db = await this._db();
+    if (!db) return; /* Fallback-Modus: kein Persistieren möglich */
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const key = await this._deviceKey();
     const plain = te.encode(JSON.stringify({
@@ -181,6 +221,10 @@ const Vault = {
 
     step('Vault.load gestartet, _dbp existiert bereits: ' + !!this._dbp);
     const db = await this._db();
+    if (!db) {
+      step('_db() zurückgegeben: null (Fallback-Modus) — kein gespeicherter Vault vorhanden');
+      return null;
+    }
     step('_db() OK, Stores=' + Array.from(db.objectStoreNames).join(',') + ', deviceId=' + deviceId);
 
     let rec;
@@ -317,6 +361,7 @@ const LocalCache = {
     const plain = te.encode(JSON.stringify(snapshot));
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this._key, plain);
     const db = await Vault._db();
+    if (!db) return; /* Fallback-Modus */
     await new Promise((resolve, reject) => {
       const tx = db.transaction('messages', 'readwrite');
       tx.objectStore('messages').put({ deviceId: this._deviceId, iv: [...iv], ct: [...new Uint8Array(ct)] });
@@ -331,6 +376,7 @@ const LocalCache = {
   async load() {
     if (!this._key || !this._deviceId) return false;
     const db = await Vault._db();
+    if (!db) return false; /* Fallback-Modus */
     const rec = await new Promise((resolve, reject) => {
       const tx = db.transaction('messages', 'readonly');
       const req = tx.objectStore('messages').get(this._deviceId);
