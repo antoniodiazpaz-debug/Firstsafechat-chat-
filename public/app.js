@@ -621,7 +621,9 @@ async function renderLoginForKnownDevice(deviceId, userName) {
     if (!vaultRec || vaultRec === 'corrupt' || !vaultRec.meta?.token) {
       throw new Error('vault-unusable');
     }
+    $('#bootMsg') && ($('#bootMsg').textContent = 'Schlüssel werden importiert…');
     state.identity = await reconstructIdentityFromVault(vaultRec.data);
+    $('#bootMsg') && ($('#bootMsg').textContent = 'Verbinde mit Server…');
 
     let me;
     try {
@@ -683,16 +685,20 @@ async function reconstructIdentityFromVault(data) {
   const log = [];
   const step = (msg) => { log.push(new Date().toISOString().slice(11,23) + ' — ' + msg); };
 
+  const bootMsgEl = document.getElementById('bootMsg');
+  const setMsg = (m) => { if (bootMsgEl) bootMsgEl.textContent = m; };
+
   step('reconstructIdentityFromVault gestartet');
+  setMsg('IK wird importiert…');
   step('data.IK vorhanden: ' + !!data.IK + ', kty=' + data.IK?.kty);
   step('data.IKS vorhanden: ' + !!data.IKS + ', kty=' + data.IKS?.kty);
   step('data.SPK vorhanden: ' + !!data.SPK + ', kty=' + data.SPK?.kty);
   step('data.opks vorhanden: ' + !!data.opks + ', Länge=' + data.opks?.length);
 
   const timeoutId = setTimeout(() => {
-    step('TIMEOUT nach 6s — Import-Vorgang hat nie geantwortet');
+    step('TIMEOUT nach 3s — Import-Vorgang hat nie geantwortet');
     showDiagPanel(log.join('\n'));
-  }, 6000);
+  }, 3000);
 
   try {
     const importDH = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
@@ -702,15 +708,19 @@ async function reconstructIdentityFromVault(data) {
     step('importiere IK...');
     const IK = { priv: await importDH(data.IK), privJwk: data.IK, pubJwk: pubOnly(data.IK) };
     step('IK OK, importiere IKS...');
+    setMsg('IKS wird importiert…');
     const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
     step('IKS OK, importiere SPK...');
+    setMsg('SPK wird importiert…');
     const SPK = { priv: await importDH(data.SPK), privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
     step('SPK OK, importiere opks...');
+    setMsg('OPKs werden importiert…');
     const opks = new Map();
     for (const [id, jwk] of data.opks) {
       opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
     }
     step('alle Schlüssel erfolgreich importiert');
+    setMsg('Schlüssel importiert ✓');
     clearTimeout(timeoutId);
     return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0,
       spkMeta: { spkId: 1, createdAt: Date.now(), sig: null } };
