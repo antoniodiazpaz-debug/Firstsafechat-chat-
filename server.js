@@ -1835,6 +1835,18 @@ const server = http.createServer(async (req, res) => {
      hätte im Browser funktioniert, ihr <script src="/app.js"> aber mit
      404 wäre gescheitert. Das ist jetzt eine echte, generische
      Verzeichnisauslieferung statt einer Einzeldatei-Ausnahme. */
+  /* /reset — löscht localStorage im Browser und leitet zur Startseite.
+     Nützlich wenn die App beim Boot hängt (z. B. abgelaufenes Token). */
+  if (req.method === 'GET' && url.pathname === '/reset') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reset</title></head><body>' +
+      '<script>localStorage.clear();sessionStorage.clear();' +
+      'document.cookie.split(";").forEach(c=>{document.cookie=c.replace(/=.*/,"=;expires=Thu, 01 Jan 1970 00:00:00 GMT")});' +
+      'location.href="/";</script>' +
+      '<p>Wird zurückgesetzt…</p></body></html>');
+    return;
+  }
+
   if (req.method === 'GET' && !url.pathname.startsWith('/api/')) {
     const served = serveStatic(url.pathname, res);
     if (served) return;
