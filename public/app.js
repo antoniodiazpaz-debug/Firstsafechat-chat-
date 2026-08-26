@@ -67,89 +67,57 @@ function showDiagPanel(text) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   LOKALER VAULT — localStorage-basiert (kein IndexedDB)
-   Identitätsschlüssel werden mit AES-256-GCM verschlüsselt und als
-   Base64 in localStorage gespeichert. Der AES-Schlüssel selbst wird
-   ebenfalls als exportierter JWK in localStorage gehalten — weniger
-   sicher als ein nicht-extrahierbarer IndexedDB-Key, aber zuverlässig
-   auf allen Android-Geräten ohne Hang-Risiko.
+   LOKALER SPEICHER — Klartext localStorage (kein Crypto, kein IndexedDB)
+   Token, DeviceId, UserName werden unverschlüsselt gespeichert.
+   Die Crypto-Schlüssel (für E2EE) werden ebenfalls als JWK im
+   localStorage gehalten — einfach und zuverlässig auf allen Geräten.
    ═══════════════════════════════════════════════════════════════════════ */
 const Vault = {
-  _keyCache: null,
-
-  async _deviceKey() {
-    if (this._keyCache) return this._keyCache;
-    const stored = localStorage.getItem('securechat:deviceKey');
-    if (stored) {
-      this._keyCache = await crypto.subtle.importKey(
-        'jwk', JSON.parse(stored), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-      return this._keyCache;
-    }
-    const key = await crypto.subtle.generateKey(
-      { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
-    const jwk = await crypto.subtle.exportKey('jwk', key);
-    localStorage.setItem('securechat:deviceKey', JSON.stringify(jwk));
-    this._keyCache = key;
-    return key;
-  },
-
-  async save(deviceId, identityStore, meta) {
-    const bootMsgEl = document.getElementById('bootMsg');
-    if (bootMsgEl) bootMsgEl.textContent = 'Vault: speichere Identität…';
-    const key = await this._deviceKey();
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const plain = te.encode(JSON.stringify({
-      IK: identityStore.IK.privJwk,
-      IKS: identityStore.IKS.privJwk,
-      SPK: identityStore.SPK.privJwk,
+  save(deviceId, identityStore, meta) {
+    localStorage.setItem('sc:deviceId', deviceId);
+    localStorage.setItem('sc:token', meta.token);
+    localStorage.setItem('sc:userName', meta.userName || '');
+    localStorage.setItem('sc:email', meta.email || '');
+    localStorage.setItem('sc:keys', JSON.stringify({
+      IK:   identityStore.IK.privJwk,
+      IKS:  identityStore.IKS.privJwk,
+      SPK:  identityStore.SPK.privJwk,
       opks: [...identityStore.opks].map(([id, k]) => [id, k.privJwk])
     }));
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
-    const rec = {
-      iv: b64(iv),
-      ct: b64(new Uint8Array(ct)),
-      meta,
-      savedAt: Date.now()
+  },
+
+  load(deviceId) {
+    const storedId = localStorage.getItem('sc:deviceId');
+    if (storedId !== deviceId) return null;
+    const token = localStorage.getItem('sc:token');
+    const keysRaw = localStorage.getItem('sc:keys');
+    if (!token || !keysRaw) return null;
+    return {
+      data: JSON.parse(keysRaw),
+      meta: {
+        token,
+        userName: localStorage.getItem('sc:userName') || '',
+        email:    localStorage.getItem('sc:email') || ''
+      }
     };
-    localStorage.setItem('securechat:vault:' + deviceId, JSON.stringify(rec));
-    if (bootMsgEl) bootMsgEl.textContent = 'Vault: gespeichert ✓';
   },
 
-  async load(deviceId) {
-    const bootMsgEl = document.getElementById('bootMsg');
-    if (bootMsgEl) bootMsgEl.textContent = 'Vault: lade Identität…';
-    const raw = localStorage.getItem('securechat:vault:' + deviceId);
-    if (!raw) {
-      if (bootMsgEl) bootMsgEl.textContent = 'Vault: kein gespeicherter Eintrag';
-      return null;
-    }
-    const rec = JSON.parse(raw);
-    const key = await this._deviceKey();
-    let plain;
-    try {
-      plain = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: ub64(rec.iv) }, key, ub64(rec.ct));
-    } catch {
-      return 'corrupt';
-    }
-    if (bootMsgEl) bootMsgEl.textContent = 'Vault: geladen ✓';
-    return { data: JSON.parse(td.decode(plain)), meta: rec.meta };
-  },
-
-  async knownDeviceId() {
-    return localStorage.getItem('securechat:deviceId');
+  knownDeviceId() {
+    return localStorage.getItem('sc:deviceId');
   },
   rememberDevice(deviceId, userName) {
-    localStorage.setItem('securechat:deviceId', deviceId);
-    localStorage.setItem('securechat:userName', userName);
+    localStorage.setItem('sc:deviceId', deviceId);
+    localStorage.setItem('sc:userName', userName);
   },
   forget() {
-    localStorage.removeItem('securechat:deviceId');
-    localStorage.removeItem('securechat:userName');
+    ['sc:deviceId','sc:token','sc:userName','sc:email','sc:keys',
+     'securechat:deviceId','securechat:userName','securechat:deviceKey']
+      .forEach(k => localStorage.removeItem(k));
+    /* Auch alte vault-Einträge entfernen */
+    Object.keys(localStorage)
+      .filter(k => k.startsWith('securechat:vault:'))
+      .forEach(k => localStorage.removeItem(k));
   },
-
-  /* Für LocalCache-Kompatibilität: _db() gibt null zurück,
-     damit LocalCache.save/load sofort den Fallback-Pfad nimmt. */
   async _db() { return null; }
 };
 
@@ -629,18 +597,14 @@ function renderRecoveryCodeStep(email) {
    Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
    mehr, weil es kein Passwort mehr gibt. */
 async function renderLoginForKnownDevice(deviceId, userName) {
-  $('#bootMsg').textContent = 'Automatische Anmeldung …';
+  $('#bootMsg').textContent = 'Anmeldung…';
   $('#boot').classList.remove('hide');
 
   try {
-    const vaultRec = await Vault.load(deviceId);
-    if (!vaultRec || vaultRec === 'corrupt' || !vaultRec.meta?.token) {
-      throw new Error('vault-unusable');
-    }
-    $('#bootMsg') && ($('#bootMsg').textContent = 'Schlüssel werden importiert…');
-    state.identity = await reconstructIdentityFromVault(vaultRec.data);
-    $('#bootMsg') && ($('#bootMsg').textContent = 'Verbinde mit Server…');
+    const vaultRec = Vault.load(deviceId);
+    if (!vaultRec || !vaultRec.meta?.token) throw new Error('vault-unusable');
 
+    $('#bootMsg').textContent = 'Verbinde mit Server…';
     let me;
     try {
       const ctrl = new AbortController();
@@ -659,45 +623,20 @@ async function renderLoginForKnownDevice(deviceId, userName) {
       me = await meResp.json();
     } catch (e) {
       if (e.status === 401) throw new Error('token-expired');
-      /* Server nicht erreichbar, Vault aber lesbar — Offline-Modus,
-         genau wie zuvor beim Passwort-Pfad. */
+      /* Server nicht erreichbar — Offline-Modus */
       $('#boot').classList.add('hide');
       await afterAuthOffline(deviceId, userName);
       return;
     }
 
+    /* Schlüssel erst NACH erfolgreichem Login importieren */
+    $('#bootMsg').textContent = 'Schlüssel werden geladen…';
+    state.identity = await reconstructIdentityFromVault(vaultRec.data);
+
     api.token = vaultRec.meta.token;
     await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
   } catch (e) {
     $('#boot').classList.add('hide');
-
-    if (e.message === 'db-blocked' || e.message === 'db-open-timeout' || e.message === 'tx-timeout') {
-      /* Für tx-timeout bleibt das bereits von showDiagPanel() angezeigte
-         Log sichtbar (siehe Vault.load) — hier NICHT renderAuthChoice()
-         aufrufen, das würde das Panel sofort wieder überschreiben,
-         bevor es gelesen werden kann. */
-      if (e.message === 'tx-timeout') return;
-      /* Rein technisches, VORÜBERGEHENDES Problem (meist ein alter,
-         noch offener Tab, der die Datenbankverbindung blockiert) — hat
-         nichts mit dem Konto selbst zu tun. Vault NICHT vergessen und
-         NICHT zur Registrierung zwingen, das würde ein völlig
-         funktionsfähiges Konto grundlos verlieren lassen. Stattdessen
-         klar erklären, was zu tun ist. */
-      $('#auth').classList.remove('hide');
-      $('#auth').innerHTML = `
-        <div class="card">
-          <div class="logo"><div class="ic">⚠️</div><h1>Verbindung blockiert</h1></div>
-          <p style="color:var(--sub);font-size:14px;margin:0 0 16px">
-            Ein anderer offener Tab mit dieser App verhindert gerade den Zugriff
-            auf den lokalen Schlüsselspeicher. Bitte schließe alle anderen Tabs
-            mit dieser Seite und lade dann neu.
-          </p>
-          <button class="btn" onclick="location.reload()">Erneut versuchen</button>
-        </div>`;
-      return;
-    }
-
-    /* Token abgelaufen oder Vault beschädigt: dieses Gerät kann sich
        nicht mehr automatisch anmelden. Ohne Passwort gibt es keinen Weg,
        den ALTEN Zugang wiederherzustellen — die einzig verbleibenden
        Optionen sind eine neue Registrierung, Pairing von einem anderen
