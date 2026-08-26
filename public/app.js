@@ -627,7 +627,13 @@ async function renderLoginForKnownDevice(deviceId, userName) {
 
     let me;
     try {
-      me = await api._fetch('/api/me', { auth: false, headers: { Authorization: 'Bearer ' + vaultRec.meta.token } });
+      const ctrl = new AbortController();
+      const meTimeout = setTimeout(() => ctrl.abort(), 8000);
+      try {
+        me = await api._fetch('/api/me', { auth: false, headers: { Authorization: 'Bearer ' + vaultRec.meta.token }, signal: ctrl.signal });
+      } finally {
+        clearTimeout(meTimeout);
+      }
     } catch (e) {
       if (e.status === 401) throw new Error('token-expired');
       /* Server nicht erreichbar, Vault aber lesbar — Offline-Modus,
