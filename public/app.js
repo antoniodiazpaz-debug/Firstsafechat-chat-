@@ -340,6 +340,21 @@ async function boot() {
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
+  /* Reset-Button nach 5s einblenden — falls die App hängt,
+     kann der Nutzer localStorage löschen und neu starten. */
+  const resetTimeout = setTimeout(() => {
+    const existing = document.getElementById('bootResetBtn');
+    if (existing) return;
+    const btn = document.createElement('button');
+    btn.id = 'bootResetBtn';
+    btn.textContent = '🔄 Zurücksetzen & neu starten';
+    btn.style.cssText = 'margin-top:24px;padding:12px 20px;border-radius:12px;border:none;' +
+      'background:#f15c6d;color:#fff;font-size:15px;font-weight:600;display:block;' +
+      'margin-left:auto;margin-right:auto;cursor:pointer';
+    btn.onclick = () => { localStorage.clear(); location.reload(); };
+    document.getElementById('boot')?.appendChild(btn);
+  }, 5000);
+
   setupOfflineDetection();
   updateOfflineBanner();
 
@@ -355,6 +370,7 @@ async function boot() {
   }
 
   const knownDevice = await Vault.knownDeviceId();
+  clearTimeout(resetTimeout);
   $('#boot').classList.add('hide');
 
   if (knownDevice) {
