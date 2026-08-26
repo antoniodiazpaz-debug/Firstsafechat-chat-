@@ -597,58 +597,45 @@ function renderRecoveryCodeStep(email) {
    Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
    mehr, weil es kein Passwort mehr gibt. */
 async function renderLoginForKnownDevice(deviceId, userName) {
-  $('#bootMsg').textContent = 'Anmeldung…';
-  $('#boot').classList.remove('hide');
-
-  try {
-    const vaultRec = Vault.load(deviceId);
-    if (!vaultRec || !vaultRec.meta?.token) throw new Error('vault-unusable');
-
-    $('#bootMsg').textContent = 'Verbinde mit Server…';
-    let me;
-    try {
-      const ctrl = new AbortController();
-      const meTimeout = setTimeout(() => ctrl.abort(), 10000);
-      let meResp;
-      try {
-        meResp = await fetch(API_BASE + '/api/me', {
-          headers: { Authorization: 'Bearer ' + vaultRec.meta.token },
-          signal: ctrl.signal
-        });
-      } finally {
-        clearTimeout(meTimeout);
-      }
-      if (meResp.status === 401) throw Object.assign(new Error('token-expired'), { status: 401 });
-      if (!meResp.ok) throw new Error('me-error-' + meResp.status);
-      me = await meResp.json();
-    } catch (e) {
-      if (e.status === 401) throw new Error('token-expired');
-      /* Server nicht erreichbar — Offline-Modus */
-      $('#boot').classList.add('hide');
-      await afterAuthOffline(deviceId, userName);
-      return;
-    }
-
-    /* Schlüssel erst NACH erfolgreichem Login importieren */
-    $('#bootMsg').textContent = 'Schlüssel werden geladen…';
-    state.identity = await reconstructIdentityFromVault(vaultRec.data);
-
-    api.token = vaultRec.meta.token;
-    await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
-  } catch (e) {
-    $('#boot').classList.add('hide');
-       nicht mehr automatisch anmelden. Ohne Passwort gibt es keinen Weg,
-       den ALTEN Zugang wiederherzustellen — die einzig verbleibenden
-       Optionen sind eine neue Registrierung, Pairing von einem anderen
-       angemeldeten Gerät, oder die E-Mail-Wiederherstellung. */
+  const vaultRec = Vault.load(deviceId);
+  if (!vaultRec || !vaultRec.meta?.token) {
     Vault.forget();
     renderAuthChoice();
-    if (e.message === 'token-expired') {
-      authErr('Sitzung abgelaufen — bitte neu registrieren, ein anderes angemeldetes Gerät zum Koppeln nutzen, oder das Konto per E-Mail wiederherstellen.');
-    }
+    return;
   }
-}
 
+  /* App sofort mit lokalen Daten öffnen — kein Warten auf Server */
+  $('#boot').classList.add('hide');
+  state.identity = await reconstructIdentityFromVault(vaultRec.data);
+  api.token = vaultRec.meta.token;
+
+  /* Offline-Cache laden falls vorhanden */
+  await LocalCache.unlock(deviceId);
+  await LocalCache.load();
+
+  /* Sofort die Chat-Liste zeigen */
+  await afterAuthOffline(deviceId, userName);
+
+  /* Server-Check im Hintergrund — nur bei Fehler zur Anmeldung */
+  fetch(API_BASE + '/api/me', {
+    headers: { Authorization: 'Bearer ' + vaultRec.meta.token }
+  }).then(async r => {
+    if (r.status === 401) {
+      /* Token abgelaufen — Vault löschen und neu anmelden */
+      Vault.forget();
+      location.reload();
+      return;
+    }
+    if (!r.ok) return; /* Server-Fehler ignorieren, App bleibt offen */
+    const me = await r.json();
+    /* Online — vollständige Auth-Sequenz im Hintergrund */
+    state.isOffline = false;
+    updateOfflineBanner();
+    await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
+  }).catch(() => {
+    /* Kein Netz — App bleibt im Offline-Modus, kein Reload */
+  });
+}
 async function reconstructIdentityFromVault(data) {
   const log = [];
   const step = (msg) => { log.push(new Date().toISOString().slice(11,23) + ' — ' + msg); };
