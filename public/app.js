@@ -964,7 +964,16 @@ async function handleEnvelope(env, live) {
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
   conv.lastMsg = { text: plaintext, ts: env.sentAt };
   conv.unread = (conv.unread || 0) + 1;
+  if (!conv.name && env.senderName) conv.name = env.senderName;
   state.convs.set(convId, conv);
+  /* Name nachladen falls noch unbekannt */
+  if (!conv.name && env.senderId) {
+    fetch(API_BASE + '/api/user/' + env.senderId, {
+      headers: { Authorization: 'Bearer ' + api.token }
+    }).then(r => r.ok ? r.json() : null).then(u => {
+      if (u?.user?.name) { conv.name = u.user.name; renderMain(); }
+    }).catch(() => {});
+  }
   LocalCache.scheduleSave();
 
   if (live) api.ackViaSocket([env.id]);
@@ -1147,7 +1156,7 @@ const appActions = {
   closeChat() { closeChat(); },
   sendClick() { sendCurrentMessage(); },
   inputKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCurrentMessage(); } },
-  startChatWith(userId) { startChatWith(userId); },
+  startChatWith(userId, userName) { startChatWith(userId, userName); },
   chatMenu(e) { chatMenu(e); },
   toggleBlock() { toggleBlock(); },
   reportUser() { reportUser(); },
@@ -1440,7 +1449,7 @@ async function openNewChatSheet() {
       <div class="grabber"></div>
       <h3 style="margin:0 0 12px">Neuer Chat</h3>
       ${users.length ? users.map(u => `
-        <div class="row" style="padding:8px 0" onclick="window.__app.startChatWith('${u.id}')">
+        <div class="row" style="padding:8px 0" onclick="window.__app.startChatWith('${u.id}', '${esc(u.name || '')}')">
           <div class="av">${esc((u.name || '?')[0].toUpperCase())}
             <div class="dot ${u.online ? 'online' : 'offline'}"></div></div>
           <div class="meta" style="border-bottom:none">
@@ -1451,13 +1460,15 @@ async function openNewChatSheet() {
   document.getElementById('overlays').appendChild(sheet);
 }
 
-function startChatWith(userId) {
+function startChatWith(userId, userName) {
   document.getElementById('newChatSheet')?.remove();
   const convId = 'dm_' + [state.me.id, userId].sort().join('_');
   let conv = state.convs.get(convId);
   if (!conv) {
-    conv = { convId, peerId: userId, name: userId, unread: 0 };
+    conv = { convId, peerId: userId, name: userName || userId, unread: 0 };
     state.convs.set(convId, conv);
+  } else if (!conv.name || conv.name === conv.peerId) {
+    conv.name = userName || conv.name;
   }
   openChat(conv);
 }
