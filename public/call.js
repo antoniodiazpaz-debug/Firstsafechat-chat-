@@ -139,8 +139,12 @@ const Call = (() => {
     const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
     conn.onicecandidate = e => {
-      if (e.candidate && currentCall) {
-        api.wsSend({ type: 'call-ice', to: currentCall.peerId, callId: currentCall.callId, candidate: e.candidate });
+      if (e.candidate && currentCall && api) {
+        try {
+          api.wsSend({ type: 'call-ice', to: currentCall.peerId, callId: currentCall.callId, candidate: e.candidate });
+        } catch(err) {
+          log('ICE-Kandidat konnte nicht gesendet werden:', err.message);
+        }
       }
     };
 

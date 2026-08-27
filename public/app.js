@@ -733,11 +733,18 @@ async function afterAuth(data) {
   await loadBlockList();
   await refreshInbox();
 
-  $('#auth').classList.add('hide');
-  $('#app').classList.remove('hide');
-  renderShell();
-  go('chats');
-  toast('Willkommen, ' + state.me.name + ' 🔐');
+  /* UI nur neu aufbauen wenn noch nicht sichtbar */
+  if ($('#app').classList.contains('hide')) {
+    $('#auth').classList.add('hide');
+    $('#app').classList.remove('hide');
+    renderShell();
+    go('chats');
+    toast('Willkommen, ' + state.me.name + ' 🔐');
+  } else {
+    /* App läuft bereits (Offline-Modus war aktiv) — nur aktualisieren */
+    renderMain();
+    updateOfflineBanner();
+  }
 }
 
 function showEmailVerifyPrompt(blocking) {
@@ -886,6 +893,8 @@ async function afterAuthOffline(deviceId, userName) {
 }
 
 function wireSocketEvents() {
+  if (wireSocketEvents._wired) return;
+  wireSocketEvents._wired = true;
   api.on('envelope', onIncomingEnvelope);
   api.on('presence', onPresence);
   initCallUI(api);
@@ -901,7 +910,6 @@ function wireSocketEvents() {
   api.on('connected', () => {
     state.isOffline = false;
     updateOfflineBanner();
-    toast('Verbunden', 1200);
     flushOutbox();
   });
   api.on('disconnected', () => toast('Verbindung unterbrochen — versuche erneut…', 1800));
