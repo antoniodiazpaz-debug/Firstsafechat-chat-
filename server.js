@@ -1816,7 +1816,7 @@ function serveStatic(pathname, res) {
        ein Nutzer nach einem Deploy erst nach hartem Reload die neue
        Version. Module dahinter (app.js etc.) landen im Service-Worker-
        Cache, der hat eine eigene, kontrollierte Invalidierung. */
-    'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600'
+    'Cache-Control': (ext === '.html' || ext === '.js') ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
   });
   res.end(body);
   return true;
