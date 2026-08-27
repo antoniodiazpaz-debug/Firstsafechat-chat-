@@ -1248,6 +1248,14 @@ const routes = {
     json(res, 200, { user: pub(await q.userById.get(a.user.id)) });
   },
 
+  'GET /api/user': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const userId = url.pathname.split('/').pop();
+    const user = await q.userById.get(userId);
+    if (!user) return json(res, 404, { error: 'Nicht gefunden' });
+    json(res, 200, { user: pub(user) });
+  },
+
   'GET /api/users': async (req, res) => {
     const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const blockedRows = await q.blockedByMe.all(a.user.id);
@@ -1861,7 +1869,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   const handler = routes[key];
-  if (!handler) return json(res, 404, { error: 'Unbekannter Endpunkt' });
+  if (!handler) {
+    /* Dynamische Routen */
+    if (req.method === 'GET' && url.pathname.startsWith('/api/user/')) {
+      return routes['GET /api/user'](req, res, url);
+    }
+    return json(res, 404, { error: 'Unbekannter Endpunkt' });
+  }
   try { await handler(req, res, url); }
   catch (e) { console.error(key, e.message); json(res, 500, { error: e.message }); }
 });
