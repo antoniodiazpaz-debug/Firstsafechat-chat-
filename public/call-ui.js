@@ -69,20 +69,17 @@ function render(state) {
   if (state.state === 'ringing') {
     renderRinging(state.call);
     startRingtone();
-  } else if (state.state === 'calling') {
+  if (state.state === 'calling') {
     renderCalling(state.call);
+    if (state.localStream && localVideoEl) localVideoEl.srcObject = state.localStream;
   } else if (state.state === 'connecting') {
     renderConnecting(state.call);
+    if (state.localStream && localVideoEl) localVideoEl.srcObject = state.localStream;
   } else if (state.state === 'connected') {
     renderConnected(state.call, state.remoteStream);
+    if (state.localStream && localVideoEl) localVideoEl.srcObject = state.localStream;
   } else if (state.state === 'error') {
     renderError(state.reason, state.message);
-  }
-
-  /* Lokales Vorschaubild aktualisieren, sobald ein Stream vorhanden ist
-     (calling/connecting/connected teilen sich dasselbe <video>-Element) */
-  if (state.localStream && localVideoEl) {
-    localVideoEl.srcObject = state.localStream;
   }
 }
 
