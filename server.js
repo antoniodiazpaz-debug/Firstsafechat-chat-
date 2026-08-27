@@ -1840,10 +1840,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/reset') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reset</title></head><body>' +
-      '<script>localStorage.clear();sessionStorage.clear();' +
-      'document.cookie.split(";").forEach(c=>{document.cookie=c.replace(/=.*/,"=;expires=Thu, 01 Jan 1970 00:00:00 GMT")});' +
-      'location.href="/";</script>' +
-      '<p>Wird zurückgesetzt…</p></body></html>');
+      '<script>' +
+      'localStorage.clear();sessionStorage.clear();' +
+      '(async()=>{' +
+      '  if("serviceWorker" in navigator){' +
+      '    const regs = await navigator.serviceWorker.getRegistrations();' +
+      '    for(const r of regs) await r.unregister();' +
+      '    const keys = await caches.keys();' +
+      '    for(const k of keys) await caches.delete(k);' +
+      '  }' +
+      '  location.href="/";' +
+      '})();' +
+      '</script><p>Wird zurückgesetzt…</p></body></html>');
     return;
   }
 
