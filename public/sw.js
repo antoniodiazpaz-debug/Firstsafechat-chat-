@@ -7,7 +7,7 @@
    auf der Platte.
    ═══════════════════════════════════════════════════════════════════════ */
 
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL = `shell-${VERSION}`;
 
 /* Nur statische Dateien. Bewusst kurz gehalten. */
@@ -40,10 +40,12 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
 
-  /* Niemals zwischenspeichern: alles, was Nutzerdaten berührt */
+  /* Niemals zwischenspeichern: alles, was Nutzerdaten berührt
+     oder dynamisch aktualisiert werden muss */
   if (e.request.method !== 'GET' ||
       url.pathname.startsWith('/api/') ||
       url.pathname.startsWith('/rest/') ||
+      url.pathname.endsWith('.js') ||
       url.hostname.includes('supabase') ||
       url.hostname.includes('r2.') ||
       url.hostname.includes('mix-')) {
