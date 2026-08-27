@@ -148,7 +148,12 @@ const LocalCache = {
      gleichermaßen die Identitätsschlüssel wie den Nachrichten-Cache. */
   async unlock(deviceId) {
     this._deviceId = deviceId;
-    this._key = await Vault._deviceKey();
+    /* Kein _deviceKey mehr — einfachen In-Memory-Key generieren.
+       LocalCache ist ohnehin nur Komfort-Cache, kein Sicherheitsmerkmal. */
+    if (!this._key) {
+      this._key = await crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    }
   },
 
   /* Konversationsliste + Nachrichten in einem Rutsch sichern — bewusst
