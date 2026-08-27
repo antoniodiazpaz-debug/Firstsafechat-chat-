@@ -1103,8 +1103,7 @@ function renderMain() {
   convs.sort((a, b) => (b.lastMsg?.ts || 0) - (a.lastMsg?.ts || 0));
 
   main.innerHTML = `
-    <div class="lockedrow"><span class="ic">🔒</span><span>Gesperrte Chats</span></div>
-    <div class="scroll" style="height:calc(100% - 46px);position:relative">
+    <div class="scroll" style="height:100%;position:relative">
       ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') :
         `<div class="empty"><div class="ic">💬</div><div>Noch keine Chats.<br>Tippe auf + um zu starten.</div></div>`}
       <div class="fab" onclick="window.__app.newChat()">💬</div>
