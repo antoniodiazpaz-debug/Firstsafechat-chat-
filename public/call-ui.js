@@ -6,7 +6,7 @@
    selbst je nach Anrufzustand. Einzige Voraussetzung: ein Element mit
    id="callOverlay" muss im HTML vorhanden sein (leer, wird hier befüllt).
    ═══════════════════════════════════════════════════════════════════════ */
-import { Call } from './call.js';
+import { Call } from '/call.js';
 
 let overlayEl = null;
 let remoteVideoEl = null;
