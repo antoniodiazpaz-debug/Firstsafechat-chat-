@@ -563,7 +563,13 @@ async function reconstructIdentityFromVault(data) {
     const importDH   = jwk => crypto.subtle.importKey('jwk', jwk, { name:'ECDH', namedCurve:'P-256' }, true, ['deriveBits']);
     const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name:'ECDSA', namedCurve:'P-256' }, true, ['sign']);
     const pubOnly    = jwk => { const c = { ...jwk }; delete c.d; return c; };
-    const IK  = { priv: await importDH(data.IK),   privJwk: data.IK,  pubJwk: pubOnly(data.IK) };
+    const ikPubJwk = pubOnly(data.IK);
+    const IK = {
+      priv: await importDH(data.IK),
+      privJwk: data.IK,
+      pubJwk: ikPubJwk,
+      pub: await crypto.subtle.importKey('jwk', ikPubJwk, { name:'ECDH', namedCurve:'P-256' }, true, [])
+    };
     const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
     const spkPubJwk = pubOnly(data.SPK);
     const SPK = {
@@ -745,6 +751,10 @@ async function handleEnvelope(env, live) {
     plaintext = '⚠️ [' + e.name + '] ' + e.message + ' | header:' + JSON.stringify(env.header || null) + ' | sealed:' + !!env.sealed;
   }
 
+  /* Header als String parsen falls nötig */
+  if (typeof env.header === 'string') {
+    try { env.header = JSON.parse(env.header); } catch {}
+  }
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
 
   /* FIX 2b: Name sofort aus User-Liste holen */
@@ -779,9 +789,13 @@ async function openRatchet(env) {
   try {
     const key = sk(env.senderId, env.senderDeviceId);
     let st = state.sessions.get(key);
-    /* Wenn n:0 und X3DH-Header vorhanden → immer neue Session aufbauen.
-       Eine bestehende Session im RAM gehört zu einer alten Konversation. */
-    if (env.header?.x3dh && (env.header?.n === 0)) {
+    /* Header könnte als String vom Server kommen — parsen falls nötig */
+    if (typeof env.header === 'string') {
+      try { env.header = JSON.parse(env.header); } catch {}
+    }
+    /* Wenn X3DH-Header vorhanden → immer neue Session aufbauen.
+       Die bestehende Session im RAM gehört zu einer anderen Konversation. */
+    if (env.header?.x3dh) {
       state.sessions.delete(key);
       st = null;
     }
@@ -996,7 +1010,17 @@ async function ensureReceiverSession(env) {
      wir bauen X3DH ohne OPK (3-DH statt 4-DH, immer noch sicher) */
   const usedOpk = opkId ? (state.identity.opks.get(opkId) || null) : null;
 
-  const SK = await X3DH.responder(state.identity.IK, mySPK, usedOpk, senderIK, senderEK);
+  const _dbg = 'IKpriv:' + !!state.identity.IK?.priv
+    + ' SPKpriv:' + !!mySPK?.priv
+    + ' SPKpub:' + !!mySPK?.pub
+    + ' OPK:' + !!usedOpk
+    + ' opkId:' + opkId;
+  let SK;
+  try {
+    SK = await X3DH.responder(state.identity.IK, mySPK, usedOpk, senderIK, senderEK);
+  } catch(e2) {
+    throw new Error('X3DH-Fehler: ' + _dbg + ' | ' + e2.message);
+  }
   const st = Ratchet.initReceiver(SK, mySPK);
   state.sessions.set(key, st);
   if (usedOpk) state.identity.opks.delete(opkId);
