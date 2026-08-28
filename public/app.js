@@ -983,19 +983,23 @@ const appActions = {
    X3DH — FIX 1: Session nach Aufbau persistieren
    ═══════════════════════════════════════════════════════════════════════ */
 async function ensureSessions(peerId) {
+  /* Bundle vom Server holen — immer nötig um Geräteliste zu kennen */
   const { bundles } = await api.fetchBundle(peerId);
   if (!bundles?.length) throw new Error('Kein aktives Gerät für diesen Nutzer gefunden');
-  const missing = bundles.filter(b => !state.sessions.has(sk(peerId, b.deviceId)));
-  for (const bundle of missing) {
+
+  for (const bundle of bundles) {
+    const key = sk(peerId, bundle.deviceId);
+    /* Bestehende Session im RAM wiederverwenden — KEIN neuer X3DH */
+    if (state.sessions.has(key)) continue;
+
+    /* Nur neue Session aufbauen wenn keine existiert */
     const verify = await PreKeys.verifyBundle(bundle);
-    if (!verify.ok) { console.warn('Bundle-Signatur ungültig', bundle.deviceId, verify.reason); continue; }
+    if (!verify.ok) { console.warn('Bundle ungültig', bundle.deviceId, verify.reason); continue; }
     const { SK, EK } = await X3DH.initiator(state.identity.IK, bundle);
     const st = await Ratchet.initSender(SK, bundle.spk);
     st.usedOpkId = bundle.opkId;
     st.ephemeral = EK;
-    state.sessions.set(sk(peerId, bundle.deviceId), st);
-    /* FIX 1: Neue Session sofort speichern */
-    await SessionStore.save(sk(peerId, bundle.deviceId), st);
+    state.sessions.set(key, st);
   }
   return bundles;
 }
