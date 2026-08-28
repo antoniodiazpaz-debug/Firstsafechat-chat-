@@ -298,7 +298,7 @@ const state = {
   convs: new Map(), messages: new Map(), sessions: new Map(),
   bundleCache: new Map(), monitor: null, search: '',
   blocked: new Set(),
-  processedEnvelopes: new Set(), /* verhindert Doppelverarbeitung */
+  processedEnvelopes: new Set(JSON.parse(localStorage.getItem('sc:processed') || '[]')), /* verhindert Doppelverarbeitung */
   isOffline: typeof navigator !== 'undefined' && navigator.onLine === false,
   outbox: []
 };
@@ -746,11 +746,12 @@ async function handleEnvelope(env, live) {
   /* Doppelverarbeitung verhindern — Inbox + WebSocket liefern dieselbe Nachricht */
   if (state.processedEnvelopes.has(env.id)) return;
   state.processedEnvelopes.add(env.id);
-  /* Set begrenzen auf letzte 500 IDs */
-  if (state.processedEnvelopes.size > 500) {
+  /* Set begrenzen auf letzte 200 IDs und in localStorage persistieren */
+  if (state.processedEnvelopes.size > 200) {
     const first = state.processedEnvelopes.values().next().value;
     state.processedEnvelopes.delete(first);
   }
+  try { localStorage.setItem('sc:processed', JSON.stringify([...state.processedEnvelopes])); } catch {}
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
   let plaintext = '[verschlüsselt]';
   try {
@@ -820,7 +821,14 @@ async function openRatchet(env) {
   }
   const assoc = `v1|${senderId}|${env.convId}`;
 
-  const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
+  let buf;
+  try {
+    buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
+  } catch (decErr) {
+    /* Bei Fehler Session verwerfen — beim nächsten Versuch wird neu aufgebaut */
+    state.sessions.delete(key);
+    throw decErr;
+  }
   await SessionStore.save(key, st);
   return td.decode(buf);
 }
