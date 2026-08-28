@@ -9,8 +9,6 @@ import { setLocale, getLocale, t } from '/i18n.js';
 import { detectLanguage, guessDialCode, preparePhoneInput, watchForSmsCode } from '/device-info.js';
 import { Call } from '/call.js';
 
-/* Sprache sofort beim Laden setzen — vor jedem UI-Aufbau, damit auch
-   die allererste gerenderte Seite (Boot/Auth) schon übersetzt ist. */
 setLocale(detectLanguage().supported);
 if (document.documentElement) document.documentElement.lang = getLocale();
 
@@ -42,12 +40,6 @@ function toast(msg, ms = 2300) {
 const API_BASE = window.SECURECHAT_CONFIG?.apiBase || location.origin;
 const api = new ApiClient(API_BASE);
 
-/* ═══════════════════════════════════════════════════════════════════════
-   LOKALER VAULT — verschlüsselte Schlüsselspeicherung (IndexedDB)
-   Der private Schlüssel eines Geräts verlässt dieses Gerät nie. Er wird
-   mit einem aus dem Passwort abgeleiteten Schlüssel verschlüsselt lokal
-   gespeichert, damit ein Reload nicht die ganze Identität verliert.
-   ═══════════════════════════════════════════════════════════════════════ */
 function showDiagPanel(text) {
   document.getElementById('diagPanel')?.remove();
   const panel = document.createElement('div');
@@ -66,22 +58,13 @@ function showDiagPanel(text) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   LOKALER SPEICHER — Klartext localStorage (kein Crypto, kein IndexedDB)
-   Token, DeviceId, UserName werden unverschlüsselt gespeichert.
-   Die Crypto-Schlüssel (für E2EE) werden ebenfalls als JWK im
-   localStorage gehalten — einfach und zuverlässig auf allen Geräten.
+   LOKALER SPEICHER
    ═══════════════════════════════════════════════════════════════════════ */
 const Vault = {
   save(deviceId, identityStore, meta) {
     localStorage.setItem('sc:deviceId', deviceId);
-async _db() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('securechat', 1);
-    req.onupgradeneeded = e => e.target.result.createObjectStore('messages', { keyPath: 'deviceId' });
-    req.onsuccess = e => resolve(e.target.result);
-    req.onerror = () => reject(req.error);
-  });
-}    localStorage.setItem('sc:userName', meta.userName || '');
+    localStorage.setItem('sc:token', meta.token);
+    localStorage.setItem('sc:userName', meta.userName || '');
     localStorage.setItem('sc:email', meta.email || '');
     localStorage.setItem('sc:keys', JSON.stringify({
       IK:   identityStore.IK.privJwk,
@@ -110,68 +93,47 @@ async _db() {
   knownDeviceId() {
     return localStorage.getItem('sc:deviceId');
   },
+
   rememberDevice(deviceId, userName) {
     localStorage.setItem('sc:deviceId', deviceId);
     localStorage.setItem('sc:userName', userName);
   },
+
   forget() {
     ['sc:deviceId','sc:token','sc:userName','sc:email','sc:keys',
      'securechat:deviceId','securechat:userName','securechat:deviceKey']
       .forEach(k => localStorage.removeItem(k));
-    /* Auch alte vault-Einträge entfernen */
     Object.keys(localStorage)
       .filter(k => k.startsWith('securechat:vault:'))
       .forEach(k => localStorage.removeItem(k));
   },
+
+  /* FIX 1: Chatverlauf — echte IndexedDB statt null */
   async _db() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('securechat', 1);
-    req.onupgradeneeded = e => e.target.result.createObjectStore('messages', { keyPath: 'deviceId' });
-    req.onsuccess = e => resolve(e.target.result);
-    req.onerror = () => reject(req.error);
-  });
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('securechat', 1);
+      req.onupgradeneeded = e => e.target.result.createObjectStore('messages', { keyPath: 'deviceId' });
+      req.onsuccess = e => resolve(e.target.result);
+      req.onerror = () => reject(req.error);
+    });
   }
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
-   LOCAL CACHE — verschlüsselter Nachrichten-Cache für den Offline-Modus
-   ─────────────────────────────────────────────────────────────────────
-   Ohne diesen Cache wäre "offline lesen" eine leere Behauptung: state.
-   messages ist eine reine In-Memory-Map, die bei jedem Neuladen der
-   Seite verloren geht. Hier wird der Konversationsstand nach jeder
-   Änderung mit dem VAULT-Schlüssel verschlüsselt in IndexedDB abgelegt
-   — also mit demselben Schlüssel, der auch die privaten Ratchet-
-   Schlüssel schützt. Ein gestohlenes, gesperrtes Gerät gibt damit weder
-   Schlüssel noch Klartext-Verlauf preis, nur wer das Passwort kennt,
-   kommt an beides.
-
-   Bewusst NICHT im Service-Worker-Cache (der ist für die Programmhülle,
-   liegt unverschlüsselt — siehe sw.js). Getrennte Speicherorte für
-   getrennte Vertraulichkeitsstufen.
+   LOCAL CACHE
    ═══════════════════════════════════════════════════════════════════════ */
 const LocalCache = {
-  _key: null,   // AES-Schlüssel, wird beim Entsperren des Vaults gesetzt
+  _key: null,
   _deviceId: null,
 
-  /* Wird von afterAuth()/afterAuthOffline() aufgerufen, sobald der Vault
-     entsperrt ist — nutzt DENSELBEN nicht-extrahierbaren Geräteschlüssel
-     wie Vault selbst (siehe Vault._deviceKey). Kein eigenes Passwort,
-     keine eigene Ableitung mehr nötig: der Geräteschlüssel schützt
-     gleichermaßen die Identitätsschlüssel wie den Nachrichten-Cache. */
   async unlock(deviceId) {
     this._deviceId = deviceId;
-    /* Kein _deviceKey mehr — einfachen In-Memory-Key generieren.
-       LocalCache ist ohnehin nur Komfort-Cache, kein Sicherheitsmerkmal. */
     if (!this._key) {
       this._key = await crypto.subtle.generateKey(
         { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
     }
   },
 
-  /* Konversationsliste + Nachrichten in einem Rutsch sichern — bewusst
-     kein Eintrag pro Nachricht (siehe persistent_storage_for_artifacts-
-     Grundsatz: zusammengehörige Daten in einem Schlüssel bündeln,
-     statt viele kleine Schreibvorgänge zu erzeugen). */
   async save() {
     if (!this._key || !this._deviceId) return;
     const snapshot = {
@@ -184,7 +146,7 @@ const LocalCache = {
     const plain = te.encode(JSON.stringify(snapshot));
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this._key, plain);
     const db = await Vault._db();
-    if (!db) return; /* Fallback-Modus */
+    if (!db) return;
     await new Promise((resolve, reject) => {
       const tx = db.transaction('messages', 'readwrite');
       tx.objectStore('messages').put({ deviceId: this._deviceId, iv: [...iv], ct: [...new Uint8Array(ct)] });
@@ -193,13 +155,10 @@ const LocalCache = {
     });
   },
 
-  /* Beim Start (online oder offline) den letzten bekannten Stand laden,
-     BEVOR überhaupt ein Netzwerkaufruf versucht wird — so zeigt die
-     Chat-Liste sofort etwas an, auch wenn der Server nicht antwortet. */
   async load() {
     if (!this._key || !this._deviceId) return false;
     const db = await Vault._db();
-    if (!db) return false; /* Fallback-Modus */
+    if (!db) return false;
     const rec = await new Promise((resolve, reject) => {
       const tx = db.transaction('messages', 'readonly');
       const req = tx.objectStore('messages').get(this._deviceId);
@@ -221,9 +180,6 @@ const LocalCache = {
     }
   },
 
-  /* Regelmäßig speichern statt bei jeder einzelnen Nachricht — spart
-     IndexedDB-Schreibvorgänge bei einer Serie schnell eintreffender
-     Nachrichten, ohne nennenswerte Verzögerung für den Nutzer. */
   _saveTimer: null,
   scheduleSave() {
     if (this._saveTimer) return;
@@ -248,27 +204,13 @@ const state = {
   monitor: null,
   search: '',
   blocked: new Set(),
-  /* Eigener Netzstatus (nicht zu verwechseln mit "online" bei Kontakten,
-     das ist deren WebSocket-Präsenz). Startet optimistisch mit
-     navigator.onLine — das ist zuverlässig genug für "kein Netzadapter
-     aktiv", erkennt aber keinen kaputten Proxy o. Ä.; die eigentliche
-     Wahrheit liefert erst ein fehlgeschlagener fetch()-Aufruf. */
   isOffline: typeof navigator !== 'undefined' && navigator.onLine === false,
-  /* Nachrichten, die während einer Netzunterbrechung geschrieben wurden.
-     Werden automatisch erneut versucht, sobald das Netz zurückkommt —
-     der Nutzer muss NICHT manuell erneut auf Senden tippen. */
-  outbox: []   // { convId, peerId, text, localId, ts }
+  outbox: []
 };
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
 /* ═══════════════════════════════════════════════════════════════════════
    NETZSTATUS
-   ─────────────────────────────────────────────────────────────────────
-   Zwei Signale kombiniert: das Browser-Ereignis (schnell, aber grob —
-   erkennt nur "Netzwerkadapter tot") und der WebSocket-Verbindungsstatus
-   (genauer, weil er tatsächlich mit dem Server spricht). Ein Banner
-   erscheint nur, wenn BEIDE offline sagen, damit ein kurzer WebSocket-
-   Reconnect-Versuch nicht sofort einen Alarm auslöst.
    ═══════════════════════════════════════════════════════════════════════ */
 function setupOfflineDetection() {
   if (typeof window === 'undefined' || !window.addEventListener) return;
@@ -293,9 +235,6 @@ function updateOfflineBanner() {
   }
 }
 
-/* Wartende Nachrichten erneut versuchen, sobald die Verbindung zurück
-   ist. Reihenfolge bleibt erhalten (älteste zuerst) — sonst könnten
-   Antworten vor der Nachricht ankommen, auf die sie sich beziehen. */
 async function flushOutbox() {
   if (!state.outbox.length) return;
   const pending = [...state.outbox];
@@ -303,20 +242,16 @@ async function flushOutbox() {
   for (const item of pending) {
     try {
       await sendMessage(item.peerId, item.convId, item.text);
-      /* Lokalen Platzhalter durch das echte, gesendete Ergebnis ersetzen */
       const msgs = state.messages.get(item.convId);
       const local = msgs?.find(m => m.id === item.localId);
       if (local) local.pending = false;
     } catch (e) {
-      /* Immer noch offline oder Server lehnt ab (z. B. blockiert) —
-         zurück in die Outbox, nicht stillschweigend verwerfen. */
       state.outbox.push(item);
     }
   }
   if (state.view === 'chat') renderChatMessages();
   renderMain();
 }
-
 
 /* ═══════════════════════════════════════════════════════════════════════
    BOOT
@@ -325,8 +260,6 @@ async function boot() {
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
-  /* Reset-Button nach 5s einblenden — falls die App hängt,
-     kann der Nutzer localStorage löschen und neu starten. */
   const resetTimeout = setTimeout(() => {
     const existing = document.getElementById('bootResetBtn');
     if (existing) return;
@@ -366,7 +299,7 @@ async function boot() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   AUTH — Registrierung, Login (bekanntes Gerät), Pairing (neues Gerät)
+   AUTH
    ═══════════════════════════════════════════════════════════════════════ */
 function showAuth(html) {
   $('#auth').innerHTML = html;
@@ -393,10 +326,6 @@ function renderAuthChoice() {
       </div>
     </div>`);
   window.__auth = { submit: authSubmit, recover: renderRecoveryPrompt };
-
-  /* Telefonfeld für Browser-/OS-Autofill vorbereiten und mit der aus
-     der Systemsprache geschätzten Vorwahl vorbefüllen — das Feld bleibt
-     vollständig editierbar, es ist nur ein Startwert. */
   const phoneInput = $('#aPhone');
   if (phoneInput) {
     preparePhoneInput(phoneInput);
@@ -409,32 +338,15 @@ function authErr(msg) {
   const e = $('#authErr'); e.textContent = '⚠️ ' + msg; e.classList.remove('hide');
 }
 
-/* Passwortlos: Registrierung ist der einzige Weg, ein Konto auf einem
-   Gerät neu einzurichten. Ein bereits registriertes Gerät meldet sich
-   automatisch an (siehe boot()) — es gibt keinen manuellen "Login"-Weg
-   mehr für ein bereits bekanntes Gerät, und keinen Passwort-basierten
-   Weg für ein neues Gerät (dafür existiert bereits das Pairing-System:
-   ein Code von einem angemeldeten Gerät koppelt ein weiteres, siehe
-   renderPairingPrompt). */
 async function authSubmit() {
   const btn = $('#authBtn'); btn.disabled = true;
   const name = $('#aUser').value.trim();
   try {
     if (!name) return authErr(t('fieldsRequired'));
-
-    /* Telefonnummer ist bewusst OPTIONAL — der Server verlangt sie
-       nicht (siehe /api/register in server.js), sie dient nur dem
-       freiwilligen Kontaktabgleich ("X nutzt die App auch"). */
     const phone = $('#aPhone').value.trim();
-
     const email = $('#aEmail').value.trim();
     if (!email) return authErr(t('emailRequired'));
-    /* Bewusst nur eine grobe Formprüfung (etwas@etwas.etwas) — die
-       eigentliche Gültigkeit bestätigt sich erst durch den zugestellten
-       Bestätigungscode. Eine strengere Regex hier würde nur seltene,
-       aber technisch gültige Adressen fälschlich ablehnen. */
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return authErr(t('emailInvalid'));
-
     btn.textContent = t('generatingKeys');
     const identity = await PreKeys.createStore();
     const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
@@ -443,12 +355,6 @@ async function authSubmit() {
       name, phone: phone || undefined, email,
       deviceName: guessDeviceName(), platform, identity
     });
-    /* Sitzungstoken wird ZUSAMMEN mit den Identitätsschlüsseln im
-       lokalen, durch den nicht-extrahierbaren Geräteschlüssel
-       geschützten Vault gespeichert — das ist die gesamte
-       "Passwort"-Ersetzung: kein Geheimnis, das der Nutzer eingibt,
-       sondern ein Geheimnis, das an dieses Browserprofil gebunden ist
-       und es nie in lesbarer Form verlässt. */
     await Vault.save(data.device.id, identity, { name, userId: data.user.id, token: data.token });
     Vault.rememberDevice(data.device.id, name);
     state.identity = identity;
@@ -534,10 +440,6 @@ function renderRecoveryPrompt() {
       const email = $('#recEmail').value.trim();
       if (!email) { $('#recErr').textContent = t('emailRequired'); $('#recErr').classList.remove('hide'); return; }
       await api.recoverRequest(email);
-      /* Die Server-Antwort verrät absichtlich nie, ob die E-Mail
-         tatsächlich zu einem Konto gehört (siehe server.js) — die
-         Oberfläche zeigt deshalb IMMER denselben nächsten Schritt,
-         unabhängig vom tatsächlichen Ergebnis. */
       renderRecoveryCodeStep(email);
     } catch (e) {
       $('#recErr').textContent = '⚠️ ' + e.message;
@@ -574,12 +476,6 @@ function renderRecoveryCodeStep(email) {
         return;
       }
       btn.textContent = t('generatingKeys');
-      /* Wiederherstellung erzeugt zwangsläufig ein NEUES Schlüsselpaar
-         für dieses Gerät — die alten privaten Schlüssel haben das
-         ursprüngliche Gerät nie verlassen (Ende-zu-Ende-Verschlüsselung)
-         und lassen sich serverseitig nicht zurückholen. Der Nutzer
-         bekommt denselben Namen und dasselbe Konto zurück, aber ein
-         frisches Gerät darin. */
       const identity = await PreKeys.createStore();
       const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
         (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
@@ -597,22 +493,6 @@ function renderRecoveryCodeStep(email) {
   };
 }
 
-/* Passwortlos: ein bekanntes Gerät meldet sich vollautomatisch an, ganz
-   ohne Bildschirm dazwischen — der Vault entsperrt sich selbst (der
-   nicht-extrahierbare Geräteschlüssel braucht keine Nutzereingabe), und
-   das darin gespeicherte Sitzungstoken (30 Tage gültig, siehe server.js)
-   wird direkt gegen /api/me geprüft. Nur wenn das Token abgelaufen ist
-   oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
-   Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
-   mehr, weil es kein Passwort mehr gibt. */
-/* Passwortlos: ein bekanntes Gerät meldet sich vollautomatisch an, ganz
-   ohne Bildschirm dazwischen — der Vault entsperrt sich selbst (der
-   nicht-extrahierbare Geräteschlüssel braucht keine Nutzereingabe), und
-   das darin gespeicherte Sitzungstoken (19 Jahre gültig, siehe server.js)
-   wird direkt gegen /api/me geprüft. Nur wenn das Token abgelaufen ist
-   oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
-   Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
-   mehr, weil es kein Passwort mehr gibt. */
 async function renderLoginForKnownDevice(deviceId, userName) {
   const vaultRec = Vault.load(deviceId);
   if (!vaultRec || !vaultRec.meta?.token) {
@@ -620,78 +500,54 @@ async function renderLoginForKnownDevice(deviceId, userName) {
     renderAuthChoice();
     return;
   }
-
-  /* App sofort mit lokalen Daten öffnen — kein Warten auf Server */
   $('#boot').classList.add('hide');
   state.identity = await reconstructIdentityFromVault(vaultRec.data);
   api.token = vaultRec.meta.token;
-
-  /* Offline-Cache laden falls vorhanden */
   await LocalCache.unlock(deviceId);
   await LocalCache.load();
-
-  /* Sofort die Chat-Liste zeigen */
   await afterAuthOffline(deviceId, userName);
-
-  /* Server-Check im Hintergrund — nur bei Fehler zur Anmeldung */
   fetch(API_BASE + '/api/me', {
     headers: { Authorization: 'Bearer ' + vaultRec.meta.token }
   }).then(async r => {
-    if (r.status === 401) {
-      /* Token abgelaufen — Vault löschen und neu anmelden */
-      Vault.forget();
-      location.reload();
-      return;
-    }
-    if (!r.ok) return; /* Server-Fehler ignorieren, App bleibt offen */
+    if (r.status === 401) { Vault.forget(); location.reload(); return; }
+    if (!r.ok) return;
     const me = await r.json();
-    /* Online — vollständige Auth-Sequenz im Hintergrund */
     state.isOffline = false;
     updateOfflineBanner();
     await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
-  }).catch(() => {
-    /* Kein Netz — App bleibt im Offline-Modus, kein Reload */
-  });
+  }).catch(() => {});
 }
+
 async function reconstructIdentityFromVault(data) {
   const log = [];
   const step = (msg) => { log.push(new Date().toISOString().slice(11,23) + ' — ' + msg); };
-
   const bootMsgEl = document.getElementById('bootMsg');
   const setMsg = (m) => { if (bootMsgEl) bootMsgEl.textContent = m; };
-
   step('reconstructIdentityFromVault gestartet');
   setMsg('IK wird importiert…');
-  step('data.IK vorhanden: ' + !!data.IK + ', kty=' + data.IK?.kty);
-  step('data.IKS vorhanden: ' + !!data.IKS + ', kty=' + data.IKS?.kty);
-  step('data.SPK vorhanden: ' + !!data.SPK + ', kty=' + data.SPK?.kty);
-  step('data.opks vorhanden: ' + !!data.opks + ', Länge=' + data.opks?.length);
-
   const timeoutId = setTimeout(() => {
-    step('TIMEOUT nach 3s — Import-Vorgang hat nie geantwortet');
+    step('TIMEOUT nach 3s');
     showDiagPanel(log.join('\n'));
   }, 3000);
-
   try {
     const importDH = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
     const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
     const pubOnly = jwk => { const c = { ...jwk }; delete c.d; return c; };
-
     step('importiere IK...');
     const IK = { priv: await importDH(data.IK), privJwk: data.IK, pubJwk: pubOnly(data.IK) };
-    step('IK OK, importiere IKS...');
+    step('IK OK');
     setMsg('IKS wird importiert…');
     const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
-    step('IKS OK, importiere SPK...');
+    step('IKS OK');
     setMsg('SPK wird importiert…');
     const SPK = { priv: await importDH(data.SPK), privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
-    step('SPK OK, importiere opks...');
+    step('SPK OK');
     setMsg('OPKs werden importiert…');
     const opks = new Map();
     for (const [id, jwk] of data.opks) {
       opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
     }
-    step('alle Schlüssel erfolgreich importiert');
+    step('alle Schlüssel importiert');
     setMsg('Schlüssel importiert ✓');
     clearTimeout(timeoutId);
     return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0,
@@ -711,33 +567,15 @@ async function afterAuth(data) {
   state.me = data.user;
   state.device = data.device;
   state.monitor = new KT.Monitor();
-
-  /* WICHTIG: window.__app muss HIER gesetzt werden, nicht erst in
-     renderShell() — die E-Mail-Verifizierung (Pflicht, siehe unten)
-     kann einen frühen return auslösen, BEVOR renderShell() je läuft. */
   window.__app = appActions;
 
-  /* E-Mail-Verifizierung ist PFLICHT — deshalb hier GANZ AM ANFANG
-     geprüft, VOR jedem anderen await (LocalCache, WebSocket, Inbox,
-     Blockliste). Grund: jeder dieser Aufrufe könnte theoretisch werfen
-     und ohne umgebendes try/catch die gesamte Funktion abbrechen, bevor
-     die Verifizierungsprüfung je erreicht wird — das würde sich exakt
-     als "Overlay erscheint (aus einem früheren, noch im DOM hängenden
-     Aufruf), aber neue Klicks bewirken nichts" zeigen, weil kein neuer
-     Aufruf von showEmailVerifyPrompt() mehr stattfindet und somit auch
-     keine frischen Event-Listener registriert werden. */
   if (!state.me.emailVerified) {
     showEmailVerifyPrompt(true);
     return;
   }
 
-  /* Lokalen Nachrichten-Cache entsperren und zuerst laden — damit die
-     Chat-Liste sofort etwas zeigt, auch bevor die Inbox vom Server
-     abgeglichen ist. Nutzt denselben Geräteschlüssel wie der Vault,
-     kein separates Geheimnis mehr nötig. */
   await LocalCache.unlock(data.device.id);
   await LocalCache.load();
-
   api.connect();
   wireSocketEvents();
 
@@ -745,7 +583,6 @@ async function afterAuth(data) {
   await loadBlockList();
   await refreshInbox();
 
-  /* UI nur neu aufbauen wenn noch nicht sichtbar */
   if ($('#app').classList.contains('hide')) {
     $('#auth').classList.add('hide');
     $('#app').classList.remove('hide');
@@ -753,29 +590,15 @@ async function afterAuth(data) {
     go('chats');
     toast('Willkommen, ' + state.me.name + ' 🔐');
   } else {
-    /* App läuft bereits (Offline-Modus war aktiv) — nur aktualisieren */
     renderMain();
     updateOfflineBanner();
   }
 }
 
 function showEmailVerifyPrompt(blocking) {
-  /* Ein eventuell noch vorhandenes altes Sheet zuerst entfernen — sonst
-     könnten zwei Elemente mit derselben id="verifySheet" im DOM landen,
-     falls diese Funktion mehr als einmal aufgerufen wird. getElementById
-     würde dann nur das ERSTE (möglicherweise alte, verwaiste) Element
-     finden, während visuell das neue obenauf liegt — die Event-Listener
-     hingen dann am falschen Element, was sich exakt als "sichtbares
-     Overlay, aber Klicks bewirken nichts" zeigen würde. */
   document.getElementById('verifySheet')?.remove();
-
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'verifySheet';
-  /* Bei PFLICHT-Verifizierung (blocking=true) gibt es bewusst keinen
-     "Später"-Button und keinen Klick-außerhalb-zum-Schließen — das
-     Konto kommt sonst nie zur eigentlichen App durch, siehe server.js,
-     wo die Registrierung selbst ohne erfolgreichen Mailversand schon
-     zurückgerollt wird. */
   sheet.innerHTML = `
     <div class="sheetbox">
       <div class="grabber"></div>
@@ -794,24 +617,6 @@ function showEmailVerifyPrompt(blocking) {
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
   document.getElementById('verifyCodeInput')?.focus();
-
-  /* Direkte Event-Listener statt onclick="window.__app...()" — das
-     umgeht JEDES Timing-Problem mit window.__app komplett, weil die
-     Funktionen hier direkt referenziert werden, ohne den Umweg über
-     das globale Objekt. Robuster als der Inline-Ansatz, unabhängig
-     davon, wann/ob window.__app zu diesem Zeitpunkt bereits gesetzt
-     wurde.
-
-     DEFENSIV mit ?. abgesichert: falls eines der Elemente aus
-     irgendeinem Grund null ist, würde ein direkter .addEventListener()-
-     Aufruf sofort werfen und ALLE folgenden Listener-Registrierungen in
-     dieser Funktion verhindern — das würde exakt zum gemeldeten Symptom
-     passen ("Buttons sehen normal aus, reagieren aber auf nichts",
-     weil gar kein Listener je registriert wurde). document.title wird
-     zusätzlich als TEMPORÄRES Diagnosesignal genutzt, weil selbst
-     alert() im Feld nicht sichtbar zuverlässig ankam — eine Änderung
-     des Tab-Titels lässt sich im Browser-Tab-Umschalter oder in der
-     Adressleiste erkennen, ganz ohne Konsolenzugriff. */
   const submitBtn = document.getElementById('verifySubmitBtn');
   const resendBtn = document.getElementById('verifyResendBtn');
   const dismissBtn = document.getElementById('verifyDismissBtn');
@@ -836,13 +641,6 @@ async function submitEmailCode() {
       state.me.emailVerified = true;
       document.getElementById('verifySheet')?.remove();
       toast('✓ E-Mail bestätigt');
-
-      /* Bei Pflicht-Verifizierung war die Hauptoberfläche bisher noch nie
-         aufgebaut — jetzt automatisch weiterleiten, ohne dass ein
-         erneuter Login-Schritt nötig wäre. Das Sitzungstoken aus der
-         Registrierung ist bereits gültig; der Nutzer ist im
-         API-/WebSocket-Sinn längst angemeldet, es fehlte nur die
-         Freischaltung der Oberfläche. */
       if ($('#app').classList.contains('hide')) {
         $('#auth').classList.add('hide');
         $('#app').classList.remove('hide');
@@ -858,14 +656,6 @@ async function submitEmailCode() {
       else alert('DIAGNOSE: errEl nicht gefunden. Fehler war: ' + msg);
     }
   } catch (outerErr) {
-    /* TEMPORÄR zur Fehlersuche: fängt JEDEN unerwarteten Fehler ab, der
-       außerhalb des inneren try/catch auftritt (z. B. wenn $('#app')
-       selbst wirft, oder renderShell()/go() einen Fehler hat) — ohne
-       dieses äußere Netz würde ein solcher Fehler komplett lautlos
-       bleiben, exakt das gemeldete Symptom "Buttons reagieren, aber
-       nichts passiert". alert() ist hier bewusst blockierend gewählt,
-       damit die Meldung garantiert gesehen wird, auch ohne Zugriff auf
-       die Browser-Konsole. */
     alert('DIAGNOSE — unerwarteter Fehler in submitEmailCode: ' + outerErr.message + '\n\n' + outerErr.stack);
   }
 }
@@ -883,19 +673,11 @@ function dismissEmailVerify() {
   document.getElementById('verifySheet')?.remove();
 }
 
-/* Server nicht erreichbar, aber der Vault hat sich lokal mit dem
-   richtigen Passwort entsperrt: App im Offline-Modus starten. Zeigt
-   den letzten gespeicherten Stand (Konversationen, Nachrichten,
-   wartende Outbox), aber ohne Verbindung — Senden landet in der Outbox,
-   kein Posteingangsabgleich, keine Live-Präsenz. Sobald das Netz
-   zurückkommt, holt boot()/connect() den Rest automatisch nach. */
 async function afterAuthOffline(deviceId, userName) {
-  state.me = { id: null, name: userName };   // echte ID erst nach Online-Login bekannt
+  state.me = { id: null, name: userName };
   state.device = { id: deviceId };
   state.isOffline = true;
-
   await LocalCache.load();
-
   $('#auth').classList.add('hide');
   $('#app').classList.remove('hide');
   renderShell();
@@ -909,9 +691,7 @@ function wireSocketEvents() {
   wireSocketEvents._wired = true;
   api.on('envelope', onIncomingEnvelope);
   api.on('presence', onPresence);
-  /* Call global verfügbar machen für call-ui.js */
   window.Call = Call;
-  /* call-ui.js als normales Script laden */
   if (!window.__initCallUI) {
     const s = document.createElement('script');
     s.src = '/call-ui.js';
@@ -925,9 +705,7 @@ function wireSocketEvents() {
     toast('Dieses Gerät wurde entfernt. Du wirst abgemeldet.');
     setTimeout(() => { Vault.forget(); location.reload(); }, 1500);
   });
-  api.on('contact-joined', async () => {
-    toast('Ein Kontakt nutzt jetzt auch SecureChat 👋');
-  });
+  api.on('contact-joined', async () => { toast('Ein Kontakt nutzt jetzt auch SecureChat 👋'); });
   api.on('need-prekeys', () => refillPrekeys().catch(() => {}));
   api.on('connected', () => {
     toast('🟢 WebSocket verbunden', 1500);
@@ -950,7 +728,7 @@ async function refillPrekeys() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   POSTEINGANG — beim Start und live über WebSocket
+   POSTEINGANG
    ═══════════════════════════════════════════════════════════════════════ */
 async function refreshInbox() {
   const { envelopes } = await api.inbox();
@@ -972,6 +750,7 @@ async function onIncomingEnvelope(env) {
     renderMain();
   }
 }
+
 async function handleEnvelope(env, live) {
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
   let plaintext = '[verschlüsselt]';
@@ -986,27 +765,38 @@ async function handleEnvelope(env, live) {
     plaintext = '⚠️ Nicht entschlüsselbar';
   }
 
-  if (!state.messages.has(convId)) state.messages.set(convId, []);
-  state.messages.get(convId).push({
-    id: env.id, from: env.senderId || '(versiegelt)', text: plaintext,
-    ts: env.sentAt, mine: false, sealed: !!env.sealed
-  });
-
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
-  conv.lastMsg = { text: plaintext, ts: env.sentAt };
-  conv.unread = (conv.unread || 0) + 1;
+
+  /* FIX 2: Sender-Name sofort aus senderName oder User-Liste holen */
   if (!conv.name && env.senderName) conv.name = env.senderName;
-  state.convs.set(convId, conv);
-  /* Name nachladen falls noch unbekannt */
+  if (!conv.name && env.senderId) {
+    try {
+      const allUsers = await api.listUsers();
+      const found = (allUsers.users || []).find(u => u.id === env.senderId);
+      if (found?.name) conv.name = found.name;
+    } catch {}
+  }
+  /* Fallback: asynchron nachladen */
   if (!conv.name && env.senderId) {
     fetch(API_BASE + '/api/user/' + env.senderId, {
       headers: { Authorization: 'Bearer ' + api.token }
     }).then(r => r.ok ? r.json() : null).then(u => {
       if (u?.user?.name) { conv.name = u.user.name; renderMain(); }
     }).catch(() => {});
-       }
-  LocalCache.scheduleSave();
+  }
 
+  if (!state.messages.has(convId)) state.messages.set(convId, []);
+  state.messages.get(convId).push({
+    /* FIX 2b: Name direkt in der Nachricht verwenden */
+    id: env.id, from: conv.name || env.senderName || env.senderId || '(versiegelt)',
+    text: plaintext, ts: env.sentAt, mine: false, sealed: !!env.sealed
+  });
+
+  conv.lastMsg = { text: plaintext, ts: env.sentAt };
+  conv.unread = (conv.unread || 0) + 1;
+  state.convs.set(convId, conv);
+
+  LocalCache.scheduleSave();
   if (live) api.ackViaSocket([env.id]);
 }
 
@@ -1014,23 +804,12 @@ async function openRatchet(env) {
   const key = sk(env.senderId, env.senderDeviceId);
   let st = state.sessions.get(key);
   if (!st) st = await ensureReceiverSession(env);
-  /* env.ciphertext kommt als Base64-String vom Server (siehe sendMessage,
-     das ArrayBuffer→Base64 vor dem Versand kodiert) — hier zurück zu
-     Bytes, bevor Ratchet.decrypt() sie an WebCrypto weiterreicht.
-
-     WICHTIG: Ratchet.encrypt() berechnet die AAD aus JSON.stringify(header)
-     BEVOR app.js das x3dh-Feld für den Transport anhängt (siehe
-     sendMessage) — die AAD kennt also nur {dh, pn, n}, nicht x3dh. Würde
-     man den vollen, empfangenen Header (mit x3dh) an decrypt() geben,
-     ergäbe JSON.stringify() einen anderen String als beim Verschlüsseln,
-     der GCM-Tag würde nicht mehr passen. Das x3dh-Feld muss also vor
-     dem Entschlüsseln wieder entfernt werden — es wurde bereits von
-     ensureReceiverSession() ausgelesen, wird hier nicht mehr gebraucht. */
   const { x3dh, ...ratchetHeader } = env.header || {};
   const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) },
     `v1|${env.senderId}|${env.convId}`);
   return td.decode(buf);
 }
+
 async function openSealed(env) {
   const raw = ub64(env.ciphertext);
   const sep = raw.indexOf(0);
@@ -1061,7 +840,7 @@ async function loadBlockList() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   SHELL — Kopfzeile, Filter-Pillen, Chat-Liste, untere Navigation
+   SHELL
    ═══════════════════════════════════════════════════════════════════════ */
 function renderShell() {
   $('#app').innerHTML = `
@@ -1123,7 +902,6 @@ function renderMain() {
     main.innerHTML = `<div class="empty"><div class="ic">🚧</div><div>Noch nicht verfügbar</div></div>`;
     return;
   }
-
   let convs = [...state.convs.values()];
   if (activePill === 'unread') convs = convs.filter(c => (c.unread || 0) > 0);
   if (activePill === 'groups') convs = convs.filter(c => c.isGroup);
@@ -1132,7 +910,6 @@ function renderMain() {
     convs = convs.filter(c => (c.name || c.peerId || '').toLowerCase().includes(q));
   }
   convs.sort((a, b) => (b.lastMsg?.ts || 0) - (a.lastMsg?.ts || 0));
-
   main.innerHTML = `
     <div class="scroll" style="height:100%;position:relative">
       ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') :
@@ -1162,7 +939,7 @@ function convRow(c, i) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   AKTIONEN, vom UI aufgerufen
+   AKTIONEN
    ═══════════════════════════════════════════════════════════════════════ */
 const appActions = {
   setPill(id) { activePill = id; renderPills(); renderMain(); },
@@ -1206,24 +983,15 @@ const appActions = {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
-   SITZUNGSAUFBAU — X3DH pro Empfängergerät
-   ─────────────────────────────────────────────────────────────────────
-   Ein logischer Chat mit einem Kontakt kann mehrere Ratchet-Sitzungen
-   bedeuten — eine pro aktivem Gerät des Kontakts (Fanout). Der Bundle-
-   Abruf liefert alle Geräte auf einmal; für jedes ohne bestehende
-   Sitzung wird X3DH einmalig durchgeführt.
+   SITZUNGSAUFBAU — X3DH
    ═══════════════════════════════════════════════════════════════════════ */
 async function ensureSessions(peerId) {
   const { bundles } = await api.fetchBundle(peerId);
   if (!bundles?.length) throw new Error('Kein aktives Gerät für diesen Nutzer gefunden');
-
   const missing = bundles.filter(b => !state.sessions.has(sk(peerId, b.deviceId)));
   for (const bundle of missing) {
     const verify = await PreKeys.verifyBundle(bundle);
-    if (!verify.ok) {
-      console.warn('Bundle-Signatur ungültig für Gerät', bundle.deviceId, verify.reason);
-      continue;   // dieses Gerät überspringen, andere bleiben nutzbar
-    }
+    if (!verify.ok) { console.warn('Bundle-Signatur ungültig für Gerät', bundle.deviceId, verify.reason); continue; }
     const { SK, EK } = await X3DH.initiator(state.identity.IK, bundle);
     const st = await Ratchet.initSender(SK, bundle.spk);
     st.usedOpkId = bundle.opkId;
@@ -1233,17 +1001,10 @@ async function ensureSessions(peerId) {
   return bundles;
 }
 
-/* Wenn WIR der Empfänger einer ersten Nachricht sind, muss die Sitzung
-   als Empfänger aufgebaut werden — passiert lazy beim ersten
-   entschlüsselbaren Umschlag, siehe openRatchet() weiter unten, das bei
-   Fehlschlag versucht, aus dem mitgelieferten Header eine neue
-   Empfänger-Sitzung zu bilden (X3DH.responder benötigt den passenden,
-   inzwischen verbrauchten One-Time-Prekey). */
 async function ensureReceiverSession(env) {
   const key = sk(env.senderId, env.senderDeviceId);
   if (state.sessions.has(key)) return state.sessions.get(key);
-  if (!env.header?.x3dh) throw new Error('Kein X3DH-Anfangsheader vorhanden — Sitzung nicht rekonstruierbar');
-
+  if (!env.header?.x3dh) throw new Error('Kein X3DH-Anfangsheader vorhanden');
   const { senderIK, senderEK, opkId } = env.header.x3dh;
   const usedOpk = opkId ? state.identity.opks.get(opkId) : null;
   const SK = await X3DH.responder(state.identity.IK, state.identity.SPK, usedOpk, senderIK, senderEK);
@@ -1254,53 +1015,28 @@ async function ensureReceiverSession(env) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   NACHRICHT SENDEN — Fanout an alle aktiven Empfängergeräte
+   NACHRICHT SENDEN
    ═══════════════════════════════════════════════════════════════════════ */
 async function sendMessage(peerId, convId, plaintext) {
   const bundles = await ensureSessions(peerId);
   const perDevice = [];
-
   for (const bundle of bundles) {
     const key = sk(peerId, bundle.deviceId);
     const st = state.sessions.get(key);
-    if (!st) continue;   // Bundle-Signatur war ungültig, siehe ensureSessions
-
-    /* WICHTIG: Ratchet.initSender() setzt dhSteps bereits auf 1 (das
-       anfängliche X3DH-DH zählt als erster Schritt) — dhSteps===0 ist
-       daher NIE wahr für eine frische Sender-Sitzung und hätte den
-       X3DH-Header nie angehängt. Der richtige Indikator für "erste
-       Nachricht auf dieser Sitzung" ist allein Ns (tatsächlich gesendete
-       Nachrichten), das bei initSender korrekt bei 0 startet.
-
-       Der X3DH-Header gehört NUR zur allerersten Nachricht des
-       ursprünglichen INITIATORS (st.ephemeral ist nur bei per
-       ensureSessions/X3DH.initiator aufgebauten Sitzungen gesetzt).
-       Antwortet stattdessen der ursprüngliche EMPFÄNGER (Sitzung kam aus
-       ensureReceiverSession, kein eigener Ephemeral-Key vorhanden), ist
-       kein X3DH-Header nötig — der Ratchet-Header allein reicht, weil
-       die Sitzung beim Gegenüber schon über den ersten Header etabliert
-       wurde. */
+    if (!st) continue;
     const isFirst = st.Ns === 0 && !!st.ephemeral;
     const env = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${convId}`);
     const header = isFirst
       ? { ...env.header, x3dh: { senderIK: state.identity.IK.pubJwk, senderEK: st.ephemeral.pubJwk, opkId: st.usedOpkId } }
       : env.header;
-    /* Ratchet.encrypt() liefert ct als rohen ArrayBuffer (WebCrypto-
-       Ausgabe) — der Server speichert ciphertext als TEXT-Spalte und
-       kann keinen ArrayBuffer binden. Vor dem Versand nach Base64
-       kodieren; openRatchet() beim Empfänger dekodiert entsprechend
-       zurück, bevor Ratchet.decrypt() den rohen Buffer wieder erwartet. */
     perDevice.push({ deviceId: bundle.deviceId, header, ciphertext: b64(env.ct) });
   }
-  if (!perDevice.length) throw new Error('Keine gültige Sitzung für dieses Konto aufbaubar');
-
+  if (!perDevice.length) throw new Error('Keine gültige Sitzung aufbaubar');
   const result = await api.send({ recipientId: peerId, convId, kind: 'text', perDevice });
-
   const conv = state.convs.get(convId) || { convId, peerId };
   conv.lastMsg = { text: plaintext, ts: result.sentAt };
   conv.unread = 0;
   state.convs.set(convId, conv);
-
   if (!state.messages.has(convId)) state.messages.set(convId, []);
   state.messages.get(convId).push({ id: 'local-' + result.sentAt, text: plaintext, ts: result.sentAt, mine: true });
   LocalCache.scheduleSave();
@@ -1315,24 +1051,11 @@ async function sendCurrentMessage() {
   input.value = '';
   input.style.height = 'auto';
   const { peerId, convId } = state.activeConv;
-
-  /* Schon bekannt offline: gar nicht erst versuchen — sofort in die
-     Warteschlange, mit sichtbarem "wird gesendet"-Zustand statt eines
-     Fehlertoasts bei jeder einzelnen Nachricht. */
-  if (state.isOffline) {
-    queueOffline(peerId, convId, text);
-    return;
-  }
-
+  if (state.isOffline) { queueOffline(peerId, convId, text); return; }
   try {
     await sendMessage(peerId, convId, text);
     renderChatMessages();
   } catch (e) {
-    /* Unterscheiden: ein Netzwerkfehler (TypeError bei fetch, kein
-       HTTP-Status) landet in der automatischen Warteschlange. Eine
-       echte Serverablehnung (z. B. blockiert, 4xx) bekommt der Nutzer
-       sofort zu sehen — automatisches Wiederholen würde da nur denselben
-       Fehler wiederholen, das Problem liegt nicht am Netz. */
     if (e.status === undefined) {
       state.isOffline = true;
       updateOfflineBanner();
@@ -1360,7 +1083,6 @@ function openChat(c) {
   state.view = 'chat';
   state.activeConv = { peerId: c.peerId, convId: c.convId, name: c.name || c.peerId };
   if (c.unread) { c.unread = 0; }
-
   const overlay = document.createElement('div');
   overlay.className = 'chatview';
   overlay.id = 'chatOverlay';
@@ -1389,15 +1111,13 @@ function openChat(c) {
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(overlay);
-
   ensureSessions(c.peerId).catch(e => toast('⚠️ ' + e.message));
   renderChatMessages();
   $('#msgInput')?.focus();
 }
 
 function closeChat() {
-  const overlay = document.getElementById('chatOverlay');
-  overlay?.remove();
+  document.getElementById('chatOverlay')?.remove();
   state.view = 'list';
   state.activeConv = null;
   renderMain();
@@ -1415,20 +1135,14 @@ function renderChatMessages() {
   const body = document.getElementById('chatbody');
   if (!body) return;
   const msgs = state.messages.get(state.activeConv.convId) || [];
-
   let lastDay = null;
   const rows = [];
   rows.push(`<div class="encnote">🔒 Nachrichten sind Ende-zu-Ende-verschlüsselt.</div>`);
   for (const m of msgs) {
     const d = day(m.ts);
     if (d !== lastDay) { rows.push(`<div class="daysep"><span>${d}</span></div>`); lastDay = d; }
-
-    /* Medienreferenz erkennen: entweder schon beim Senden markiert
-       (m.media, eigener Anhang) oder beim Empfangen aus dem
-       entschlüsselten JSON-Text erkannt. */
     const incomingMedia = !m.media && !m.mine ? parseIncomingMedia(m.text) : null;
     const media = m.media || incomingMedia;
-
     let content;
     if (media) {
       if (m.mediaUrl) {
@@ -1445,17 +1159,16 @@ function renderChatMessages() {
     } else {
       content = `<div class="tx">${esc(m.text)}</div>`;
     }
-
     rows.push(`
       <div class="msgrow ${m.mine ? 'mine' : ''}">
         <div class="bub" style="${m.pending ? 'opacity:.65' : ''}">
+          ${!m.mine ? `<div class="sender-name" style="font-size:11px;color:var(--acc);margin-bottom:2px">${esc(m.from || '')}</div>` : ''}
           ${content}
           <div class="ft"><span class="tm">${time(m.ts)}</span>
             ${m.mine ? (m.pending
-              ? `<span class="ck" title="Wird gesendet, sobald wieder online">🕐</span>`
+              ? `<span class="ck" title="Wird gesendet">🕐</span>`
               : `<span class="ck">✓✓</span>`) : ''}
-            ${!m.mine && media ? `<span class="timerbadge" style="color:var(--sub);background:rgba(255,255,255,.08)"
-              title="Direkt übertragen — Absender für den Speicherdienst sichtbar">📎 direkt</span>` : ''}</div>
+          </div>
         </div>
       </div>`);
   }
@@ -1470,7 +1183,6 @@ async function openNewChatSheet() {
   let users;
   try { ({ users } = await api.listUsers()); }
   catch (e) { toast('⚠️ ' + e.message); return; }
-
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'newChatSheet';
   sheet.onclick = e => { if (e.target === sheet) sheet.remove(); };
@@ -1540,9 +1252,8 @@ function showDeleteAccount() {
       <div class="grabber"></div>
       <h3 style="margin:0 0 8px;color:#f15c6d">Konto endgültig löschen</h3>
       <p style="color:var(--sub);margin:0 0 16px;font-size:14px">
-        Das kann nicht rückgängig gemacht werden. Alle Nachrichten, Geräte
-        und Kontaktdaten dieses Kontos werden unwiderruflich gelöscht.
-        Tipp zur Bestätigung deinen Namen <strong>${esc(state.me.name)}</strong> ein.
+        Das kann nicht rückgängig gemacht werden. Tipp zur Bestätigung deinen Namen
+        <strong>${esc(state.me.name)}</strong> ein.
       </p>
       <input id="deleteAccountConfirm" type="text" placeholder="${esc(state.me.name)}" autocomplete="off"
         style="width:100%;box-sizing:border-box;font-size:16px;padding:14px;border-radius:10px;
@@ -1575,19 +1286,13 @@ async function confirmDeleteAccount() {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   CHAT-MENÜ — Blockieren & Melden
-   ─────────────────────────────────────────────────────────────────────
-   Melden überträgt bewusst NUR Kennung + Grund, niemals automatisch den
-   Nachrichtentext — bei Ende-zu-Ende-Verschlüsselung hat der Server sonst
-   keinen Klartext, den man ihm "versehentlich" mitgeben könnte. Der
-   Inhalt wird nur beigefügt, wenn der Meldende das ausdrücklich anhakt.
+   CHAT-MENÜ
    ═══════════════════════════════════════════════════════════════════════ */
 function chatMenu(e) {
   e?.stopPropagation();
   if (!state.activeConv) return;
   const peerId = state.activeConv.peerId;
   const isBlocked = state.blocked.has(peerId);
-
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'chatMenuSheet';
   sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
@@ -1634,9 +1339,6 @@ function reportUser() {
   modal.innerHTML = `
     <div class="modalbox">
       <h3>🚩 Person melden</h3>
-      <div style="color:var(--sub);font-size:12.5px;margin-bottom:14px">
-        Die Meldung enthält die Kennung dieser Person und deinen Grund —
-        nicht automatisch den Nachrichtentext.</div>
       <label>Grund</label>
       <select class="in" id="repReason">
         <option value="spam">Spam oder Werbung</option>
@@ -1646,7 +1348,7 @@ function reportUser() {
         <option value="other">Anderer Grund</option>
       </select>
       <label>Zusätzliche Angaben (optional)</label>
-      <textarea class="in" id="repNote" rows="3" placeholder="Kontext, den wir wissen sollten…"></textarea>
+      <textarea class="in" id="repNote" rows="3" placeholder="Kontext…"></textarea>
       <div class="mrow">
         <button class="btn ghost" onclick="document.getElementById('reportModal').remove()">Abbrechen</button>
         <button class="btn dan" onclick="window.__app.submitReport()">Melden</button>
@@ -1668,14 +1370,6 @@ async function submitReport() {
 
 /* ═══════════════════════════════════════════════════════════════════════
    MEDIENVERSAND
-   ─────────────────────────────────────────────────────────────────────
-   Große Dateien (>6 KB) passen nicht durch den Ratchet/Mixnet-Pfad (feste
-   7-KB-Paketgröße im Mixnet ist Voraussetzung für Anonymität — siehe
-   media-storage.js). Sie werden separat verschlüsselt zu R2 hochgeladen;
-   nur Pfad+Schlüssel (~250 Byte) reisen durch den geschützten Weg. Dabei
-   ist der Absender für den Speicherdienst sichtbar — anders als beim
-   reinen Textpfad. Ohne konfigurierten Medienspeicher (window.MEDIA_CONFIG)
-   bleibt Textversand voll nutzbar, nur Anhänge sind dann deaktiviert.
    ═══════════════════════════════════════════════════════════════════════ */
 function attachSheet() {
   const sheet = document.createElement('div');
@@ -1727,16 +1421,10 @@ async function sendMediaMessage(file, kind) {
     const uploaded = await window.MediaStorage.uploadMedia(toUpload,
       { uploadUrl: window.MEDIA_CONFIG.uploadUrl, kind });
     const ref = window.MediaStorage.mediaReference(uploaded);
-
-    /* Nur die winzige Referenz (~250 Byte) geht durch den geschützten
-       Ratchet-Pfad — genau wie Text, nur mit kind:'media' markiert,
-       damit der Empfänger weiß, dass er die Datei separat laden muss. */
     const result = await sendMessage(state.activeConv.peerId, state.activeConv.convId,
       JSON.stringify({ __media: ref, kind }));
-
     const conv = state.convs.get(state.activeConv.convId);
     if (conv) conv.lastMsg = { text: kind === 'image' ? '📷 Foto' : kind === 'video' ? '🎬 Video' : '📄 ' + file.name, ts: result.sentAt };
-
     const msgs = state.messages.get(state.activeConv.convId) || [];
     const last = msgs[msgs.length - 1];
     if (last) { last.media = { ref, kind, name: file.name }; last.text = ''; }
@@ -1746,10 +1434,6 @@ async function sendMediaMessage(file, kind) {
   }
 }
 
-/* Beim Empfangen: erkennt, ob eine entschlüsselte Nachricht eigentlich
-   eine Medienreferenz ist (JSON mit __media-Feld), lädt bei Bedarf
-   NICHT automatisch herunter (Datenverbrauch!) — der Nutzer tippt zum
-   Laden. parseIncomingMedia() wird von renderChatMessages genutzt. */
 function parseIncomingMedia(text) {
   try {
     const obj = JSON.parse(text);
@@ -1776,10 +1460,6 @@ async function downloadAndShowMedia(msgId, ref, kind) {
   }
 }
 
-/* Für Tests: interne Funktionen und Zustand exportieren. Der Aufruf von
-   boot() unten läuft im Browser wie gewohnt automatisch; unter Node (in
-   Tests) wird dasselbe Modul importiert, ohne dass boot() dort DOM-Elemente
-   braucht, weil die Testsuite eigene Aufrufe macht statt boot(). */
 export { state, Vault, reconstructIdentityFromVault, sk, boot,
   authSubmit, renderAuthChoice, renderPills, renderNav,
   renderMain, go, convRow, handleEnvelope, api,
