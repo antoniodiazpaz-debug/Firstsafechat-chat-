@@ -7,7 +7,6 @@ import { P, PreKeys, KT, X3DH, Ratchet, MAX_SKIP, b64, ub64, hexs, te, td } from
 import { ApiClient, hashContact } from '/api-client.js';
 import { setLocale, getLocale, t } from '/i18n.js';
 import { detectLanguage, guessDialCode, preparePhoneInput, watchForSmsCode } from '/device-info.js';
-import { initCallUI } from '/call-ui.js';
 import { Call } from '/call.js';
 
 /* Sprache sofort beim Laden setzen — vor jedem UI-Aufbau, damit auch
@@ -897,7 +896,17 @@ function wireSocketEvents() {
   wireSocketEvents._wired = true;
   api.on('envelope', onIncomingEnvelope);
   api.on('presence', onPresence);
-  initCallUI(api);
+  /* Call global verfügbar machen für call-ui.js */
+  window.Call = Call;
+  /* call-ui.js als normales Script laden */
+  if (!window.__initCallUI) {
+    const s = document.createElement('script');
+    s.src = '/call-ui.js';
+    s.onload = () => { if (window.__initCallUI) window.__initCallUI(api); };
+    document.head.appendChild(s);
+  } else {
+    window.__initCallUI(api);
+  }
   api.on('device-added', d => toast('Neues Gerät verbunden: ' + (d.device?.name || '')));
   api.on('device-revoked', () => {
     toast('Dieses Gerät wurde entfernt. Du wirst abgemeldet.');

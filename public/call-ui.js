@@ -6,7 +6,7 @@
    selbst je nach Anrufzustand. Einzige Voraussetzung: ein Element mit
    id="callOverlay" muss im HTML vorhanden sein (leer, wird hier befüllt).
    ═══════════════════════════════════════════════════════════════════════ */
-import { Call } from '/call.js';
+/* call-ui.js — kein ES-Modul-Import, Call kommt von app.js */
 
 let overlayEl = null;
 let remoteVideoEl = null;
@@ -268,4 +268,4 @@ function injectStyles() {
   document.head.appendChild(style);
 }
 
-export { initCallUI };
+window.__initCallUI = initCallUI;
