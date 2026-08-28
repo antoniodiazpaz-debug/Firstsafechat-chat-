@@ -195,6 +195,59 @@ const Call = (() => {
     return !track.enabled;   // true = Kamera jetzt aus
   }
 
+  let currentFacingMode = 'user';
+
+  /* ── Zwischen Frontkamera (Selfie) und Hauptkamera wechseln ──
+     Holt einen neuen Videostream mit dem jeweils anderen facingMode
+     und ersetzt den Track sowohl im lokalen Stream (Vorschau) als auch
+     im laufenden RTCPeerConnection-Sender (damit der Gesprächspartner
+     ebenfalls die neue Kamera sieht, ohne die Verbindung neu aufbauen
+     zu müssen — replaceTrack() ist dafür genau gemacht). */
+  async function switchCamera() {
+    if (!localStream) return currentFacingMode;
+    const oldTrack = localStream.getVideoTracks()[0];
+    if (!oldTrack) return currentFacingMode;
+
+    const nextFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+    let newStream;
+    try {
+      newStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { exact: nextFacingMode } }
+      });
+    } catch (err) {
+      /* Manche Geräte (z. B. Laptops ohne Rückkamera) unterstützen nur
+         eine Kamera — dann bleibt einfach die aktuelle aktiv. */
+      log('Kamerawechsel fehlgeschlagen:', err.message);
+      throw err;
+    }
+
+    const newTrack = newStream.getVideoTracks()[0];
+    const wasEnabled = oldTrack.enabled;
+    newTrack.enabled = wasEnabled;
+
+    /* Im PeerConnection-Sender austauschen, falls eine Verbindung läuft */
+    if (pc) {
+      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender) await sender.replaceTrack(newTrack);
+    }
+
+    /* Im lokalen Stream austauschen (für die eigene Vorschau) */
+    localStream.removeTrack(oldTrack);
+    oldTrack.stop();
+    localStream.addTrack(newTrack);
+
+    currentFacingMode = nextFacingMode;
+    /* Kein voller notify()/Rerender — würde Drag-Position und DOM-Handler
+       zerstören. Stattdessen ein leichtgewichtiges Zusatz-Event, auf das
+       die UI gezielt reagiert (nur srcObject + Spiegel-Klasse aktualisieren). */
+    onCameraSwitch({ localStream, facingMode: currentFacingMode });
+    return currentFacingMode;
+  }
+
+  let onCameraSwitch = () => {};
+  function subscribeCameraSwitch(fn) { onCameraSwitch = fn; }
+
   /* ── Signalisierungs-Nachrichten vom Server verdrahten ──
      Folgt demselben Muster wie wireSocketEvents() in app.js. ── */
   function wire(apiClient) {
@@ -255,7 +308,7 @@ const Call = (() => {
     });
   }
 
-  return { start, accept, reject, endCall, toggleMute, toggleCamera, subscribe, wire };
+  return { start, accept, reject, endCall, toggleMute, toggleCamera, switchCamera, subscribe, subscribeCameraSwitch, wire };
 })();
 
 export { Call };

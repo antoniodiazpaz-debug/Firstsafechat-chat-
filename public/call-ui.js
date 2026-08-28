@@ -69,7 +69,7 @@ function render(state) {
   if (state.state === 'ringing') {
     renderRinging(state.call);
     startRingtone();
-  } else if (state.state === 'calling') {
+  if (state.state === 'calling') {
     renderCalling(state.call);
     if (state.localStream && localVideoEl) localVideoEl.srcObject = state.localStream;
   } else if (state.state === 'connecting') {
@@ -122,7 +122,7 @@ function renderCalling(call) {
       <div class="call-avatar">${(call.peerName || '?')[0].toUpperCase()}</div>
       <div class="call-peername">${escapeHtml(call.peerName)}</div>
       <div class="call-status">Klingelt …</div>
-      ${call.kind === 'video' ? '<video id="callLocalVideo" class="call-local-preview" autoplay muted playsinline></video>' : ''}
+      ${call.kind === 'video' ? '<video id="callLocalVideo" class="call-local-preview call-local-mirrored" autoplay muted playsinline></video>' : ''}
       <div class="call-actions">
         <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen">✕</button>
       </div>
@@ -139,7 +139,7 @@ function renderConnecting(call) {
       <div class="call-avatar">${(call.peerName || '?')[0].toUpperCase()}</div>
       <div class="call-peername">${escapeHtml(call.peerName)}</div>
       <div class="call-status">Verbinde …</div>
-      ${call.kind === 'video' ? '<video id="callLocalVideo" class="call-local-preview" autoplay muted playsinline></video>' : ''}
+      ${call.kind === 'video' ? '<video id="callLocalVideo" class="call-local-preview call-local-mirrored" autoplay muted playsinline></video>' : ''}
       <div class="call-actions">
         <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen">✕</button>
       </div>
@@ -159,10 +159,11 @@ function renderConnected(call, remoteStream) {
         : `<div class="call-avatar call-avatar-large">${(call.peerName || '?')[0].toUpperCase()}</div>`}
       <div class="call-peername ${isVideo ? 'call-peername-overlay' : ''}">${escapeHtml(call.peerName)}</div>
       <div class="call-status call-timer" id="callTimer">00:00</div>
-      ${isVideo ? '<video id="callLocalVideo" class="call-local-preview call-local-preview-small" autoplay muted playsinline></video>' : ''}
+      ${isVideo ? '<video id="callLocalVideo" class="call-local-preview call-local-preview-small call-local-mirrored" autoplay muted playsinline></video>' : ''}
       <div class="call-actions call-actions-connected">
         <button class="call-btn call-btn-secondary" id="callMuteBtn" aria-label="Stummschalten">🎤</button>
         ${isVideo ? '<button class="call-btn call-btn-secondary" id="callCamBtn" aria-label="Kamera">📷</button>' : ''}
+        ${isVideo ? '<button class="call-btn call-btn-secondary" id="callFlipBtn" aria-label="Kamera wechseln">🔄</button>' : ''}
         <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen">✕</button>
       </div>
     </div>
@@ -171,6 +172,7 @@ function renderConnected(call, remoteStream) {
   remoteVideoEl = document.getElementById('callRemoteVideo');
   localVideoEl = document.getElementById('callLocalVideo');
   if (remoteVideoEl && remoteStream) remoteVideoEl.srcObject = remoteStream;
+  if (localVideoEl) makeDraggable(localVideoEl);
 
   document.getElementById('callEndBtn').onclick = () => Call.endCall();
   document.getElementById('callMuteBtn').onclick = (e) => {
@@ -184,8 +186,58 @@ function renderConnected(call, remoteStream) {
     e.target.textContent = camOff ? '🚫' : '📷';
     e.target.classList.toggle('call-btn-active', camOff);
   };
+  const flipBtn = document.getElementById('callFlipBtn');
+  if (flipBtn) flipBtn.onclick = async () => {
+    flipBtn.disabled = true;
+    try { await Call.switchCamera(); } catch (e) { /* Gerät hat evtl. nur eine Kamera */ }
+    flipBtn.disabled = false;
+  };
 
   startCallTimer();
+}
+
+/* Macht ein Element per Touch/Maus frei verschiebbar innerhalb des
+   Viewports — für das kleine Selbstbild-Fenster (PiP) im Videoanruf.
+   Nutzt Pointer Events statt separater touch/mouse-Handler, damit
+   Maus UND Touch mit demselben Code funktionieren. */
+function makeDraggable(elm) {
+  let startX = 0, startY = 0, origX = 0, origY = 0, dragging = false;
+
+  elm.style.touchAction = 'none';
+  elm.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    elm.setPointerCapture(e.pointerId);
+    const rect = elm.getBoundingClientRect();
+    origX = rect.left;
+    origY = rect.top;
+    startX = e.clientX;
+    startY = e.clientY;
+    /* Von rechts/unten-Positionierung (CSS) auf feste left/top umschalten,
+       sonst würde die erste Bewegung springen. */
+    elm.style.right = 'auto';
+    elm.style.bottom = 'auto';
+    elm.style.left = origX + 'px';
+    elm.style.top = origY + 'px';
+  });
+
+  elm.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    let newX = origX + dx;
+    let newY = origY + dy;
+    /* Innerhalb des Viewports halten */
+    const maxX = window.innerWidth - elm.offsetWidth;
+    const maxY = window.innerHeight - elm.offsetHeight;
+    newX = Math.max(0, Math.min(maxX, newX));
+    newY = Math.max(0, Math.min(maxY, newY));
+    elm.style.left = newX + 'px';
+    elm.style.top = newY + 'px';
+  });
+
+  const stop = (e) => { dragging = false; try { elm.releasePointerCapture(e.pointerId); } catch {} };
+  elm.addEventListener('pointerup', stop);
+  elm.addEventListener('pointercancel', stop);
 }
 
 let timerInterval = null;
@@ -226,6 +278,12 @@ function escapeHtml(s) {
 function initCallUI(api) {
   Call.wire(api);
   Call.subscribe(render);
+  Call.subscribeCameraSwitch(({ localStream, facingMode }) => {
+    if (localVideoEl) {
+      localVideoEl.srcObject = localStream;
+      localVideoEl.classList.toggle('call-local-mirrored', facingMode === 'user');
+    }
+  });
   injectStyles();
 }
 
@@ -249,8 +307,11 @@ function injectStyles() {
     .call-timer{font-variant-numeric:tabular-nums}
     .call-error{color:#f15c6d;text-align:center;max-width:280px;padding:0 20px}
     .call-remote-video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-    .call-local-preview{position:absolute;top:16px;right:16px;width:110px;height:150px;
-      border-radius:12px;object-fit:cover;box-shadow:0 4px 12px rgba(0,0,0,.4)}
+    .call-local-preview{position:fixed;top:16px;right:16px;width:110px;height:150px;
+      border-radius:12px;object-fit:cover;box-shadow:0 4px 12px rgba(0,0,0,.4);
+      cursor:grab;z-index:610}
+    .call-local-preview.call-local-mirrored{transform:scaleX(-1)}
+    .call-local-preview:active{cursor:grabbing}
     .call-local-preview-small{width:90px;height:120px;bottom:120px;top:auto}
     .call-actions{display:flex;gap:24px;position:absolute;bottom:60px}
     .call-actions-incoming{gap:60px}
