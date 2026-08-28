@@ -952,7 +952,7 @@ async function handleEnvelope(env, live) {
 
   if (!state.messages.has(convId)) state.messages.set(convId, []);
   state.messages.get(convId).push({
-    id: env.id, from: env.senderId || '(versiegelt)', text: plaintext,
+id: env.id, from: conv.name || env.senderName || env.senderId || '(versiegelt)', text: plaintext,
     ts: env.sentAt, mine: false, sealed: !!env.sealed
   });
 
