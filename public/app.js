@@ -1,6 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════════
    APP — verbindet crypto-core.js und api-client.js zu einer echten
-   Anwendung.
+   Anwendung. Anders als die alte index.html-Simulation spricht das
+   hier den echten Server über HTTP/WebSocket an.
    ═══════════════════════════════════════════════════════════════════════ */
 import { P, PreKeys, KT, X3DH, Ratchet, MAX_SKIP, b64, ub64, hexs, te, td } from '/crypto-core.js';
 import { ApiClient, hashContact } from '/api-client.js';
@@ -8,6 +9,8 @@ import { setLocale, getLocale, t } from '/i18n.js';
 import { detectLanguage, guessDialCode, preparePhoneInput, watchForSmsCode } from '/device-info.js';
 import { Call } from '/call.js';
 
+/* Sprache sofort beim Laden setzen — vor jedem UI-Aufbau, damit auch
+   die allererste gerenderte Seite (Boot/Auth) schon übersetzt ist. */
 setLocale(detectLanguage().supported);
 if (document.documentElement) document.documentElement.lang = getLocale();
 
@@ -39,6 +42,12 @@ function toast(msg, ms = 2300) {
 const API_BASE = window.SECURECHAT_CONFIG?.apiBase || location.origin;
 const api = new ApiClient(API_BASE);
 
+/* ═══════════════════════════════════════════════════════════════════════
+   LOKALER VAULT — verschlüsselte Schlüsselspeicherung (IndexedDB)
+   Der private Schlüssel eines Geräts verlässt dieses Gerät nie. Er wird
+   mit einem aus dem Passwort abgeleiteten Schlüssel verschlüsselt lokal
+   gespeichert, damit ein Reload nicht die ganze Identität verliert.
+   ═══════════════════════════════════════════════════════════════════════ */
 function showDiagPanel(text) {
   document.getElementById('diagPanel')?.remove();
   const panel = document.createElement('div');
@@ -57,7 +66,10 @@ function showDiagPanel(text) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   VAULT — localStorage
+   LOKALER SPEICHER — Klartext localStorage (kein Crypto, kein IndexedDB)
+   Token, DeviceId, UserName werden unverschlüsselt gespeichert.
+   Die Crypto-Schlüssel (für E2EE) werden ebenfalls als JWK im
+   localStorage gehalten — einfach und zuverlässig auf allen Geräten.
    ═══════════════════════════════════════════════════════════════════════ */
 const Vault = {
   save(deviceId, identityStore, meta) {
@@ -72,6 +84,7 @@ const Vault = {
       opks: [...identityStore.opks].map(([id, k]) => [id, k.privJwk])
     }));
   },
+
   load(deviceId) {
     const storedId = localStorage.getItem('sc:deviceId');
     if (storedId !== deviceId) return null;
@@ -80,10 +93,17 @@ const Vault = {
     if (!token || !keysRaw) return null;
     return {
       data: JSON.parse(keysRaw),
-      meta: { token, userName: localStorage.getItem('sc:userName') || '', email: localStorage.getItem('sc:email') || '' }
+      meta: {
+        token,
+        userName: localStorage.getItem('sc:userName') || '',
+        email:    localStorage.getItem('sc:email') || ''
+      }
     };
   },
-  knownDeviceId() { return localStorage.getItem('sc:deviceId'); },
+
+  knownDeviceId() {
+    return localStorage.getItem('sc:deviceId');
+  },
   rememberDevice(deviceId, userName) {
     localStorage.setItem('sc:deviceId', deviceId);
     localStorage.setItem('sc:userName', userName);
@@ -92,151 +112,29 @@ const Vault = {
     ['sc:deviceId','sc:token','sc:userName','sc:email','sc:keys',
      'securechat:deviceId','securechat:userName','securechat:deviceKey']
       .forEach(k => localStorage.removeItem(k));
-    Object.keys(localStorage).filter(k => k.startsWith('securechat:vault:')).forEach(k => localStorage.removeItem(k));
+    /* Auch alte vault-Einträge entfernen */
+    Object.keys(localStorage)
+      .filter(k => k.startsWith('securechat:vault:'))
+      .forEach(k => localStorage.removeItem(k));
   },
-  async _db() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open('securechat', 2);
-      req.onupgradeneeded = e => {
-        const db = e.target.result;
-        if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages', { keyPath: 'deviceId' });
-        if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', { keyPath: 'key' });
-      };
-      req.onsuccess = e => resolve(e.target.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
+  async _db() { return null; }
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
-   SESSION STORE — FIX 1: Ratchet-Zustand dauerhaft in IndexedDB
-   ═══════════════════════════════════════════════════════════════════════ */
-const SessionStore = {
-  /* Serialisiert einen Ratchet-Zustand: CryptoKey → JWK */
-  async _serialize(st) {
-    const exportKey = async k => {
-      if (!k) return null;
-      if (k.privJwk) return { privJwk: k.privJwk, pubJwk: k.pubJwk };
-      try {
-        const priv = await crypto.subtle.exportKey('jwk', k.priv || k);
-        const pub  = k.pub ? await crypto.subtle.exportKey('jwk', k.pub) : null;
-        return { privJwk: priv, pubJwk: pub };
-      } catch { return null; }
-    };
-    const exportRaw = async k => {
-      if (!k) return null;
-      if (k instanceof Uint8Array) return b64(k);
-      if (k instanceof ArrayBuffer) return b64(new Uint8Array(k));
-      try { return b64(await crypto.subtle.exportKey('raw', k)); } catch { return null; }
-    };
-    const skipped = {};
-    for (const [key, mk] of (st.skipped || new Map())) {
-      skipped[key] = await exportRaw(mk);
-    }
-    return {
-      RK:      await exportRaw(st.RK),
-      DHs:     st.DHs ? await exportKey(st.DHs) : null,
-      DHrJwk:  st.DHrJwk || null,
-      CKs:     await exportRaw(st.CKs),
-      CKr:     await exportRaw(st.CKr),
-      Ns:      st.Ns, Nr: st.Nr, PN: st.PN,
-      dhSteps: st.dhSteps,
-      usedOpkId: st.usedOpkId || null,
-      ephemeralJwk: st.ephemeral ? { privJwk: st.ephemeral.privJwk, pubJwk: st.ephemeral.pubJwk } : null,
-      skipped
-    };
-  },
+   LOCAL CACHE — verschlüsselter Nachrichten-Cache für den Offline-Modus
+   ─────────────────────────────────────────────────────────────────────
+   Ohne diesen Cache wäre "offline lesen" eine leere Behauptung: state.
+   messages ist eine reine In-Memory-Map, die bei jedem Neuladen der
+   Seite verloren geht. Hier wird der Konversationsstand nach jeder
+   Änderung mit dem VAULT-Schlüssel verschlüsselt in IndexedDB abgelegt
+   — also mit demselben Schlüssel, der auch die privaten Ratchet-
+   Schlüssel schützt. Ein gestohlenes, gesperrtes Gerät gibt damit weder
+   Schlüssel noch Klartext-Verlauf preis, nur wer das Passwort kennt,
+   kommt an beides.
 
-  /* Deserialisiert: JWK → CryptoKey */
-  async _deserialize(raw) {
-    const importDH = jwk => jwk ? crypto.subtle.importKey('jwk', jwk, { name:'ECDH', namedCurve:'P-256' }, true, ['deriveBits']) : null;
-    const importRaw = b64str => {
-      if (!b64str) return null;
-      /* Ratchet erwartet Uint8Array, nicht ArrayBuffer */
-      return ub64(b64str);
-    };
-    const importKey = async obj => {
-      if (!obj) return null;
-      const priv = await importDH(obj.privJwk);
-      const pub  = obj.pubJwk ? await crypto.subtle.importKey('jwk', obj.pubJwk, { name:'ECDH', namedCurve:'P-256' }, true, []) : null;
-      return { priv, pub, privJwk: obj.privJwk, pubJwk: obj.pubJwk };
-    };
-    const skipped = new Map();
-    for (const [key, val] of Object.entries(raw.skipped || {})) {
-      if (val) skipped.set(key, ub64(val));
-    }
-    const DHs = await importKey(raw.DHs);
-    const DHr = raw.DHrJwk ? await crypto.subtle.importKey('jwk', raw.DHrJwk, { name:'ECDH', namedCurve:'P-256' }, true, []) : null;
-    const ephemeral = raw.ephemeralJwk ? await importKey(raw.ephemeralJwk) : null;
-    return {
-      RK:      importRaw(raw.RK),
-      DHs, DHr,
-      DHrJwk:  raw.DHrJwk || null,
-      CKs:     importRaw(raw.CKs),
-      CKr:     importRaw(raw.CKr),
-      Ns: raw.Ns, Nr: raw.Nr, PN: raw.PN,
-      dhSteps: raw.dhSteps,
-      usedOpkId: raw.usedOpkId || null,
-      ephemeral,
-      skipped,
-      log: []
-    };
-  },
-
-  async save(sessionKey, st) {
-    /* Session-Persistenz deaktiviert — CryptoKey-Objekte lassen sich
-       nicht zuverlässig serialisieren. Der Server hält unzugestellte
-       Envelopes vor, sodass nach einem Reload X3DH neu aufgebaut wird. */
-  },
-
-  async load(sessionKey) {
-    try {
-      const db = await Vault._db();
-      const rec = await new Promise((resolve, reject) => {
-        const tx = db.transaction('sessions', 'readonly');
-        const req = tx.objectStore('sessions').get(sessionKey);
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-      });
-      if (!rec) return null;
-      return await this._deserialize(rec.data);
-    } catch (e) { console.warn('Session laden fehlgeschlagen:', e.message); return null; }
-  },
-
-  async clearAll() {
-    try {
-      const db = await Vault._db();
-      await new Promise((resolve, reject) => {
-        const tx = db.transaction('sessions', 'readwrite');
-        tx.objectStore('sessions').clear();
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error);
-      });
-    } catch (e) { console.warn('Sessions löschen fehlgeschlagen:', e.message); }
-  },
-
-  async loadAll() {
-    try {
-      const db = await Vault._db();
-      const all = await new Promise((resolve, reject) => {
-        const tx = db.transaction('sessions', 'readonly');
-        const req = tx.objectStore('sessions').getAll();
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-      });
-      const result = new Map();
-      for (const rec of all) {
-        try {
-          result.set(rec.key, await this._deserialize(rec.data));
-        } catch {}
-      }
-      return result;
-    } catch { return new Map(); }
-  }
-};
-
-/* ═══════════════════════════════════════════════════════════════════════
-   LOCAL CACHE — Nachrichten-Cache
+   Bewusst NICHT im Service-Worker-Cache (der ist für die Programmhülle,
+   liegt unverschlüsselt — siehe sw.js). Getrennte Speicherorte für
+   getrennte Vertraulichkeitsstufen.
    ═══════════════════════════════════════════════════════════════════════ */
 const LocalCache = {
   _deviceId: null,
@@ -245,30 +143,37 @@ const LocalCache = {
     this._deviceId = deviceId;
   },
 
+  /* Klartext in localStorage — einfach und zuverlässig, kein Crypto
+     nötig da bereits im Klartext-Ansatz der App (siehe Vault). */
   async save() {
     if (!this._deviceId) return;
+    const snapshot = {
+      convs: [...state.convs.entries()],
+      messages: [...state.messages.entries()],
+      outbox: state.outbox,
+      savedAt: Date.now()
+    };
     try {
-      const snapshot = {
-        convs: [...state.convs.entries()],
-        messages: [...state.messages.entries()],
-        outbox: state.outbox,
-        savedAt: Date.now()
-      };
       localStorage.setItem('sc:cache:' + this._deviceId, JSON.stringify(snapshot));
-    } catch (e) { console.warn('Cache speichern fehlgeschlagen:', e.message); }
+    } catch (e) {
+      console.warn('LocalCache.save fehlgeschlagen:', e.message);
+    }
   },
 
   async load() {
     if (!this._deviceId) return false;
+    const raw = localStorage.getItem('sc:cache:' + this._deviceId);
+    if (!raw) return false;
     try {
-      const raw = localStorage.getItem('sc:cache:' + this._deviceId);
-      if (!raw) return false;
       const snapshot = JSON.parse(raw);
-      state.convs = new Map(snapshot.convs || []);
-      state.messages = new Map(snapshot.messages || []);
+      state.convs = new Map(snapshot.convs);
+      state.messages = new Map(snapshot.messages);
       state.outbox = snapshot.outbox || [];
       return true;
-    } catch (e) { console.warn('Cache laden fehlgeschlagen:', e.message); return false; }
+    } catch (e) {
+      console.warn('Lokaler Nachrichten-Cache nicht lesbar:', e.message);
+      return false;
+    }
   },
 
   _saveTimer: null,
@@ -279,54 +184,91 @@ const LocalCache = {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
-   ZUSTAND
+   ANWENDUNGSZUSTAND
    ═══════════════════════════════════════════════════════════════════════ */
 const state = {
-  me: null, device: null, identity: null,
-  view: 'list', tab: 'chats', activeConv: null,
-  convs: new Map(), messages: new Map(), sessions: new Map(),
-  bundleCache: new Map(), monitor: null, search: '',
+  me: null,
+  device: null,
+  identity: null,
+  view: 'list',
+  tab: 'chats',
+  activeConv: null,
+  convs: new Map(),
+  messages: new Map(),
+  sessions: new Map(),
+  bundleCache: new Map(),
+  monitor: null,
+  search: '',
   blocked: new Set(),
-  processedEnvelopes: new Set(JSON.parse(localStorage.getItem('sc:processed') || '[]')), /* verhindert Doppelverarbeitung */
+  /* Eigener Netzstatus (nicht zu verwechseln mit "online" bei Kontakten,
+     das ist deren WebSocket-Präsenz). Startet optimistisch mit
+     navigator.onLine — das ist zuverlässig genug für "kein Netzadapter
+     aktiv", erkennt aber keinen kaputten Proxy o. Ä.; die eigentliche
+     Wahrheit liefert erst ein fehlgeschlagener fetch()-Aufruf. */
   isOffline: typeof navigator !== 'undefined' && navigator.onLine === false,
-  outbox: []
+  /* Nachrichten, die während einer Netzunterbrechung geschrieben wurden.
+     Werden automatisch erneut versucht, sobald das Netz zurückkommt —
+     der Nutzer muss NICHT manuell erneut auf Senden tippen. */
+  outbox: []   // { convId, peerId, text, localId, ts }
 };
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
 /* ═══════════════════════════════════════════════════════════════════════
    NETZSTATUS
+   ─────────────────────────────────────────────────────────────────────
+   Zwei Signale kombiniert: das Browser-Ereignis (schnell, aber grob —
+   erkennt nur "Netzwerkadapter tot") und der WebSocket-Verbindungsstatus
+   (genauer, weil er tatsächlich mit dem Server spricht). Ein Banner
+   erscheint nur, wenn BEIDE offline sagen, damit ein kurzer WebSocket-
+   Reconnect-Versuch nicht sofort einen Alarm auslöst.
    ═══════════════════════════════════════════════════════════════════════ */
 function setupOfflineDetection() {
   if (typeof window === 'undefined' || !window.addEventListener) return;
-  window.addEventListener('online',  () => { state.isOffline = false; updateOfflineBanner(); flushOutbox(); });
-  window.addEventListener('offline', () => { state.isOffline = true;  updateOfflineBanner(); });
+  window.addEventListener('online', () => { state.isOffline = false; updateOfflineBanner(); flushOutbox(); });
+  window.addEventListener('offline', () => { state.isOffline = true; updateOfflineBanner(); });
 }
+
 function updateOfflineBanner() {
   const bar = document.getElementById('offlineBar');
   if (state.isOffline) {
     if (!bar) {
       const el = document.createElement('div');
       el.id = 'offlineBar';
-      el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:900;background:var(--warn);color:#3a2a00;text-align:center;font-size:12.5px;font-weight:600;padding:6px 12px;padding-top:calc(6px + env(safe-area-inset-top))';
+      el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:900;' +
+        'background:var(--warn);color:#3a2a00;text-align:center;font-size:12.5px;' +
+        'font-weight:600;padding:6px 12px;padding-top:calc(6px + env(safe-area-inset-top))';
       el.textContent = '⚠️ Keine Verbindung — Nachrichten werden gesendet, sobald du wieder online bist';
       document.body.prepend(el);
     }
-  } else if (bar) bar.remove();
+  } else if (bar) {
+    bar.remove();
+  }
 }
+
+/* Wartende Nachrichten erneut versuchen, sobald die Verbindung zurück
+   ist. Reihenfolge bleibt erhalten (älteste zuerst) — sonst könnten
+   Antworten vor der Nachricht ankommen, auf die sie sich beziehen. */
 async function flushOutbox() {
   if (!state.outbox.length) return;
-  const pending = [...state.outbox]; state.outbox = [];
+  const pending = [...state.outbox];
+  state.outbox = [];
   for (const item of pending) {
     try {
       await sendMessage(item.peerId, item.convId, item.text);
+      /* Lokalen Platzhalter durch das echte, gesendete Ergebnis ersetzen */
       const msgs = state.messages.get(item.convId);
       const local = msgs?.find(m => m.id === item.localId);
       if (local) local.pending = false;
-    } catch { state.outbox.push(item); }
+    } catch (e) {
+      /* Immer noch offline oder Server lehnt ab (z. B. blockiert) —
+         zurück in die Outbox, nicht stillschweigend verwerfen. */
+      state.outbox.push(item);
+    }
   }
   if (state.view === 'chat') renderChatMessages();
   renderMain();
 }
+
 
 /* ═══════════════════════════════════════════════════════════════════════
    BOOT
@@ -334,47 +276,61 @@ async function flushOutbox() {
 async function boot() {
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
+
+  /* Reset-Button nach 5s einblenden — falls die App hängt,
+     kann der Nutzer localStorage löschen und neu starten. */
   const resetTimeout = setTimeout(() => {
     const existing = document.getElementById('bootResetBtn');
     if (existing) return;
     const btn = document.createElement('button');
     btn.id = 'bootResetBtn';
     btn.textContent = '🔄 Zurücksetzen & neu starten';
-    btn.style.cssText = 'margin-top:24px;padding:12px 20px;border-radius:12px;border:none;background:#f15c6d;color:#fff;font-size:15px;font-weight:600;display:block;margin-left:auto;margin-right:auto;cursor:pointer';
+    btn.style.cssText = 'margin-top:24px;padding:12px 20px;border-radius:12px;border:none;' +
+      'background:#f15c6d;color:#fff;font-size:15px;font-weight:600;display:block;' +
+      'margin-left:auto;margin-right:auto;cursor:pointer';
     btn.onclick = () => { localStorage.clear(); location.reload(); };
     document.getElementById('boot')?.appendChild(btn);
   }, 5000);
+
   setupOfflineDetection();
   updateOfflineBanner();
+
   try {
     await api._fetch('/api/health', { auth: false });
-  } catch {
-    const knownDevice = Vault.knownDeviceId();
-    if (!knownDevice) { $('#bootMsg').textContent = 'Server nicht erreichbar.'; return; }
+  } catch (e) {
+    const knownDevice = await Vault.knownDeviceId();
+    if (!knownDevice) {
+      $('#bootMsg').textContent = 'Server nicht erreichbar. Bitte später erneut versuchen.';
+      return;
+    }
     state.isOffline = true;
   }
-  const knownDevice = Vault.knownDeviceId();
+
+  const knownDevice = await Vault.knownDeviceId();
   clearTimeout(resetTimeout);
   $('#boot').classList.add('hide');
+
   if (knownDevice) {
-    renderLoginForKnownDevice(knownDevice, localStorage.getItem('sc:userName') || '');
+    renderLoginForKnownDevice(knownDevice, localStorage.getItem('securechat:userName') || '');
   } else {
     renderAuthChoice();
   }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   AUTH
+   AUTH — Registrierung, Login (bekanntes Gerät), Pairing (neues Gerät)
    ═══════════════════════════════════════════════════════════════════════ */
 function showAuth(html) {
   $('#auth').innerHTML = html;
   $('#auth').classList.remove('hide');
   $('#app').classList.add('hide');
 }
+
 function renderAuthChoice() {
   showAuth(`
     <div id="authCard" class="card">
-      <div class="logo"><div class="ic">🔐</div><h1>${t('appName')}</h1><p>${t('tagline')}</p></div>
+      <div class="logo"><div class="ic">🔐</div><h1>${t('appName')}</h1>
+        <p>${t('tagline')}</p></div>
       <div id="authErr" class="err hide"></div>
       <label>${t('username')}</label>
       <input class="in" id="aUser" placeholder="Anna" autocomplete="username">
@@ -389,6 +345,10 @@ function renderAuthChoice() {
       </div>
     </div>`);
   window.__auth = { submit: authSubmit, recover: renderRecoveryPrompt };
+
+  /* Telefonfeld für Browser-/OS-Autofill vorbereiten und mit der aus
+     der Systemsprache geschätzten Vorwahl vorbefüllen — das Feld bleibt
+     vollständig editierbar, es ist nur ein Startwert. */
   const phoneInput = $('#aPhone');
   if (phoneInput) {
     preparePhoneInput(phoneInput);
@@ -396,29 +356,64 @@ function renderAuthChoice() {
     if (dial && !phoneInput.value) phoneInput.value = dial + ' ';
   }
 }
-function authErr(msg) { const e = $('#authErr'); e.textContent = '⚠️ ' + msg; e.classList.remove('hide'); }
 
+function authErr(msg) {
+  const e = $('#authErr'); e.textContent = '⚠️ ' + msg; e.classList.remove('hide');
+}
+
+/* Passwortlos: Registrierung ist der einzige Weg, ein Konto auf einem
+   Gerät neu einzurichten. Ein bereits registriertes Gerät meldet sich
+   automatisch an (siehe boot()) — es gibt keinen manuellen "Login"-Weg
+   mehr für ein bereits bekanntes Gerät, und keinen Passwort-basierten
+   Weg für ein neues Gerät (dafür existiert bereits das Pairing-System:
+   ein Code von einem angemeldeten Gerät koppelt ein weiteres, siehe
+   renderPairingPrompt). */
 async function authSubmit() {
   const btn = $('#authBtn'); btn.disabled = true;
   const name = $('#aUser').value.trim();
   try {
     if (!name) return authErr(t('fieldsRequired'));
+
+    /* Telefonnummer ist bewusst OPTIONAL — der Server verlangt sie
+       nicht (siehe /api/register in server.js), sie dient nur dem
+       freiwilligen Kontaktabgleich ("X nutzt die App auch"). */
     const phone = $('#aPhone').value.trim();
+
     const email = $('#aEmail').value.trim();
     if (!email) return authErr(t('emailRequired'));
+    /* Bewusst nur eine grobe Formprüfung (etwas@etwas.etwas) — die
+       eigentliche Gültigkeit bestätigt sich erst durch den zugestellten
+       Bestätigungscode. Eine strengere Regex hier würde nur seltene,
+       aber technisch gültige Adressen fälschlich ablehnen. */
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return authErr(t('emailInvalid'));
+
     btn.textContent = t('generatingKeys');
     const identity = await PreKeys.createStore();
-    const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' : (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
-    const data = await api.register({ name, phone: phone || undefined, email, deviceName: guessDeviceName(), platform, identity });
+    const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
+      (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
+    const data = await api.register({
+      name, phone: phone || undefined, email,
+      deviceName: guessDeviceName(), platform, identity
+    });
+    /* Sitzungstoken wird ZUSAMMEN mit den Identitätsschlüsseln im
+       lokalen, durch den nicht-extrahierbaren Geräteschlüssel
+       geschützten Vault gespeichert — das ist die gesamte
+       "Passwort"-Ersetzung: kein Geheimnis, das der Nutzer eingibt,
+       sondern ein Geheimnis, das an dieses Browserprofil gebunden ist
+       und es nie in lesbarer Form verlässt. */
     await Vault.save(data.device.id, identity, { name, userId: data.user.id, token: data.token });
     Vault.rememberDevice(data.device.id, name);
     state.identity = identity;
     await afterAuth(data);
   } catch (e) {
-    if (e.status === 428) renderPairingPrompt(name);
-    else authErr(e.message);
-  } finally { btn.disabled = false; }
+    if (e.status === 428) {
+      renderPairingPrompt(name);
+    } else {
+      authErr(e.message);
+    }
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function guessDeviceName() {
@@ -434,8 +429,11 @@ function guessDeviceName() {
 function renderPairingPrompt(name) {
   showAuth(`
     <div class="card">
-      <div class="logo"><div class="ic">🔗</div><h1>${t('newDevice')}</h1><p>${t('appName')}</p></div>
-      <div class="err" style="background:rgba(83,189,235,.1);border-color:rgba(83,189,235,.3);color:#a8dcf5">${t('pairHint')}</div>
+      <div class="logo"><div class="ic">🔗</div><h1>${t('newDevice')}</h1>
+        <p>${t('appName')}</p></div>
+      <div class="err" style="background:rgba(83,189,235,.1);border-color:rgba(83,189,235,.3);color:#a8dcf5">
+        ${t('pairHint')}
+      </div>
       <label>${t('pairCode')}</label>
       <input class="in" id="pairCode" placeholder="${t('pairCode')}" autocomplete="off">
       <div id="pairErr" class="err hide"></div>
@@ -450,7 +448,8 @@ function renderPairingPrompt(name) {
       if (!code) { $('#pairErr').textContent = t('fieldsRequired'); $('#pairErr').classList.remove('hide'); return; }
       btn.textContent = t('generatingKeys');
       const identity = await PreKeys.createStore();
-      const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' : (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
+      const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
+        (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
       const data = await api.pairClaim({ code, deviceName: guessDeviceName(), platform, identity });
       await Vault.save(data.device.id, identity, { name: data.user.name, userId: data.user.id, token: data.token });
       Vault.rememberDevice(data.device.id, data.user.name);
@@ -459,15 +458,21 @@ function renderPairingPrompt(name) {
     } catch (e) {
       $('#pairErr').textContent = '⚠️ ' + e.message;
       $('#pairErr').classList.remove('hide');
-    } finally { btn.disabled = false; btn.textContent = t('pair'); }
+    } finally {
+      btn.disabled = false; btn.textContent = t('pair');
+    }
   };
 }
 
 function renderRecoveryPrompt() {
   showAuth(`
     <div class="card">
-      <div class="logo"><div class="ic">📧</div><h1>Konto wiederherstellen</h1><p>${t('appName')}</p></div>
-      <p style="color:var(--sub);font-size:14px;margin:0 0 16px">Wir schicken dir einen Code an deine bestätigte E-Mail-Adresse.</p>
+      <div class="logo"><div class="ic">📧</div><h1>Konto wiederherstellen</h1>
+        <p>${t('appName')}</p></div>
+      <p style="color:var(--sub);font-size:14px;margin:0 0 16px">
+        Wir schicken dir einen Code an deine bestätigte E-Mail-Adresse.
+        Damit richtest du dieses Gerät neu für dein bestehendes Konto ein.
+      </p>
       <label>E-Mail</label>
       <input class="in" id="recEmail" placeholder="du@example.com" autocomplete="email">
       <div id="recErr" class="err hide"></div>
@@ -481,18 +486,29 @@ function renderRecoveryPrompt() {
       const email = $('#recEmail').value.trim();
       if (!email) { $('#recErr').textContent = t('emailRequired'); $('#recErr').classList.remove('hide'); return; }
       await api.recoverRequest(email);
+      /* Die Server-Antwort verrät absichtlich nie, ob die E-Mail
+         tatsächlich zu einem Konto gehört (siehe server.js) — die
+         Oberfläche zeigt deshalb IMMER denselben nächsten Schritt,
+         unabhängig vom tatsächlichen Ergebnis. */
       renderRecoveryCodeStep(email);
     } catch (e) {
-      $('#recErr').textContent = '⚠️ ' + e.message; $('#recErr').classList.remove('hide');
-    } finally { btn.disabled = false; }
+      $('#recErr').textContent = '⚠️ ' + e.message;
+      $('#recErr').classList.remove('hide');
+    } finally {
+      btn.disabled = false;
+    }
   };
 }
 
 function renderRecoveryCodeStep(email) {
   showAuth(`
     <div class="card">
-      <div class="logo"><div class="ic">📧</div><h1>Code eingeben</h1><p>${esc(email)}</p></div>
-      <p style="color:var(--sub);font-size:14px;margin:0 0 16px">6-stelliger Code aus deinem Postfach (auch Spam prüfen).</p>
+      <div class="logo"><div class="ic">📧</div><h1>Code eingeben</h1>
+        <p>${esc(email)}</p></div>
+      <p style="color:var(--sub);font-size:14px;margin:0 0 16px">
+        Falls diese Adresse zu einem Konto gehört, ist dort jetzt ein
+        6-stelliger Code angekommen (auch im Spam-Ordner nachsehen).
+      </p>
       <label>Code</label>
       <input class="in" id="recCode" inputmode="numeric" maxlength="6" placeholder="000000">
       <div id="recCodeErr" class="err hide"></div>
@@ -504,98 +520,184 @@ function renderRecoveryCodeStep(email) {
     const btn = $('#recVerifyBtn'); btn.disabled = true;
     try {
       const code = $('#recCode').value.trim();
-      if (!code || code.length !== 6) { $('#recCodeErr').textContent = 'Bitte 6-stelligen Code eingeben.'; $('#recCodeErr').classList.remove('hide'); return; }
+      if (!code || code.length !== 6) {
+        $('#recCodeErr').textContent = 'Bitte den 6-stelligen Code eingeben.';
+        $('#recCodeErr').classList.remove('hide');
+        return;
+      }
       btn.textContent = t('generatingKeys');
+      /* Wiederherstellung erzeugt zwangsläufig ein NEUES Schlüsselpaar
+         für dieses Gerät — die alten privaten Schlüssel haben das
+         ursprüngliche Gerät nie verlassen (Ende-zu-Ende-Verschlüsselung)
+         und lassen sich serverseitig nicht zurückholen. Der Nutzer
+         bekommt denselben Namen und dasselbe Konto zurück, aber ein
+         frisches Gerät darin. */
       const identity = await PreKeys.createStore();
-      const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' : (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
+      const platform = /Mobi|Android/i.test(navigator.userAgent) ? 'android' :
+        (/iPhone|iPad/i.test(navigator.userAgent) ? 'ios' : 'web');
       const data = await api.recoverVerify({ email, code, deviceName: guessDeviceName(), platform, identity });
       await Vault.save(data.device.id, identity, { name: data.user.name, userId: data.user.id, token: data.token });
       Vault.rememberDevice(data.device.id, data.user.name);
       state.identity = identity;
       await afterAuth(data);
     } catch (e) {
-      $('#recCodeErr').textContent = '⚠️ ' + e.message; $('#recCodeErr').classList.remove('hide');
-    } finally { btn.disabled = false; btn.textContent = 'Konto wiederherstellen'; }
+      $('#recCodeErr').textContent = '⚠️ ' + e.message;
+      $('#recCodeErr').classList.remove('hide');
+    } finally {
+      btn.disabled = false; btn.textContent = 'Konto wiederherstellen';
+    }
   };
 }
 
+/* Passwortlos: ein bekanntes Gerät meldet sich vollautomatisch an, ganz
+   ohne Bildschirm dazwischen — der Vault entsperrt sich selbst (der
+   nicht-extrahierbare Geräteschlüssel braucht keine Nutzereingabe), und
+   das darin gespeicherte Sitzungstoken (30 Tage gültig, siehe server.js)
+   wird direkt gegen /api/me geprüft. Nur wenn das Token abgelaufen ist
+   oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
+   Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
+   mehr, weil es kein Passwort mehr gibt. */
+/* Passwortlos: ein bekanntes Gerät meldet sich vollautomatisch an, ganz
+   ohne Bildschirm dazwischen — der Vault entsperrt sich selbst (der
+   nicht-extrahierbare Geräteschlüssel braucht keine Nutzereingabe), und
+   das darin gespeicherte Sitzungstoken (19 Jahre gültig, siehe server.js)
+   wird direkt gegen /api/me geprüft. Nur wenn das Token abgelaufen ist
+   oder der Vault aus irgendeinem Grund nicht lesbar ist, kommt der
+   Nutzer zur Registrierung zurück — es gibt keinen Passwort-Fallback
+   mehr, weil es kein Passwort mehr gibt. */
 async function renderLoginForKnownDevice(deviceId, userName) {
   const vaultRec = Vault.load(deviceId);
-  if (!vaultRec || !vaultRec.meta?.token) { Vault.forget(); renderAuthChoice(); return; }
+  if (!vaultRec || !vaultRec.meta?.token) {
+    Vault.forget();
+    renderAuthChoice();
+    return;
+  }
+
+  /* App sofort mit lokalen Daten öffnen — kein Warten auf Server */
   $('#boot').classList.add('hide');
   state.identity = await reconstructIdentityFromVault(vaultRec.data);
   api.token = vaultRec.meta.token;
+
+  /* Offline-Cache laden falls vorhanden */
   await LocalCache.unlock(deviceId);
   await LocalCache.load();
-  /* FIX 1: Alte Sessions aus IndexedDB löschen und neu aufbauen
-     (korrupte Sessions führen zu OperationError bei AES-GCM) */
-  await SessionStore.clearAll();
-  state.sessions.clear();
-  await afterAuthOffline(deviceId, userName);
-  fetch(API_BASE + '/api/me', { headers: { Authorization: 'Bearer ' + vaultRec.meta.token } })
-    .then(async r => {
-      if (r.status === 401) { Vault.forget(); location.reload(); return; }
-      if (!r.ok) return;
-      const me = await r.json();
-      state.isOffline = false;
-      updateOfflineBanner();
-      await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
-    }).catch(() => {});
-}
 
+  /* Sofort die Chat-Liste zeigen */
+  await afterAuthOffline(deviceId, userName);
+
+  /* Server-Check im Hintergrund — nur bei Fehler zur Anmeldung */
+  fetch(API_BASE + '/api/me', {
+    headers: { Authorization: 'Bearer ' + vaultRec.meta.token }
+  }).then(async r => {
+    if (r.status === 401) {
+      /* Token abgelaufen — Vault löschen und neu anmelden */
+      Vault.forget();
+      location.reload();
+      return;
+    }
+    if (!r.ok) return; /* Server-Fehler ignorieren, App bleibt offen */
+    const me = await r.json();
+    /* Online — vollständige Auth-Sequenz im Hintergrund */
+    state.isOffline = false;
+    updateOfflineBanner();
+    await afterAuth({ token: vaultRec.meta.token, user: me.user, device: me.device });
+  }).catch(() => {
+    /* Kein Netz — App bleibt im Offline-Modus, kein Reload */
+  });
+}
 async function reconstructIdentityFromVault(data) {
-  const log = [], step = msg => log.push(new Date().toISOString().slice(11,23) + ' — ' + msg);
+  const log = [];
+  const step = (msg) => { log.push(new Date().toISOString().slice(11,23) + ' — ' + msg); };
+
   const bootMsgEl = document.getElementById('bootMsg');
-  const setMsg = m => { if (bootMsgEl) bootMsgEl.textContent = m; };
-  step('Start'); setMsg('IK wird importiert…');
-  const timeoutId = setTimeout(() => { step('TIMEOUT'); showDiagPanel(log.join('\n')); }, 3000);
+  const setMsg = (m) => { if (bootMsgEl) bootMsgEl.textContent = m; };
+
+  step('reconstructIdentityFromVault gestartet');
+  setMsg('IK wird importiert…');
+  step('data.IK vorhanden: ' + !!data.IK + ', kty=' + data.IK?.kty);
+  step('data.IKS vorhanden: ' + !!data.IKS + ', kty=' + data.IKS?.kty);
+  step('data.SPK vorhanden: ' + !!data.SPK + ', kty=' + data.SPK?.kty);
+  step('data.opks vorhanden: ' + !!data.opks + ', Länge=' + data.opks?.length);
+
+  const timeoutId = setTimeout(() => {
+    step('TIMEOUT nach 3s — Import-Vorgang hat nie geantwortet');
+    showDiagPanel(log.join('\n'));
+  }, 3000);
+
   try {
-    const importDH   = jwk => crypto.subtle.importKey('jwk', jwk, { name:'ECDH', namedCurve:'P-256' }, true, ['deriveBits']);
-    const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name:'ECDSA', namedCurve:'P-256' }, true, ['sign']);
-    const pubOnly    = jwk => { const c = { ...jwk }; delete c.d; return c; };
-    const ikPubJwk = pubOnly(data.IK);
-    const IK = {
-      priv: await importDH(data.IK),
-      privJwk: data.IK,
-      pubJwk: ikPubJwk,
-      pub: await crypto.subtle.importKey('jwk', ikPubJwk, { name:'ECDH', namedCurve:'P-256' }, true, [])
-    };
+    const importDH = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const importSign = jwk => crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+    const pubOnly = jwk => { const c = { ...jwk }; delete c.d; return c; };
+
+    step('importiere IK...');
+    const IK = { priv: await importDH(data.IK), privJwk: data.IK, pubJwk: pubOnly(data.IK) };
+    step('IK OK, importiere IKS...');
+    setMsg('IKS wird importiert…');
     const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
-    const spkPubJwk = pubOnly(data.SPK);
-    const SPK = {
-      priv: await importDH(data.SPK),
-      privJwk: data.SPK,
-      pubJwk: spkPubJwk,
-      pub: await crypto.subtle.importKey('jwk', spkPubJwk, { name:'ECDH', namedCurve:'P-256' }, true, [])
-    };
+    step('IKS OK, importiere SPK...');
+    setMsg('SPK wird importiert…');
+    const SPK = { priv: await importDH(data.SPK), privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
+    step('SPK OK, importiere opks...');
     setMsg('OPKs werden importiert…');
     const opks = new Map();
-    for (const [id, jwk] of data.opks) opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
-    step('OK'); setMsg('Schlüssel importiert ✓');
+    for (const [id, jwk] of data.opks) {
+      opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
+    }
+    step('alle Schlüssel erfolgreich importiert');
+    setMsg('Schlüssel importiert ✓');
     clearTimeout(timeoutId);
-    return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0, spkMeta: { spkId: 1, createdAt: Date.now(), sig: null } };
-  } catch (e) { clearTimeout(timeoutId); step('FEHLER: ' + e.message); showDiagPanel(log.join('\n')); throw e; }
+    return { IK, IKS, SPK, opks, opkSeq: opks.size, spkId: 1, consumed: 0,
+      spkMeta: { spkId: 1, createdAt: Date.now(), sig: null } };
+  } catch (e) {
+    clearTimeout(timeoutId);
+    step('FEHLER: ' + e.message);
+    showDiagPanel(log.join('\n'));
+    throw e;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   NACH ANMELDUNG
+   NACH ERFOLGREICHER ANMELDUNG
    ═══════════════════════════════════════════════════════════════════════ */
 async function afterAuth(data) {
   state.me = data.user;
   state.device = data.device;
   state.monitor = new KT.Monitor();
+
+  /* WICHTIG: window.__app muss HIER gesetzt werden, nicht erst in
+     renderShell() — die E-Mail-Verifizierung (Pflicht, siehe unten)
+     kann einen frühen return auslösen, BEVOR renderShell() je läuft. */
   window.__app = appActions;
-  if (!state.me.emailVerified) { showEmailVerifyPrompt(true); return; }
+
+  /* E-Mail-Verifizierung ist PFLICHT — deshalb hier GANZ AM ANFANG
+     geprüft, VOR jedem anderen await (LocalCache, WebSocket, Inbox,
+     Blockliste). Grund: jeder dieser Aufrufe könnte theoretisch werfen
+     und ohne umgebendes try/catch die gesamte Funktion abbrechen, bevor
+     die Verifizierungsprüfung je erreicht wird — das würde sich exakt
+     als "Overlay erscheint (aus einem früheren, noch im DOM hängenden
+     Aufruf), aber neue Klicks bewirken nichts" zeigen, weil kein neuer
+     Aufruf von showEmailVerifyPrompt() mehr stattfindet und somit auch
+     keine frischen Event-Listener registriert werden. */
+  if (!state.me.emailVerified) {
+    showEmailVerifyPrompt(true);
+    return;
+  }
+
+  /* Lokalen Nachrichten-Cache entsperren und zuerst laden — damit die
+     Chat-Liste sofort etwas zeigt, auch bevor die Inbox vom Server
+     abgeglichen ist. Nutzt denselben Geräteschlüssel wie der Vault,
+     kein separates Geheimnis mehr nötig. */
   await LocalCache.unlock(data.device.id);
   await LocalCache.load();
-  /* Sessions werden bei Bedarf neu aufgebaut — kein Laden aus IndexedDB
-     da deserialisierte CryptoKey-Objekte zu OperationError führen können */
-  state.sessions.clear();
+
   api.connect();
   wireSocketEvents();
+
   try { await window.StorageGuard?.requestPersistence?.(); } catch {}
   await loadBlockList();
   await refreshInbox();
+
+  /* UI nur neu aufbauen wenn noch nicht sichtbar */
   if ($('#app').classList.contains('hide')) {
     $('#auth').classList.add('hide');
     $('#app').classList.remove('hide');
@@ -603,15 +705,29 @@ async function afterAuth(data) {
     go('chats');
     toast('Willkommen, ' + state.me.name + ' 🔐');
   } else {
+    /* App läuft bereits (Offline-Modus war aktiv) — nur aktualisieren */
     renderMain();
     updateOfflineBanner();
   }
 }
 
 function showEmailVerifyPrompt(blocking) {
+  /* Ein eventuell noch vorhandenes altes Sheet zuerst entfernen — sonst
+     könnten zwei Elemente mit derselben id="verifySheet" im DOM landen,
+     falls diese Funktion mehr als einmal aufgerufen wird. getElementById
+     würde dann nur das ERSTE (möglicherweise alte, verwaiste) Element
+     finden, während visuell das neue obenauf liegt — die Event-Listener
+     hingen dann am falschen Element, was sich exakt als "sichtbares
+     Overlay, aber Klicks bewirken nichts" zeigen würde. */
   document.getElementById('verifySheet')?.remove();
+
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'verifySheet';
+  /* Bei PFLICHT-Verifizierung (blocking=true) gibt es bewusst keinen
+     "Später"-Button und keinen Klick-außerhalb-zum-Schließen — das
+     Konto kommt sonst nie zur eigentlichen App durch, siehe server.js,
+     wo die Registrierung selbst ohne erfolgreichen Mailversand schon
+     zurückgerollt wird. */
   sheet.innerHTML = `
     <div class="sheetbox">
       <div class="grabber"></div>
@@ -621,7 +737,8 @@ function showEmailVerifyPrompt(blocking) {
         ${blocking ? 'Die Bestätigung ist erforderlich, um fortzufahren.' : ''}
       </p>
       <input id="verifyCodeInput" inputmode="numeric" maxlength="6" placeholder="000000"
-        style="width:100%;box-sizing:border-box;font-size:24px;letter-spacing:8px;text-align:center;padding:14px;border-radius:10px;border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
+        style="width:100%;box-sizing:border-box;font-size:24px;letter-spacing:8px;text-align:center;
+          padding:14px;border-radius:10px;border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
       <div id="verifyError" style="color:#f15c6d;font-size:13px;margin-bottom:12px;display:none"></div>
       <button class="btn" id="verifySubmitBtn" style="width:100%;margin-bottom:8px">Bestätigen</button>
       <button class="btn ghost" id="verifyResendBtn" style="width:100%${blocking ? '' : ';margin-bottom:8px'}">Code erneut senden</button>
@@ -629,9 +746,31 @@ function showEmailVerifyPrompt(blocking) {
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
   document.getElementById('verifyCodeInput')?.focus();
-  document.getElementById('verifySubmitBtn')?.addEventListener('click', submitEmailCode);
-  document.getElementById('verifyResendBtn')?.addEventListener('click', resendEmailCode);
-  document.getElementById('verifyDismissBtn')?.addEventListener('click', dismissEmailVerify);
+
+  /* Direkte Event-Listener statt onclick="window.__app...()" — das
+     umgeht JEDES Timing-Problem mit window.__app komplett, weil die
+     Funktionen hier direkt referenziert werden, ohne den Umweg über
+     das globale Objekt. Robuster als der Inline-Ansatz, unabhängig
+     davon, wann/ob window.__app zu diesem Zeitpunkt bereits gesetzt
+     wurde.
+
+     DEFENSIV mit ?. abgesichert: falls eines der Elemente aus
+     irgendeinem Grund null ist, würde ein direkter .addEventListener()-
+     Aufruf sofort werfen und ALLE folgenden Listener-Registrierungen in
+     dieser Funktion verhindern — das würde exakt zum gemeldeten Symptom
+     passen ("Buttons sehen normal aus, reagieren aber auf nichts",
+     weil gar kein Listener je registriert wurde). document.title wird
+     zusätzlich als TEMPORÄRES Diagnosesignal genutzt, weil selbst
+     alert() im Feld nicht sichtbar zuverlässig ankam — eine Änderung
+     des Tab-Titels lässt sich im Browser-Tab-Umschalter oder in der
+     Adressleiste erkennen, ganz ohne Konsolenzugriff. */
+  const submitBtn = document.getElementById('verifySubmitBtn');
+  const resendBtn = document.getElementById('verifyResendBtn');
+  const dismissBtn = document.getElementById('verifyDismissBtn');
+  document.title = 'DIAG: submitBtn=' + !!submitBtn + ' resendBtn=' + !!resendBtn;
+  submitBtn?.addEventListener('click', submitEmailCode);
+  resendBtn?.addEventListener('click', resendEmailCode);
+  dismissBtn?.addEventListener('click', dismissEmailVerify);
 }
 
 async function submitEmailCode() {
@@ -641,6 +780,7 @@ async function submitEmailCode() {
     const code = input?.value.trim();
     if (!code || code.length !== 6) {
       if (errEl) { errEl.textContent = 'Bitte den 6-stelligen Code eingeben.'; errEl.style.display = 'block'; }
+      else alert('DIAGNOSE: errEl nicht gefunden, Code war: ' + code);
       return;
     }
     try {
@@ -648,10 +788,18 @@ async function submitEmailCode() {
       state.me.emailVerified = true;
       document.getElementById('verifySheet')?.remove();
       toast('✓ E-Mail bestätigt');
+
+      /* Bei Pflicht-Verifizierung war die Hauptoberfläche bisher noch nie
+         aufgebaut — jetzt automatisch weiterleiten, ohne dass ein
+         erneuter Login-Schritt nötig wäre. Das Sitzungstoken aus der
+         Registrierung ist bereits gültig; der Nutzer ist im
+         API-/WebSocket-Sinn längst angemeldet, es fehlte nur die
+         Freischaltung der Oberfläche. */
       if ($('#app').classList.contains('hide')) {
         $('#auth').classList.add('hide');
         $('#app').classList.remove('hide');
-        renderShell(); go('chats');
+        renderShell();
+        go('chats');
         toast('Willkommen, ' + state.me.name + ' 🔐');
       }
     } catch (e) {
@@ -659,29 +807,53 @@ async function submitEmailCode() {
         : e.message === 'Code abgelaufen — neuen anfordern' ? 'Code abgelaufen — tipp auf "Code erneut senden".'
         : e.message;
       if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+      else alert('DIAGNOSE: errEl nicht gefunden. Fehler war: ' + msg);
     }
   } catch (outerErr) {
-    alert('Fehler: ' + outerErr.message);
+    /* TEMPORÄR zur Fehlersuche: fängt JEDEN unerwarteten Fehler ab, der
+       außerhalb des inneren try/catch auftritt (z. B. wenn $('#app')
+       selbst wirft, oder renderShell()/go() einen Fehler hat) — ohne
+       dieses äußere Netz würde ein solcher Fehler komplett lautlos
+       bleiben, exakt das gemeldete Symptom "Buttons reagieren, aber
+       nichts passiert". alert() ist hier bewusst blockierend gewählt,
+       damit die Meldung garantiert gesehen wird, auch ohne Zugriff auf
+       die Browser-Konsole. */
+    alert('DIAGNOSE — unerwarteter Fehler in submitEmailCode: ' + outerErr.message + '\n\n' + outerErr.stack);
   }
 }
 
 async function resendEmailCode() {
-  try { await api.resendVerification(); toast('📧 Neuer Code verschickt'); }
-  catch (e) { toast('⚠️ ' + e.message); }
+  try {
+    await api.resendVerification();
+    toast('📧 Neuer Code verschickt — bitte Postfach prüfen');
+  } catch (e) {
+    toast('⚠️ ' + e.message);
+  }
 }
 
-function dismissEmailVerify() { document.getElementById('verifySheet')?.remove(); }
+function dismissEmailVerify() {
+  document.getElementById('verifySheet')?.remove();
+}
 
+/* Server nicht erreichbar, aber der Vault hat sich lokal mit dem
+   richtigen Passwort entsperrt: App im Offline-Modus starten. Zeigt
+   den letzten gespeicherten Stand (Konversationen, Nachrichten,
+   wartende Outbox), aber ohne Verbindung — Senden landet in der Outbox,
+   kein Posteingangsabgleich, keine Live-Präsenz. Sobald das Netz
+   zurückkommt, holt boot()/connect() den Rest automatisch nach. */
 async function afterAuthOffline(deviceId, userName) {
-  state.me = { id: null, name: userName };
+  state.me = { id: null, name: userName };   // echte ID erst nach Online-Login bekannt
   state.device = { id: deviceId };
   state.isOffline = true;
+
   await LocalCache.load();
+
   $('#auth').classList.add('hide');
   $('#app').classList.remove('hide');
-  renderShell(); go('chats');
+  renderShell();
+  go('chats');
   updateOfflineBanner();
-  toast('📵 Offline — zeige gespeicherten Verlauf.', 3500);
+  toast('📵 Offline — zeige gespeicherten Verlauf. Senden folgt, sobald du wieder online bist.', 3500);
 }
 
 function wireSocketEvents() {
@@ -689,37 +861,56 @@ function wireSocketEvents() {
   wireSocketEvents._wired = true;
   api.on('envelope', onIncomingEnvelope);
   api.on('presence', onPresence);
+  /* Call global verfügbar machen für call-ui.js */
   window.Call = Call;
+  /* call-ui.js als normales Script laden */
   if (!window.__initCallUI) {
     const s = document.createElement('script');
     s.src = '/call-ui.js';
     s.onload = () => { if (window.__initCallUI) window.__initCallUI(api); };
     document.head.appendChild(s);
-  } else { window.__initCallUI(api); }
+  } else {
+    window.__initCallUI(api);
+  }
   api.on('device-added', d => toast('Neues Gerät verbunden: ' + (d.device?.name || '')));
-  api.on('device-revoked', () => { toast('Dieses Gerät wurde entfernt.'); setTimeout(() => { Vault.forget(); location.reload(); }, 1500); });
-  api.on('contact-joined', () => toast('Ein Kontakt nutzt jetzt auch SecureChat 👋'));
+  api.on('device-revoked', () => {
+    toast('Dieses Gerät wurde entfernt. Du wirst abgemeldet.');
+    setTimeout(() => { Vault.forget(); location.reload(); }, 1500);
+  });
+  api.on('contact-joined', async () => {
+    toast('Ein Kontakt nutzt jetzt auch SecureChat 👋');
+  });
   api.on('need-prekeys', () => refillPrekeys().catch(() => {}));
-  api.on('connected', () => { toast('🟢 Verbunden', 1500); state.isOffline = false; updateOfflineBanner(); flushOutbox(); });
-  api.on('disconnected', () => toast('Verbindung unterbrochen…', 1800));
+  api.on('connected', () => {
+    toast('🟢 WebSocket verbunden', 1500);
+    state.isOffline = false;
+    updateOfflineBanner();
+    flushOutbox();
+  });
+  api.on('disconnected', () => toast('Verbindung unterbrochen — versuche erneut…', 1800));
 }
 
 async function refillPrekeys() {
   const more = [];
   for (let i = 0; i < 10; i++) {
-    const k = await P.genDH(); const id = ++state.identity.opkSeq;
-    state.identity.opks.set(id, k); more.push({ opkId: id, pub: k.pubJwk });
+    const k = await P.genDH();
+    const id = ++state.identity.opkSeq;
+    state.identity.opks.set(id, k);
+    more.push({ opkId: id, pub: k.pubJwk });
   }
   await api.uploadPrekeys({ opks: more });
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   POSTEINGANG
+   POSTEINGANG — beim Start und live über WebSocket
    ═══════════════════════════════════════════════════════════════════════ */
 async function refreshInbox() {
   const { envelopes } = await api.inbox();
   const toAck = [];
-  for (const env of envelopes) { await handleEnvelope(env, false); toAck.push(env.id); }
+  for (const env of envelopes) {
+    await handleEnvelope(env, false);
+    toAck.push(env.id);
+  }
   if (toAck.length) await api.ack(toAck);
   renderMain();
 }
@@ -727,116 +918,85 @@ async function refreshInbox() {
 async function onIncomingEnvelope(env) {
   await handleEnvelope(env, true);
   const convId = env.convId || ('dm_' + [state.me?.id, env.senderId].filter(Boolean).sort().join('_'));
-  if (state.view === 'chat' && state.activeConv?.convId === convId) renderChatMessages();
-  else renderMain();
-}
-
-async function handleEnvelope(env, live) {
-  /* Doppelverarbeitung verhindern — Inbox + WebSocket liefern dieselbe Nachricht */
-  if (state.processedEnvelopes.has(env.id)) return;
-  state.processedEnvelopes.add(env.id);
-  /* Set begrenzen auf letzte 200 IDs und in localStorage persistieren */
-  if (state.processedEnvelopes.size > 200) {
-    const first = state.processedEnvelopes.values().next().value;
-    state.processedEnvelopes.delete(first);
+  if (state.view === 'chat' && state.activeConv?.convId === convId) {
+    renderChatMessages();
+  } else {
+    renderMain();
   }
-  try { localStorage.setItem('sc:processed', JSON.stringify([...state.processedEnvelopes])); } catch {}
+}
+async function handleEnvelope(env, live) {
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
   let plaintext = '[verschlüsselt]';
   try {
-    plaintext = env.sealed ? await openSealed(env) : await openRatchet(env);
+    if (env.sealed) {
+      plaintext = await openSealed(env);
+    } else {
+      plaintext = await openRatchet(env);
+    }
   } catch (e) {
     console.warn('Entschlüsselung fehlgeschlagen:', e.message);
-    plaintext = '⚠️ [' + e.name + '] ' + e.message + ' | header:' + JSON.stringify(env.header || null) + ' | sealed:' + !!env.sealed;
-  }
-
-  /* Header als String parsen falls nötig */
-  if (typeof env.header === 'string') {
-    try { env.header = JSON.parse(env.header); } catch {}
-  }
-  const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
-
-  /* FIX 2b: Name sofort aus User-Liste holen */
-  if (!conv.name && env.senderName) conv.name = env.senderName;
-  if (!conv.name && env.senderId) {
-    try {
-      const allUsers = await api.listUsers();
-      const found = (allUsers.users || []).find(u => u.id === env.senderId);
-      if (found?.name) conv.name = found.name;
-    } catch {}
-  }
-  if (!conv.name && env.senderId) {
-    fetch(API_BASE + '/api/user/' + env.senderId, { headers: { Authorization: 'Bearer ' + api.token } })
-      .then(r => r.ok ? r.json() : null).then(u => { if (u?.user?.name) { conv.name = u.user.name; renderMain(); } }).catch(() => {});
+    plaintext = '⚠️ Nicht entschlüsselbar';
   }
 
   if (!state.messages.has(convId)) state.messages.set(convId, []);
   state.messages.get(convId).push({
-    id: env.id,
-    from: conv.name || env.senderName || env.senderId || '(versiegelt)',
-    text: plaintext, ts: env.sentAt, mine: false, sealed: !!env.sealed
+    id: env.id, from: env.senderId || '(versiegelt)', text: plaintext,
+    ts: env.sentAt, mine: false, sealed: !!env.sealed
   });
+
+  const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
   conv.lastMsg = { text: plaintext, ts: env.sentAt };
   conv.unread = (conv.unread || 0) + 1;
+  if (!conv.name && env.senderName) conv.name = env.senderName;
   state.convs.set(convId, conv);
+  /* Name nachladen falls noch unbekannt */
+  if (!conv.name && env.senderId) {
+    fetch(API_BASE + '/api/user/' + env.senderId, {
+      headers: { Authorization: 'Bearer ' + api.token }
+    }).then(r => r.ok ? r.json() : null).then(u => {
+      if (u?.user?.name) { conv.name = u.user.name; renderMain(); }
+    }).catch(() => {});
+  }
   LocalCache.scheduleSave();
+
   if (live) api.ackViaSocket([env.id]);
 }
 
-/* FIX 1: openRatchet speichert Session nach Entschlüsselung */
 async function openRatchet(env) {
-  /* Header als String parsen falls nötig */
-  if (typeof env.header === 'string') {
-    try { env.header = JSON.parse(env.header); } catch {}
-  }
   const key = sk(env.senderId, env.senderDeviceId);
-  const hdr = env.header || {};
-
-  /* Bei X3DH-Header IMMER neue Session aufbauen — alte verwerfen */
-  if (hdr.x3dh) {
-    state.sessions.delete(key);
-  }
-
   let st = state.sessions.get(key);
   if (!st) st = await ensureReceiverSession(env);
+  /* env.ciphertext kommt als Base64-String vom Server (siehe sendMessage,
+     das ArrayBuffer→Base64 vor dem Versand kodiert) — hier zurück zu
+     Bytes, bevor Ratchet.decrypt() sie an WebCrypto weiterreicht.
 
-  const { x3dh, ...ratchetHeader } = hdr;
-
-  /* AAD: muss identisch mit Sender sein (v1|senderId|convId) */
-  let senderId = env.senderId;
-  if (!senderId && env.convId?.startsWith('dm_')) {
-    const parts = env.convId.replace('dm_', '').split('_');
-    senderId = parts.find(p => p !== state.me?.id) || parts[0] || '';
-  }
-  const assoc = `v1|${senderId}|${env.convId}`;
-
-  let buf;
-  try {
-    buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
-  } catch (decErr) {
-    /* Bei Fehler Session verwerfen — beim nächsten Versuch wird neu aufgebaut */
-    state.sessions.delete(key);
-    throw decErr;
-  }
-  await SessionStore.save(key, st);
+     WICHTIG: Ratchet.encrypt() berechnet die AAD aus JSON.stringify(header)
+     BEVOR app.js das x3dh-Feld für den Transport anhängt (siehe
+     sendMessage) — die AAD kennt also nur {dh, pn, n}, nicht x3dh. Würde
+     man den vollen, empfangenen Header (mit x3dh) an decrypt() geben,
+     ergäbe JSON.stringify() einen anderen String als beim Verschlüsseln,
+     der GCM-Tag würde nicht mehr passen. Das x3dh-Feld muss also vor
+     dem Entschlüsseln wieder entfernt werden — es wurde bereits von
+     ensureReceiverSession() ausgelesen, wird hier nicht mehr gebraucht. */
+  const { x3dh, ...ratchetHeader } = env.header || {};
+  const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) },
+    `v1|${env.senderId}|${env.convId}`);
   return td.decode(buf);
 }
-
 async function openSealed(env) {
   const raw = ub64(env.ciphertext);
   const sep = raw.indexOf(0);
   const ephJwk = JSON.parse(td.decode(raw.subarray(0, sep)));
   const ct = raw.subarray(sep + 1);
-  const eph = await crypto.subtle.importKey('jwk', ephJwk, { name:'ECDH', namedCurve:'P-256' }, true, []);
-  const shared = await crypto.subtle.deriveBits({ name:'ECDH', public: eph }, state.identity.IK.priv, 256);
+  const eph = await crypto.subtle.importKey('jwk', ephJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+  const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: eph }, state.identity.IK.priv, 256);
   const out = await P.hkdf(shared, null, 'SecureChat-SealedSender-v1', 44);
   const key = await crypto.subtle.importKey('raw', out.slice(0, 32), 'AES-GCM', false, ['decrypt']);
-  const pt = await crypto.subtle.decrypt({ name:'AES-GCM', iv: out.slice(32, 44) }, key, ct);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: out.slice(32, 44) }, key, ct);
   const inner = JSON.parse(td.decode(pt));
   return `(von ${esc(inner.cert.senderName)}) ` + (inner.plaintext || '[Medien]');
 }
 
-/* FIX 2: Presence — beim Chat-Öffnen Online-Status aktiv abfragen */
 function onPresence(msg) {
   for (const conv of state.convs.values()) {
     if (conv.peerId === msg.userId) conv.online = msg.online;
@@ -845,97 +1005,122 @@ function onPresence(msg) {
   if (state.view === 'list') renderMain();
 }
 
-async function fetchPresence(peerId) {
+async function loadBlockList() {
   try {
-    const users = await api.listUsers();
-    const u = (users.users || []).find(u => u.id === peerId);
-    if (u) {
-      const conv = [...state.convs.values()].find(c => c.peerId === peerId);
-      if (conv) { conv.online = !!u.online; }
-      renderChatHeader();
-    }
+    const { blocked } = await api.blockedList();
+    state.blocked = new Set(blocked);
   } catch {}
 }
 
-async function loadBlockList() {
-  try { const { blocked } = await api.blockedList(); state.blocked = new Set(blocked); } catch {}
-}
-
 /* ═══════════════════════════════════════════════════════════════════════
-   SHELL
+   SHELL — Kopfzeile, Filter-Pillen, Chat-Liste, untere Navigation
    ═══════════════════════════════════════════════════════════════════════ */
 function renderShell() {
   $('#app').innerHTML = `
-    <div class="topbar"><h1>SecureChat</h1>
+    <div class="topbar">
+      <h1>SecureChat</h1>
       <div class="topicons">
         <button class="iconbtn" onclick="window.__app.openCamera()">📷</button>
         <button class="iconbtn" onclick="window.__app.mainMenu(event)">⋮</button>
       </div>
     </div>
-    <div class="searchwrap"><div class="search"><span class="ic">🔍</span>
-      <input id="searchInput" placeholder="Suchen" oninput="window.__app.onSearch(this.value)"></div></div>
+    <div class="searchwrap">
+      <div class="search"><span class="ic">🔍</span>
+        <input id="searchInput" placeholder="Meta AI fragen oder suchen" oninput="window.__app.onSearch(this.value)"></div>
+    </div>
     <div class="pillbar" id="pillbar"></div>
     <div id="main"></div>
     <div id="navbar"></div>`;
   window.__app = appActions;
-  renderPills(); renderNav(); renderMain();
+  renderPills();
+  renderNav();
+  renderMain();
 }
 
-const PILLS = [['all','Alle'],['unread','Ungelesen'],['favorites','Favoriten'],['groups','Gruppen']];
+const PILLS = [
+  ['all', 'Alle'], ['unread', 'Ungelesen'], ['favorites', 'Favoriten'], ['groups', 'Gruppen']
+];
 let activePill = 'all';
 function renderPills() {
   $('#pillbar').innerHTML = PILLS.map(([id, label]) =>
     `<button class="pill ${activePill === id ? 'on' : ''}" onclick="window.__app.setPill('${id}')">${label}</button>`
   ).join('') + `<button class="pill plus" onclick="window.__app.newChat()">+</button>`;
 }
+
 function renderNav() {
   const totalUnread = [...state.convs.values()].reduce((a, c) => a + (c.unread || 0), 0);
-  const tabs = [['chats','💬','Chats',totalUnread],['updates','📸','Aktuelles',0],['communities','👥','Communitys',0],['calls','📞','Anrufe',0]];
-  $('#navbar').innerHTML = tabs.map(([id, ic, lb, bdg]) =>
-    `<button class="${state.tab === id ? 'on' : ''}" onclick="window.__app.go('${id}')">
-      <span class="navic">${ic}</span><span class="navlb">${lb}</span>${bdg ? `<span class="navbdg"></span>` : ''}
+  const tabs = [
+    ['chats', '💬', 'Chats', totalUnread],
+    ['updates', '📸', 'Aktuelles', 0],
+    ['communities', '👥', 'Communitys', 0],
+    ['calls', '📞', 'Anrufe', 0]
+  ];
+  $('#navbar').innerHTML = tabs.map(([id, ic, lb, bdg]) => `
+    <button class="${state.tab === id ? 'on' : ''}" onclick="window.__app.go('${id}')">
+      <span class="navic">${ic}</span><span class="navlb">${lb}</span>
+      ${bdg ? `<span class="navbdg"></span>` : ''}
     </button>`).join('');
 }
-function go(tab) { state.tab = tab; state.view = 'list'; renderNav(); renderMain(); }
+
+function go(tab) {
+  state.tab = tab; state.view = 'list';
+  renderNav(); renderMain();
+}
+
 function renderMain() {
   if (state.view !== 'list') return;
-  const main = $('#main'); if (!main) return;
-  if (state.tab !== 'chats') { main.innerHTML = `<div class="empty"><div class="ic">🚧</div><div>Noch nicht verfügbar</div></div>`; return; }
+  const main = $('#main');
+  if (!main) return;
+  if (state.tab !== 'chats') {
+    main.innerHTML = `<div class="empty"><div class="ic">🚧</div><div>Noch nicht verfügbar</div></div>`;
+    return;
+  }
+
   let convs = [...state.convs.values()];
   if (activePill === 'unread') convs = convs.filter(c => (c.unread || 0) > 0);
   if (activePill === 'groups') convs = convs.filter(c => c.isGroup);
-  if (state.search) { const q = state.search.toLowerCase(); convs = convs.filter(c => (c.name || c.peerId || '').toLowerCase().includes(q)); }
+  if (state.search) {
+    const q = state.search.toLowerCase();
+    convs = convs.filter(c => (c.name || c.peerId || '').toLowerCase().includes(q));
+  }
   convs.sort((a, b) => (b.lastMsg?.ts || 0) - (a.lastMsg?.ts || 0));
+
   main.innerHTML = `
     <div class="scroll" style="height:100%;position:relative">
-      ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') : `<div class="empty"><div class="ic">💬</div><div>Noch keine Chats.<br>Tippe auf + um zu starten.</div></div>`}
+      ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') :
+        `<div class="empty"><div class="ic">💬</div><div>Noch keine Chats.<br>Tippe auf + um zu starten.</div></div>`}
       <div class="fab" onclick="window.__app.newChat()">💬</div>
     </div>`;
   window.__conv = convs;
 }
+
 function convRow(c, i) {
   const name = c.name || c.peerId || 'Unbekannt';
-  const avatar = c.avatarUrl ? `<img src="${c.avatarUrl}">` : (name[0] || '?').toUpperCase();
+  const avatar = c.avatarUrl
+    ? `<img src="${c.avatarUrl}">`
+    : (name[0] || '?').toUpperCase();
   const unread = c.unread || 0;
   const preview = c.lastMsg ? esc(c.lastMsg.text).slice(0, 60) : 'Noch keine Nachrichten';
   return `
     <div class="row" onclick="window.__app.openConv(${i})">
       <div class="av">${avatar}${c.isGroup ? '' : `<div class="dot ${c.online ? 'online' : 'offline'}"></div>`}</div>
       <div class="meta">
-        <div class="l1"><span class="nm">${esc(name)}</span><span class="tm ${unread ? 'un' : ''}">${c.lastMsg ? time(c.lastMsg.ts) : ''}</span></div>
-        <div class="l2"><span class="pv">${preview}</span>${unread ? `<span class="unread">${unread}</span>` : ''}</div>
+        <div class="l1"><span class="nm">${esc(name)}</span>
+          <span class="tm ${unread ? 'un' : ''}">${c.lastMsg ? time(c.lastMsg.ts) : ''}</span></div>
+        <div class="l2"><span class="pv">${preview}</span>
+          ${unread ? `<span class="unread">${unread}</span>` : ''}</div>
       </div>
     </div>`;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   AKTIONEN
+   AKTIONEN, vom UI aufgerufen
    ═══════════════════════════════════════════════════════════════════════ */
 const appActions = {
   setPill(id) { activePill = id; renderPills(); renderMain(); },
   onSearch(v) { state.search = v; renderMain(); },
   go(tab) { go(tab); },
-  openConv(i) { openChat(window.__conv[i]); },
+  openConv(i) { const c = window.__conv[i]; openChat(c); },
   newChat() { openNewChatSheet(); },
   openCamera() { toast('Kamera folgt in einem späteren Schritt'); },
   startCall(kind) {
@@ -963,101 +1148,111 @@ const appActions = {
   loadMedia(msgId) {
     for (const list of state.messages.values()) {
       const m = list.find(x => x.id === msgId);
-      if (m) { const media = m.media || parseIncomingMedia(m.text); if (media) downloadAndShowMedia(msgId, media.ref, media.kind); break; }
+      if (m) {
+        const media = m.media || parseIncomingMedia(m.text);
+        if (media) downloadAndShowMedia(msgId, media.ref, media.kind);
+        break;
+      }
     }
   }
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
-   X3DH — FIX 1: Session nach Aufbau persistieren
+   SITZUNGSAUFBAU — X3DH pro Empfängergerät
+   ─────────────────────────────────────────────────────────────────────
+   Ein logischer Chat mit einem Kontakt kann mehrere Ratchet-Sitzungen
+   bedeuten — eine pro aktivem Gerät des Kontakts (Fanout). Der Bundle-
+   Abruf liefert alle Geräte auf einmal; für jedes ohne bestehende
+   Sitzung wird X3DH einmalig durchgeführt.
    ═══════════════════════════════════════════════════════════════════════ */
 async function ensureSessions(peerId) {
-  /* Bundle vom Server holen — immer nötig um Geräteliste zu kennen */
   const { bundles } = await api.fetchBundle(peerId);
   if (!bundles?.length) throw new Error('Kein aktives Gerät für diesen Nutzer gefunden');
 
-  for (const bundle of bundles) {
-    const key = sk(peerId, bundle.deviceId);
-    /* Bestehende Session im RAM wiederverwenden — KEIN neuer X3DH */
-    if (state.sessions.has(key)) continue;
-
-    /* Nur neue Session aufbauen wenn keine existiert */
+  const missing = bundles.filter(b => !state.sessions.has(sk(peerId, b.deviceId)));
+  for (const bundle of missing) {
     const verify = await PreKeys.verifyBundle(bundle);
-    if (!verify.ok) { console.warn('Bundle ungültig', bundle.deviceId, verify.reason); continue; }
+    if (!verify.ok) {
+      console.warn('Bundle-Signatur ungültig für Gerät', bundle.deviceId, verify.reason);
+      continue;   // dieses Gerät überspringen, andere bleiben nutzbar
+    }
     const { SK, EK } = await X3DH.initiator(state.identity.IK, bundle);
     const st = await Ratchet.initSender(SK, bundle.spk);
     st.usedOpkId = bundle.opkId;
     st.ephemeral = EK;
-    state.sessions.set(key, st);
+    state.sessions.set(sk(peerId, bundle.deviceId), st);
   }
   return bundles;
 }
 
+/* Wenn WIR der Empfänger einer ersten Nachricht sind, muss die Sitzung
+   als Empfänger aufgebaut werden — passiert lazy beim ersten
+   entschlüsselbaren Umschlag, siehe openRatchet() weiter unten, das bei
+   Fehlschlag versucht, aus dem mitgelieferten Header eine neue
+   Empfänger-Sitzung zu bilden (X3DH.responder benötigt den passenden,
+   inzwischen verbrauchten One-Time-Prekey). */
 async function ensureReceiverSession(env) {
   const key = sk(env.senderId, env.senderDeviceId);
   if (state.sessions.has(key)) return state.sessions.get(key);
-  if (!env.header?.x3dh) throw new Error('Kein X3DH-Header — Sitzung nicht rekonstruierbar');
+  if (!env.header?.x3dh) throw new Error('Kein X3DH-Anfangsheader vorhanden — Sitzung nicht rekonstruierbar');
+
   const { senderIK, senderEK, opkId } = env.header.x3dh;
-
-  /* SPK muss pub-Key enthalten — nach Vault-Reload ggf. neu importieren */
-  let mySPK = state.identity.SPK;
-  if (!mySPK.pub) {
-    const pubJwk = mySPK.pubJwk || (() => { const j = {...mySPK.privJwk}; delete j.d; j.key_ops = []; return j; })();
-    mySPK = {
-      ...mySPK,
-      pub: await crypto.subtle.importKey('jwk', pubJwk, { name:'ECDH', namedCurve:'P-256' }, true, []),
-      pubJwk
-    };
-    state.identity.SPK = mySPK;
-  }
-
-  /* OPK: nach Reload nicht mehr im Speicher — Server hat ihn verbraucht,
-     wir bauen X3DH ohne OPK (3-DH statt 4-DH, immer noch sicher) */
-  const usedOpk = opkId ? (state.identity.opks.get(opkId) || null) : null;
-
-  const _dbg = 'IKpriv:' + !!state.identity.IK?.priv
-    + ' SPKpriv:' + !!mySPK?.priv
-    + ' SPKpub:' + !!mySPK?.pub
-    + ' OPK:' + !!usedOpk
-    + ' opkId:' + opkId;
-  let SK;
-  try {
-    SK = await X3DH.responder(state.identity.IK, mySPK, usedOpk, senderIK, senderEK);
-  } catch(e2) {
-    throw new Error('X3DH-Fehler: ' + _dbg + ' | ' + e2.message);
-  }
-  const st = Ratchet.initReceiver(SK, mySPK);
+  const usedOpk = opkId ? state.identity.opks.get(opkId) : null;
+  const SK = await X3DH.responder(state.identity.IK, state.identity.SPK, usedOpk, senderIK, senderEK);
+  const st = Ratchet.initReceiver(SK, state.identity.SPK);
   state.sessions.set(key, st);
   if (usedOpk) state.identity.opks.delete(opkId);
-  await SessionStore.save(key, st);
   return st;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   SENDEN — FIX 1: Session nach dem Senden persistieren
+   NACHRICHT SENDEN — Fanout an alle aktiven Empfängergeräte
    ═══════════════════════════════════════════════════════════════════════ */
 async function sendMessage(peerId, convId, plaintext) {
   const bundles = await ensureSessions(peerId);
   const perDevice = [];
+
   for (const bundle of bundles) {
     const key = sk(peerId, bundle.deviceId);
     const st = state.sessions.get(key);
-    if (!st) continue;
+    if (!st) continue;   // Bundle-Signatur war ungültig, siehe ensureSessions
+
+    /* WICHTIG: Ratchet.initSender() setzt dhSteps bereits auf 1 (das
+       anfängliche X3DH-DH zählt als erster Schritt) — dhSteps===0 ist
+       daher NIE wahr für eine frische Sender-Sitzung und hätte den
+       X3DH-Header nie angehängt. Der richtige Indikator für "erste
+       Nachricht auf dieser Sitzung" ist allein Ns (tatsächlich gesendete
+       Nachrichten), das bei initSender korrekt bei 0 startet.
+
+       Der X3DH-Header gehört NUR zur allerersten Nachricht des
+       ursprünglichen INITIATORS (st.ephemeral ist nur bei per
+       ensureSessions/X3DH.initiator aufgebauten Sitzungen gesetzt).
+       Antwortet stattdessen der ursprüngliche EMPFÄNGER (Sitzung kam aus
+       ensureReceiverSession, kein eigener Ephemeral-Key vorhanden), ist
+       kein X3DH-Header nötig — der Ratchet-Header allein reicht, weil
+       die Sitzung beim Gegenüber schon über den ersten Header etabliert
+       wurde. */
     const isFirst = st.Ns === 0 && !!st.ephemeral;
     const env = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${convId}`);
     const header = isFirst
       ? { ...env.header, x3dh: { senderIK: state.identity.IK.pubJwk, senderEK: st.ephemeral.pubJwk, opkId: st.usedOpkId } }
       : env.header;
+    /* Ratchet.encrypt() liefert ct als rohen ArrayBuffer (WebCrypto-
+       Ausgabe) — der Server speichert ciphertext als TEXT-Spalte und
+       kann keinen ArrayBuffer binden. Vor dem Versand nach Base64
+       kodieren; openRatchet() beim Empfänger dekodiert entsprechend
+       zurück, bevor Ratchet.decrypt() den rohen Buffer wieder erwartet. */
     perDevice.push({ deviceId: bundle.deviceId, header, ciphertext: b64(env.ct) });
-    /* FIX 1: Session nach Verschlüsselung persistieren */
-    await SessionStore.save(key, st);
   }
-  if (!perDevice.length) throw new Error('Keine gültige Sitzung aufbaubar');
+  if (!perDevice.length) throw new Error('Keine gültige Sitzung für dieses Konto aufbaubar');
+
   const result = await api.send({ recipientId: peerId, convId, kind: 'text', perDevice });
+
   const conv = state.convs.get(convId) || { convId, peerId };
   conv.lastMsg = { text: plaintext, ts: result.sentAt };
   conv.unread = 0;
   state.convs.set(convId, conv);
+
   if (!state.messages.has(convId)) state.messages.set(convId, []);
   state.messages.get(convId).push({ id: 'local-' + result.sentAt, text: plaintext, ts: result.sentAt, mine: true });
   LocalCache.scheduleSave();
@@ -1069,15 +1264,31 @@ async function sendCurrentMessage() {
   if (!input) return;
   const text = input.value.trim();
   if (!text || !state.activeConv) return;
-  input.value = ''; input.style.height = 'auto';
+  input.value = '';
+  input.style.height = 'auto';
   const { peerId, convId } = state.activeConv;
-  if (state.isOffline) { queueOffline(peerId, convId, text); return; }
+
+  /* Schon bekannt offline: gar nicht erst versuchen — sofort in die
+     Warteschlange, mit sichtbarem "wird gesendet"-Zustand statt eines
+     Fehlertoasts bei jeder einzelnen Nachricht. */
+  if (state.isOffline) {
+    queueOffline(peerId, convId, text);
+    return;
+  }
+
   try {
     await sendMessage(peerId, convId, text);
     renderChatMessages();
   } catch (e) {
+    /* Unterscheiden: ein Netzwerkfehler (TypeError bei fetch, kein
+       HTTP-Status) landet in der automatischen Warteschlange. Eine
+       echte Serverablehnung (z. B. blockiert, 4xx) bekommt der Nutzer
+       sofort zu sehen — automatisches Wiederholen würde da nur denselben
+       Fehler wiederholen, das Problem liegt nicht am Netz. */
     if (e.status === undefined) {
-      state.isOffline = true; updateOfflineBanner(); queueOffline(peerId, convId, text);
+      state.isOffline = true;
+      updateOfflineBanner();
+      queueOffline(peerId, convId, text);
     } else {
       toast('⚠️ Senden fehlgeschlagen: ' + e.message);
       input.value = text;
@@ -1095,21 +1306,23 @@ function queueOffline(peerId, convId, text) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   CHAT-FENSTER — FIX 2: Presence beim Öffnen aktiv abfragen
+   CHAT-FENSTER
    ═══════════════════════════════════════════════════════════════════════ */
 function openChat(c) {
   state.view = 'chat';
   state.activeConv = { peerId: c.peerId, convId: c.convId, name: c.name || c.peerId };
-  if (c.unread) c.unread = 0;
+  if (c.unread) { c.unread = 0; }
+
   const overlay = document.createElement('div');
-  overlay.className = 'chatview'; overlay.id = 'chatOverlay';
+  overlay.className = 'chatview';
+  overlay.id = 'chatOverlay';
   overlay.innerHTML = `
     <div class="chatbar">
       <button class="iconbtn" onclick="window.__app.closeChat()">←</button>
       <div class="av" style="width:38px;height:38px;font-size:16px">${(c.name || '?')[0].toUpperCase()}</div>
       <div class="name">
         <div class="nm">${esc(c.name || c.peerId)}</div>
-        <div class="st" id="chatStatus">${c.online ? 'online' : 'Wird geladen…'}</div>
+        <div class="st" id="chatStatus">${c.online ? 'online' : 'offline'}</div>
       </div>
       <button class="iconbtn" onclick="window.__app.startCall('audio')" aria-label="Anrufen">📞</button>
       <button class="iconbtn" onclick="window.__app.startCall('video')" aria-label="Videoanruf">📹</button>
@@ -1128,16 +1341,18 @@ function openChat(c) {
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(overlay);
+
   ensureSessions(c.peerId).catch(e => toast('⚠️ ' + e.message));
   renderChatMessages();
   $('#msgInput')?.focus();
-  /* FIX 2: Online-Status sofort aktiv vom Server holen */
-  fetchPresence(c.peerId);
 }
 
 function closeChat() {
-  document.getElementById('chatOverlay')?.remove();
-  state.view = 'list'; state.activeConv = null; renderMain();
+  const overlay = document.getElementById('chatOverlay');
+  overlay?.remove();
+  state.view = 'list';
+  state.activeConv = null;
+  renderMain();
 }
 
 function renderChatHeader() {
@@ -1152,32 +1367,47 @@ function renderChatMessages() {
   const body = document.getElementById('chatbody');
   if (!body) return;
   const msgs = state.messages.get(state.activeConv.convId) || [];
+
   let lastDay = null;
-  const rows = ['<div class="encnote">🔒 Ende-zu-Ende-verschlüsselt.</div>'];
+  const rows = [];
+  rows.push(`<div class="encnote">🔒 Nachrichten sind Ende-zu-Ende-verschlüsselt.</div>`);
   for (const m of msgs) {
     const d = day(m.ts);
     if (d !== lastDay) { rows.push(`<div class="daysep"><span>${d}</span></div>`); lastDay = d; }
+
+    /* Medienreferenz erkennen: entweder schon beim Senden markiert
+       (m.media, eigener Anhang) oder beim Empfangen aus dem
+       entschlüsselten JSON-Text erkannt. */
     const incomingMedia = !m.media && !m.mine ? parseIncomingMedia(m.text) : null;
     const media = m.media || incomingMedia;
+
     let content;
     if (media) {
       if (m.mediaUrl) {
-        content = media.kind === 'image' ? `<div class="media"><img src="${m.mediaUrl}"></div>`
-          : media.kind === 'video' ? `<div class="media"><video src="${m.mediaUrl}" controls></video></div>`
-          : `<div class="filemsg">📄 <a href="${m.mediaUrl}" download style="color:inherit">${esc(media.name || 'Datei')}</a></div>`;
+        content = media.kind === 'image'
+          ? `<div class="media"><img src="${m.mediaUrl}"></div>`
+          : media.kind === 'video'
+            ? `<div class="media"><video src="${m.mediaUrl}" controls></video></div>`
+            : `<div class="filemsg">📄 <a href="${m.mediaUrl}" download style="color:inherit">${esc(media.name || 'Datei')}</a></div>`;
       } else {
         const icon = media.kind === 'image' ? '🖼️' : media.kind === 'video' ? '🎬' : '📄';
-        content = `<div class="filemsg" style="cursor:pointer" onclick="window.__app.loadMedia('${m.id}')">${icon} <span>${media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : (media.name || 'Datei')} — antippen zum Laden</span></div>`;
+        content = `<div class="filemsg" style="cursor:pointer" onclick="window.__app.loadMedia('${m.id}')">
+          ${icon} <span>${media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : (media.name || 'Datei')} — antippen zum Laden</span></div>`;
       }
-    } else { content = `<div class="tx">${esc(m.text)}</div>`; }
+    } else {
+      content = `<div class="tx">${esc(m.text)}</div>`;
+    }
+
     rows.push(`
       <div class="msgrow ${m.mine ? 'mine' : ''}">
         <div class="bub" style="${m.pending ? 'opacity:.65' : ''}">
-          ${!m.mine && m.from ? `<div style="font-size:11px;color:var(--acc);margin-bottom:2px">${esc(m.from)}</div>` : ''}
           ${content}
           <div class="ft"><span class="tm">${time(m.ts)}</span>
-            ${m.mine ? (m.pending ? `<span class="ck">🕐</span>` : `<span class="ck">✓✓</span>`) : ''}
-          </div>
+            ${m.mine ? (m.pending
+              ? `<span class="ck" title="Wird gesendet, sobald wieder online">🕐</span>`
+              : `<span class="ck">✓✓</span>`) : ''}
+            ${!m.mine && media ? `<span class="timerbadge" style="color:var(--sub);background:rgba(255,255,255,.08)"
+              title="Direkt übertragen — Absender für den Speicherdienst sichtbar">📎 direkt</span>` : ''}</div>
         </div>
       </div>`);
   }
@@ -1190,7 +1420,9 @@ function renderChatMessages() {
    ═══════════════════════════════════════════════════════════════════════ */
 async function openNewChatSheet() {
   let users;
-  try { ({ users } = await api.listUsers()); } catch (e) { toast('⚠️ ' + e.message); return; }
+  try { ({ users } = await api.listUsers()); }
+  catch (e) { toast('⚠️ ' + e.message); return; }
+
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'newChatSheet';
   sheet.onclick = e => { if (e.target === sheet) sheet.remove(); };
@@ -1200,8 +1432,11 @@ async function openNewChatSheet() {
       <h3 style="margin:0 0 12px">Neuer Chat</h3>
       ${users.length ? users.map(u => `
         <div class="row" style="padding:8px 0" onclick="window.__app.startChatWith('${u.id}', '${esc(u.name || '')}')">
-          <div class="av">${esc((u.name || '?')[0].toUpperCase())}<div class="dot ${u.online ? 'online' : 'offline'}"></div></div>
-          <div class="meta" style="border-bottom:none"><div class="l1"><span class="nm">${esc(u.name)}</span></div></div>
+          <div class="av">${esc((u.name || '?')[0].toUpperCase())}
+            <div class="dot ${u.online ? 'online' : 'offline'}"></div></div>
+          <div class="meta" style="border-bottom:none">
+            <div class="l1"><span class="nm">${esc(u.name)}</span></div>
+          </div>
         </div>`).join('') : `<div class="empty" style="height:auto;padding:24px"><div class="ic">👤</div><div>Noch keine anderen Nutzer</div></div>`}
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
@@ -1211,12 +1446,16 @@ function startChatWith(userId, userName) {
   document.getElementById('newChatSheet')?.remove();
   const convId = 'dm_' + [state.me.id, userId].sort().join('_');
   let conv = state.convs.get(convId);
-  if (!conv) { conv = { convId, peerId: userId, name: userName || userId, unread: 0 }; state.convs.set(convId, conv); }
-  else if (!conv.name || conv.name === conv.peerId) conv.name = userName || conv.name;
+  if (!conv) {
+    conv = { convId, peerId: userId, name: userName || userId, unread: 0 };
+    state.convs.set(convId, conv);
+  } else if (!conv.name || conv.name === conv.peerId) {
+    conv.name = userName || conv.name;
+  }
   openChat(conv);
 }
 
-function openMainMenu() {
+function openMainMenu(e) {
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'mainMenuSheet';
   sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
@@ -1239,7 +1478,8 @@ function openMainMenu() {
 async function logoutClick() {
   document.getElementById('mainMenuSheet')?.remove();
   try { await api.logout(); } catch {}
-  Vault.forget(); location.reload();
+  Vault.forget();
+  location.reload();
 }
 
 function showDeleteAccount() {
@@ -1251,11 +1491,17 @@ function showDeleteAccount() {
     <div class="sheetbox">
       <div class="grabber"></div>
       <h3 style="margin:0 0 8px;color:#f15c6d">Konto endgültig löschen</h3>
-      <p style="color:var(--sub);margin:0 0 16px;font-size:14px">Nicht rückgängig zu machen. Tipp zur Bestätigung deinen Namen <strong>${esc(state.me.name)}</strong> ein.</p>
+      <p style="color:var(--sub);margin:0 0 16px;font-size:14px">
+        Das kann nicht rückgängig gemacht werden. Alle Nachrichten, Geräte
+        und Kontaktdaten dieses Kontos werden unwiderruflich gelöscht.
+        Tipp zur Bestätigung deinen Namen <strong>${esc(state.me.name)}</strong> ein.
+      </p>
       <input id="deleteAccountConfirm" type="text" placeholder="${esc(state.me.name)}" autocomplete="off"
-        style="width:100%;box-sizing:border-box;font-size:16px;padding:14px;border-radius:10px;border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
+        style="width:100%;box-sizing:border-box;font-size:16px;padding:14px;border-radius:10px;
+          border:none;background:var(--panel2);color:var(--tx);margin-bottom:12px">
       <div id="deleteAccountError" style="color:#f15c6d;font-size:13px;margin-bottom:12px;display:none"></div>
-      <button class="btn" style="width:100%;margin-bottom:8px;background:#f15c6d" onclick="window.__app.confirmDeleteAccount()">Konto endgültig löschen</button>
+      <button class="btn" style="width:100%;margin-bottom:8px;background:#f15c6d"
+        onclick="window.__app.confirmDeleteAccount()">Konto endgültig löschen</button>
       <button class="btn ghost" style="width:100%" onclick="document.getElementById('deleteAccountSheet').remove()">Abbrechen</button>
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
@@ -1264,16 +1510,36 @@ function showDeleteAccount() {
 async function confirmDeleteAccount() {
   const input = document.getElementById('deleteAccountConfirm');
   const errEl = document.getElementById('deleteAccountError');
-  if (input?.value.trim() !== state.me.name) { errEl.textContent = 'Name stimmt nicht überein.'; errEl.style.display = 'block'; return; }
-  try { await api.deleteAccount(); Vault.forget(); location.reload(); }
-  catch (e) { errEl.textContent = e.message; errEl.style.display = 'block'; }
+  const typed = input?.value.trim();
+  if (typed !== state.me.name) {
+    errEl.textContent = 'Bitte deinen Namen exakt eingeben, um zu bestätigen.';
+    errEl.style.display = 'block';
+    return;
+  }
+  try {
+    await api.deleteAccount();
+    Vault.forget();
+    location.reload();
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.style.display = 'block';
+  }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   CHAT-MENÜ — Blockieren & Melden
+   ─────────────────────────────────────────────────────────────────────
+   Melden überträgt bewusst NUR Kennung + Grund, niemals automatisch den
+   Nachrichtentext — bei Ende-zu-Ende-Verschlüsselung hat der Server sonst
+   keinen Klartext, den man ihm "versehentlich" mitgeben könnte. Der
+   Inhalt wird nur beigefügt, wenn der Meldende das ausdrücklich anhakt.
+   ═══════════════════════════════════════════════════════════════════════ */
 function chatMenu(e) {
   e?.stopPropagation();
   if (!state.activeConv) return;
   const peerId = state.activeConv.peerId;
   const isBlocked = state.blocked.has(peerId);
+
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'chatMenuSheet';
   sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
@@ -1287,8 +1553,8 @@ function chatMenu(e) {
       <div class="row" style="padding:10px 0" onclick="window.__app.toggleBlock()">
         <div style="font-size:20px;width:32px">${isBlocked ? '✅' : '🚫'}</div>
         <div class="meta" style="border-bottom:none"><div class="l1">
-          <span class="nm" style="color:${isBlocked ? 'var(--acc2)' : 'var(--dan)'}">${isBlocked ? 'Entsperren' : 'Blockieren'}</span>
-        </div></div>
+          <span class="nm" style="color:${isBlocked ? 'var(--acc2)' : 'var(--dan)'}">
+            ${isBlocked ? 'Entsperren' : 'Blockieren'}</span></div></div>
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
@@ -1296,10 +1562,18 @@ function chatMenu(e) {
 
 async function toggleBlock() {
   document.getElementById('chatMenuSheet')?.remove();
-  const peerId = state.activeConv?.peerId; if (!peerId) return;
+  const peerId = state.activeConv?.peerId;
+  if (!peerId) return;
   try {
-    if (state.blocked.has(peerId)) { await api.unblock(peerId); state.blocked.delete(peerId); toast('Entsperrt'); }
-    else { await api.block(peerId); state.blocked.add(peerId); toast('Blockiert'); }
+    if (state.blocked.has(peerId)) {
+      await api.unblock(peerId);
+      state.blocked.delete(peerId);
+      toast('Entsperrt');
+    } else {
+      await api.block(peerId);
+      state.blocked.add(peerId);
+      toast('Blockiert — diese Person kann dir nicht mehr schreiben');
+    }
   } catch (e) { toast('⚠️ ' + e.message); }
 }
 
@@ -1312,14 +1586,19 @@ function reportUser() {
   modal.innerHTML = `
     <div class="modalbox">
       <h3>🚩 Person melden</h3>
+      <div style="color:var(--sub);font-size:12.5px;margin-bottom:14px">
+        Die Meldung enthält die Kennung dieser Person und deinen Grund —
+        nicht automatisch den Nachrichtentext.</div>
       <label>Grund</label>
       <select class="in" id="repReason">
-        <option value="spam">Spam</option><option value="harassment">Belästigung</option>
-        <option value="illegal">Illegaler Inhalt</option><option value="csam">Gefährdung Minderjähriger</option>
+        <option value="spam">Spam oder Werbung</option>
+        <option value="harassment">Belästigung oder Bedrohung</option>
+        <option value="illegal">Mutmaßlich illegaler Inhalt</option>
+        <option value="csam">Gefährdung Minderjähriger</option>
         <option value="other">Anderer Grund</option>
       </select>
       <label>Zusätzliche Angaben (optional)</label>
-      <textarea class="in" id="repNote" rows="3" placeholder="Kontext…"></textarea>
+      <textarea class="in" id="repNote" rows="3" placeholder="Kontext, den wir wissen sollten…"></textarea>
       <div class="mrow">
         <button class="btn ghost" onclick="document.getElementById('reportModal').remove()">Abbrechen</button>
         <button class="btn dan" onclick="window.__app.submitReport()">Melden</button>
@@ -1333,10 +1612,23 @@ async function submitReport() {
   const reason = $('#repReason')?.value || 'other';
   const note = $('#repNote')?.value.trim() || undefined;
   document.getElementById('reportModal')?.remove();
-  try { await api.report({ reportedId: peerId, convId: state.activeConv?.convId, reason, note }); toast('Gemeldet 🚩'); }
-  catch (e) { toast('⚠️ ' + e.message); }
+  try {
+    await api.report({ reportedId: peerId, convId: state.activeConv?.convId, reason, note });
+    toast('Gemeldet — danke für deinen Hinweis 🚩');
+  } catch (e) { toast('⚠️ ' + e.message); }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   MEDIENVERSAND
+   ─────────────────────────────────────────────────────────────────────
+   Große Dateien (>6 KB) passen nicht durch den Ratchet/Mixnet-Pfad (feste
+   7-KB-Paketgröße im Mixnet ist Voraussetzung für Anonymität — siehe
+   media-storage.js). Sie werden separat verschlüsselt zu R2 hochgeladen;
+   nur Pfad+Schlüssel (~250 Byte) reisen durch den geschützten Weg. Dabei
+   ist der Absender für den Speicherdienst sichtbar — anders als beim
+   reinen Textpfad. Ohne konfigurierten Medienspeicher (window.MEDIA_CONFIG)
+   bleibt Textversand voll nutzbar, nur Anhänge sind dann deaktiviert.
+   ═══════════════════════════════════════════════════════════════════════ */
 function attachSheet() {
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'attachSheet';
@@ -1364,45 +1656,82 @@ function pickMedia(accept, kind) {
   document.getElementById('attachSheet')?.remove();
   const input = document.createElement('input');
   input.type = 'file'; input.accept = accept;
-  input.onchange = async () => { const file = input.files?.[0]; if (!file) return; await sendMediaMessage(file, kind); };
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    await sendMediaMessage(file, kind);
+  };
   input.click();
 }
 
 async function sendMediaMessage(file, kind) {
   if (!state.activeConv) return;
-  if (!window.MediaStorage || !window.MEDIA_CONFIG?.uploadUrl) { toast('⚠️ Kein Medienspeicher konfiguriert'); return; }
+  if (!window.MediaStorage || !window.MEDIA_CONFIG?.uploadUrl) {
+    toast('⚠️ Kein Medienspeicher konfiguriert — siehe media-storage.js/config.js');
+    return;
+  }
   toast('📎 Wird hochgeladen…', 4000);
   try {
     let toUpload = file;
-    if (kind === 'image') { try { toUpload = await window.MediaStorage.shrinkImage(file); } catch {} }
-    const uploaded = await window.MediaStorage.uploadMedia(toUpload, { uploadUrl: window.MEDIA_CONFIG.uploadUrl, kind });
+    if (kind === 'image') {
+      try { toUpload = await window.MediaStorage.shrinkImage(file); } catch {}
+    }
+    const uploaded = await window.MediaStorage.uploadMedia(toUpload,
+      { uploadUrl: window.MEDIA_CONFIG.uploadUrl, kind });
     const ref = window.MediaStorage.mediaReference(uploaded);
-    const result = await sendMessage(state.activeConv.peerId, state.activeConv.convId, JSON.stringify({ __media: ref, kind }));
+
+    /* Nur die winzige Referenz (~250 Byte) geht durch den geschützten
+       Ratchet-Pfad — genau wie Text, nur mit kind:'media' markiert,
+       damit der Empfänger weiß, dass er die Datei separat laden muss. */
+    const result = await sendMessage(state.activeConv.peerId, state.activeConv.convId,
+      JSON.stringify({ __media: ref, kind }));
+
     const conv = state.convs.get(state.activeConv.convId);
     if (conv) conv.lastMsg = { text: kind === 'image' ? '📷 Foto' : kind === 'video' ? '🎬 Video' : '📄 ' + file.name, ts: result.sentAt };
+
     const msgs = state.messages.get(state.activeConv.convId) || [];
     const last = msgs[msgs.length - 1];
     if (last) { last.media = { ref, kind, name: file.name }; last.text = ''; }
     renderChatMessages();
-  } catch (e) { toast('⚠️ Upload fehlgeschlagen: ' + e.message); }
+  } catch (e) {
+    toast('⚠️ Upload fehlgeschlagen: ' + e.message);
+  }
 }
 
+/* Beim Empfangen: erkennt, ob eine entschlüsselte Nachricht eigentlich
+   eine Medienreferenz ist (JSON mit __media-Feld), lädt bei Bedarf
+   NICHT automatisch herunter (Datenverbrauch!) — der Nutzer tippt zum
+   Laden. parseIncomingMedia() wird von renderChatMessages genutzt. */
 function parseIncomingMedia(text) {
-  try { const obj = JSON.parse(text); if (obj && obj.__media) return { ref: obj.__media, kind: obj.kind }; } catch {}
+  try {
+    const obj = JSON.parse(text);
+    if (obj && obj.__media) return { ref: obj.__media, kind: obj.kind };
+  } catch {}
   return null;
 }
 
 async function downloadAndShowMedia(msgId, ref, kind) {
-  if (!window.MediaStorage || !window.MEDIA_CONFIG?.downloadUrl) { toast('⚠️ Kein Medienspeicher'); return; }
+  if (!window.MediaStorage || !window.MEDIA_CONFIG?.downloadUrl) {
+    toast('⚠️ Kein Medienspeicher konfiguriert'); return;
+  }
   toast('⬇️ Wird geladen…', 3000);
   try {
     const blob = await window.MediaStorage.downloadMedia(ref, { downloadUrl: window.MEDIA_CONFIG.downloadUrl });
     const url = URL.createObjectURL(blob);
-    for (const list of state.messages.values()) { const m = list.find(x => x.id === msgId); if (m) { m.mediaUrl = url; break; } }
+    for (const list of state.messages.values()) {
+      const m = list.find(x => x.id === msgId);
+      if (m) { m.mediaUrl = url; break; }
+    }
     renderChatMessages();
-  } catch (e) { toast('⚠️ Laden fehlgeschlagen: ' + e.message); }
+  } catch (e) {
+    toast('⚠️ Laden fehlgeschlagen: ' + e.message);
+  }
 }
 
+/* Für Tests: interne Funktionen und Zustand exportieren. Der Aufruf von
+   boot() unten läuft im Browser wie gewohnt automatisch; unter Node (in
+   Tests) wird dasselbe Modul importiert, ohne dass boot() dort DOM-Elemente
+   braucht, weil die Testsuite eigene Aufrufe macht statt boot(). */
 export { state, Vault, reconstructIdentityFromVault, sk, boot,
   authSubmit, renderAuthChoice, renderPills, renderNav,
   renderMain, go, convRow, handleEnvelope, api,
@@ -1412,4 +1741,6 @@ export { state, Vault, reconstructIdentityFromVault, sk, boot,
   downloadAndShowMedia, sendCurrentMessage, queueOffline, flushOutbox,
   setupOfflineDetection, LocalCache, afterAuthOffline, afterAuth };
 
-if (typeof document !== 'undefined' && document.getElementById('boot')) { boot(); }
+if (typeof document !== 'undefined' && document.getElementById('boot')) {
+  boot();
+}
