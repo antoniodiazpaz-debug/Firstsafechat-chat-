@@ -211,6 +211,79 @@ const state = {
      der Nutzer muss NICHT manuell erneut auf Senden tippen. */
   outbox: []   // { convId, peerId, text, localId, ts }
 };
+/* ═══════════════════════════════════════════════════════════════════════
+   RATCHET-SESSIONS PERSISTIEREN
+   ─────────────────────────────────────────────────────────────────────
+   state.sessions lag bisher nur im Speicher — bei einem Reload (z. B.
+   Android killt den Tab nach Bildschirmsperre) waren alle laufenden
+   Ratchet-Zustände weg, und neue, mit fortgeschrittenem Zähler
+   eintreffende Nachrichten wurden als "nicht entschlüsselbar" angezeigt.
+
+   Der Ratchet-State enthält zwei CryptoKey-Objekte (DHs.priv/pub, DHr),
+   die WebCrypto nicht direkt serialisieren kann — alles andere (RK,
+   CKs, CKr, skipped-Map) sind bereits rohe Bytes. Export wandelt die
+   CryptoKeys in ihre JWK-Form um (bereits vorhanden als DHs.privJwk/
+   pubJwk und DHrJwk), Import re-importiert sie beim Laden. */
+async function exportSession(st) {
+  return {
+    RK: b64(st.RK), CKs: st.CKs ? b64(st.CKs) : null, CKr: st.CKr ? b64(st.CKr) : null,
+    DHsPriv: st.DHs.privJwk, DHsPub: st.DHs.pubJwk, DHrJwk: st.DHrJwk,
+    Ns: st.Ns, Nr: st.Nr, PN: st.PN, dhSteps: st.dhSteps,
+    skipped: [...st.skipped.entries()].map(([k, v]) => [k, b64(v)]),
+    usedOpkId: st.usedOpkId ?? null,
+    ephemeralPriv: st.ephemeral ? st.ephemeral.privJwk : null,
+    ephemeralPub: st.ephemeral ? st.ephemeral.pubJwk : null
+  };
+}
+async function importSession(rec) {
+  const DHsPriv = await P.impPriv(rec.DHsPriv);
+  const DHsPub = await P.impPub(rec.DHsPub);
+  const DHr = rec.DHrJwk ? await P.impPub(rec.DHrJwk) : null;
+  const st = {
+    RK: ub64(rec.RK), CKs: rec.CKs ? ub64(rec.CKs) : null, CKr: rec.CKr ? ub64(rec.CKr) : null,
+    DHs: { priv: DHsPriv, pub: DHsPub, privJwk: rec.DHsPriv, pubJwk: rec.DHsPub },
+    DHrJwk: rec.DHrJwk, DHr,
+    Ns: rec.Ns, Nr: rec.Nr, PN: rec.PN, dhSteps: rec.dhSteps,
+    skipped: new Map(rec.skipped.map(([k, v]) => [k, ub64(v)])),
+    log: [], usedOpkId: rec.usedOpkId ?? null
+  };
+  if (rec.ephemeralPriv) {
+    st.ephemeral = {
+      priv: await P.impPriv(rec.ephemeralPriv), pub: await P.impPub(rec.ephemeralPub),
+      privJwk: rec.ephemeralPriv, pubJwk: rec.ephemeralPub
+    };
+  }
+  return st;
+}
+let sessionSaveTimer = null;
+function scheduleSessionSave() {
+  if (sessionSaveTimer) return;
+  sessionSaveTimer = setTimeout(async () => {
+    sessionSaveTimer = null;
+    if (!state.device?.id) return;
+    try {
+      const out = {};
+      for (const [key, st] of state.sessions.entries()) out[key] = await exportSession(st);
+      localStorage.setItem('sc:sessions:' + state.device.id, JSON.stringify(out));
+    } catch (e) {
+      console.warn('Session-Speichern fehlgeschlagen:', e.message);
+    }
+  }, 500);
+}
+async function loadSessions() {
+  if (!state.device?.id) return;
+  const raw = localStorage.getItem('sc:sessions:' + state.device.id);
+  if (!raw) return;
+  try {
+    const stored = JSON.parse(raw);
+    for (const [key, rec] of Object.entries(stored)) {
+      state.sessions.set(key, await importSession(rec));
+    }
+  } catch (e) {
+    console.warn('Sessions konnten nicht geladen werden:', e.message);
+  }
+}
+
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -663,6 +736,7 @@ async function afterAuth(data) {
   state.me = data.user;
   state.device = data.device;
   state.monitor = new KT.Monitor();
+  await loadSessions();
 
   /* WICHTIG: window.__app muss HIER gesetzt werden, nicht erst in
      renderShell() — die E-Mail-Verifizierung (Pflicht, siehe unten)
@@ -846,6 +920,7 @@ async function afterAuthOffline(deviceId, userName) {
   state.device = { id: deviceId };
   state.isOffline = true;
 
+  await loadSessions();
   await LocalCache.load();
 
   $('#auth').classList.add('hide');
@@ -981,6 +1056,7 @@ async function openRatchet(env) {
   const { x3dh, ...ratchetHeader } = env.header || {};
   const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) },
     `v1|${env.senderId}|${env.convId}`);
+  scheduleSessionSave();
   return td.decode(buf);
 }
 async function openSealed(env) {
@@ -1181,6 +1257,7 @@ async function ensureSessions(peerId) {
     st.usedOpkId = bundle.opkId;
     st.ephemeral = EK;
     state.sessions.set(sk(peerId, bundle.deviceId), st);
+    scheduleSessionSave();
   }
   return bundles;
 }
@@ -1201,6 +1278,7 @@ async function ensureReceiverSession(env) {
   const SK = await X3DH.responder(state.identity.IK, state.identity.SPK, usedOpk, senderIK, senderEK);
   const st = Ratchet.initReceiver(SK, state.identity.SPK);
   state.sessions.set(key, st);
+  scheduleSessionSave();
   if (usedOpk) state.identity.opks.delete(opkId);
   return st;
 }
@@ -1234,6 +1312,7 @@ async function sendMessage(peerId, convId, plaintext) {
        wurde. */
     const isFirst = st.Ns === 0 && !!st.ephemeral;
     const env = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${convId}`);
+    scheduleSessionSave();
     const header = isFirst
       ? { ...env.header, x3dh: { senderIK: state.identity.IK.pubJwk, senderEK: st.ephemeral.pubJwk, opkId: st.usedOpkId } }
       : env.header;
