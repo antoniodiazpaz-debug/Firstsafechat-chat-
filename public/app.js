@@ -732,7 +732,7 @@ async function handleEnvelope(env, live) {
     plaintext = env.sealed ? await openSealed(env) : await openRatchet(env);
   } catch (e) {
     console.warn('Entschlüsselung fehlgeschlagen:', e.message);
-    plaintext = '⚠️ ' + e.message;
+    plaintext = '⚠️ [' + e.name + '] ' + e.message + ' | header:' + JSON.stringify(env.header || null) + ' | sealed:' + !!env.sealed;
   }
 
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
@@ -766,14 +766,22 @@ async function handleEnvelope(env, live) {
 
 /* FIX 1: openRatchet speichert Session nach Entschlüsselung */
 async function openRatchet(env) {
-  const key = sk(env.senderId, env.senderDeviceId);
-  let st = state.sessions.get(key);
-  if (!st) st = await ensureReceiverSession(env);
-  const { x3dh, ...ratchetHeader } = env.header || {};
-  const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, `v1|${env.senderId}|${env.convId}`);
-  /* Session nach Entschlüsselung persistieren */
-  await SessionStore.save(key, st);
-  return td.decode(buf);
+  try {
+    const key = sk(env.senderId, env.senderDeviceId);
+    let st = state.sessions.get(key);
+    if (!st) st = await ensureReceiverSession(env);
+    const { x3dh, ...ratchetHeader } = env.header || {};
+    const assoc = `v1|${env.senderId}|${env.convId}`;
+    const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
+    await SessionStore.save(key, st);
+    return td.decode(buf);
+  } catch(e) {
+    const info = 'hadSess:' + !!state.sessions.get(sk(env.senderId, env.senderDeviceId))
+      + ' hdr:' + JSON.stringify(env.header).slice(0,80)
+      + ' err:[' + (e?.name||'?') + ']' + (e?.message||'leer')
+      + ' stack:' + String(e?.stack||'').slice(0,120);
+    throw new Error(info);
+  }
 }
 
 async function openSealed(env) {
