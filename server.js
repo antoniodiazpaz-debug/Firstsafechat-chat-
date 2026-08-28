@@ -1248,7 +1248,7 @@ const routes = {
     json(res, 200, { user: pub(await q.userById.get(a.user.id)) });
   },
 
-  'GET /api/user': async (req, res) => {
+  'GET /api/user': async (req, res, url) => {
     const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const userId = url.pathname.split('/').pop();
     const user = await q.userById.get(userId);
