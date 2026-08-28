@@ -239,49 +239,38 @@ const SessionStore = {
    LOCAL CACHE — Nachrichten-Cache
    ═══════════════════════════════════════════════════════════════════════ */
 const LocalCache = {
-  _key: null,
   _deviceId: null,
+
   async unlock(deviceId) {
     this._deviceId = deviceId;
-    if (!this._key) {
-      this._key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt','decrypt']);
-    }
   },
+
   async save() {
-    if (!this._key || !this._deviceId) return;
-    const snapshot = { convs: [...state.convs.entries()], messages: [...state.messages.entries()], outbox: state.outbox, savedAt: Date.now() };
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const plain = te.encode(JSON.stringify(snapshot));
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this._key, plain);
-    const db = await Vault._db();
-    if (!db) return;
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction('messages', 'readwrite');
-      tx.objectStore('messages').put({ deviceId: this._deviceId, iv: [...iv], ct: [...new Uint8Array(ct)] });
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
-  },
-  async load() {
-    if (!this._key || !this._deviceId) return false;
-    const db = await Vault._db();
-    if (!db) return false;
-    const rec = await new Promise((resolve, reject) => {
-      const tx = db.transaction('messages', 'readonly');
-      const req = tx.objectStore('messages').get(this._deviceId);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-    if (!rec) return false;
+    if (!this._deviceId) return;
     try {
-      const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(rec.iv) }, this._key, new Uint8Array(rec.ct));
-      const snapshot = JSON.parse(td.decode(plain));
-      state.convs = new Map(snapshot.convs);
-      state.messages = new Map(snapshot.messages);
+      const snapshot = {
+        convs: [...state.convs.entries()],
+        messages: [...state.messages.entries()],
+        outbox: state.outbox,
+        savedAt: Date.now()
+      };
+      localStorage.setItem('sc:cache:' + this._deviceId, JSON.stringify(snapshot));
+    } catch (e) { console.warn('Cache speichern fehlgeschlagen:', e.message); }
+  },
+
+  async load() {
+    if (!this._deviceId) return false;
+    try {
+      const raw = localStorage.getItem('sc:cache:' + this._deviceId);
+      if (!raw) return false;
+      const snapshot = JSON.parse(raw);
+      state.convs = new Map(snapshot.convs || []);
+      state.messages = new Map(snapshot.messages || []);
       state.outbox = snapshot.outbox || [];
       return true;
-    } catch (e) { console.warn('Cache nicht lesbar:', e.message); return false; }
+    } catch (e) { console.warn('Cache laden fehlgeschlagen:', e.message); return false; }
   },
+
   _saveTimer: null,
   scheduleSave() {
     if (this._saveTimer) return;
