@@ -815,7 +815,21 @@ async function openRatchet(env) {
       senderId = parts.find(p => p !== state.me.id) || '';
     }
     const assoc = `v1|${senderId}|${env.convId}`;
-    const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
+    let buf;
+    try {
+      buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
+    } catch(decErr) {
+      throw new Error('decrypt fehlgeschlagen'
+        + ' assoc:' + assoc
+        + ' convId:' + env.convId
+        + ' senderId:' + senderId
+        + ' me:' + state.me?.id
+        + ' Nr:' + st?.Nr
+        + ' Ns:' + st?.Ns
+        + ' DHrJwk:' + (st?.DHrJwk?.x||'null').slice(0,8)
+        + ' hdrDH:' + (ratchetHeader?.dh?.x||'null').slice(0,8)
+      );
+    }
     await SessionStore.save(key, st);
     return td.decode(buf);
   } catch(e) {
