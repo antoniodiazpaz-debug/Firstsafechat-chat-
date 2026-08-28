@@ -204,12 +204,19 @@ label{display:block;font-size:12px;color:var(--sub);margin:0 0 6px;font-weight:5
 <script type="module" src="/app.js"></script>
 <script>
 window.addEventListener('error', e => {
-  document.body.innerHTML = '<div style="position:fixed;inset:0;background:#000;color:#f00;font-family:monospace;font-size:13px;padding:16px;overflow:auto;white-space:pre-wrap;z-index:99999">' +
-    '<b>JS FEHLER:</b>\n' + e.message + '\n' + (e.filename||'') + ':' + e.lineno + '\n\n' + (e.error?.stack||'') + '</div>';
+  const info = [
+    'FEHLER: ' + e.message,
+    'Datei: ' + (e.filename||'?'),
+    'Zeile: ' + e.lineno + ', Spalte: ' + e.colno,
+    '',
+    'Stack:',
+    (e.error?.stack || '(kein Stack)')
+  ].join('\n');
+  document.body.innerHTML = '<div style="position:fixed;inset:0;background:#000;color:#f00;font-family:monospace;font-size:12px;padding:16px;overflow:auto;white-space:pre-wrap;z-index:99999;user-select:text;-webkit-user-select:text">' + info + '</div>';
 });
 window.addEventListener('unhandledrejection', e => {
-  document.body.innerHTML = '<div style="position:fixed;inset:0;background:#000;color:#f00;font-family:monospace;font-size:13px;padding:16px;overflow:auto;white-space:pre-wrap;z-index:99999">' +
-    '<b>UNHANDLED PROMISE:</b>\n' + (e.reason?.stack || e.reason) + '</div>';
+  const info = 'PROMISE FEHLER:\n' + (e.reason?.stack || String(e.reason));
+  document.body.innerHTML = '<div style="position:fixed;inset:0;background:#000;color:#ff0;font-family:monospace;font-size:12px;padding:16px;overflow:auto;white-space:pre-wrap;z-index:99999;user-select:text;-webkit-user-select:text">' + info + '</div>';
 });
 </script>
 </body>
