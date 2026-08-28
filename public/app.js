@@ -917,6 +917,7 @@ function wireSocketEvents() {
   });
   api.on('need-prekeys', () => refillPrekeys().catch(() => {}));
   api.on('connected', () => {
+    toast('🟢 WebSocket verbunden', 1500);
     state.isOffline = false;
     updateOfflineBanner();
     flushOutbox();
