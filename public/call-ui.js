@@ -69,7 +69,7 @@ function render(state) {
   if (state.state === 'ringing') {
     renderRinging(state.call);
     startRingtone();
-  if (state.state === 'calling') {
+  } else if (state.state === 'calling') {
     renderCalling(state.call);
     if (state.localStream && localVideoEl) localVideoEl.srcObject = state.localStream;
   } else if (state.state === 'connecting') {
