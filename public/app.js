@@ -298,6 +298,7 @@ const state = {
   convs: new Map(), messages: new Map(), sessions: new Map(),
   bundleCache: new Map(), monitor: null, search: '',
   blocked: new Set(),
+  processedEnvelopes: new Set(), /* verhindert Doppelverarbeitung */
   isOffline: typeof navigator !== 'undefined' && navigator.onLine === false,
   outbox: []
 };
@@ -742,6 +743,14 @@ async function onIncomingEnvelope(env) {
 }
 
 async function handleEnvelope(env, live) {
+  /* Doppelverarbeitung verhindern — Inbox + WebSocket liefern dieselbe Nachricht */
+  if (state.processedEnvelopes.has(env.id)) return;
+  state.processedEnvelopes.add(env.id);
+  /* Set begrenzen auf letzte 500 IDs */
+  if (state.processedEnvelopes.size > 500) {
+    const first = state.processedEnvelopes.values().next().value;
+    state.processedEnvelopes.delete(first);
+  }
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
   let plaintext = '[verschlüsselt]';
   try {
