@@ -779,6 +779,12 @@ async function openRatchet(env) {
   try {
     const key = sk(env.senderId, env.senderDeviceId);
     let st = state.sessions.get(key);
+    /* Wenn n:0 und X3DH-Header vorhanden → immer neue Session aufbauen.
+       Eine bestehende Session im RAM gehört zu einer alten Konversation. */
+    if (env.header?.x3dh && (env.header?.n === 0)) {
+      state.sessions.delete(key);
+      st = null;
+    }
     if (!st) st = await ensureReceiverSession(env);
     const { x3dh, ...ratchetHeader } = env.header || {};
     /* AAD muss identisch mit dem Sender sein.
