@@ -565,7 +565,13 @@ async function reconstructIdentityFromVault(data) {
     const pubOnly    = jwk => { const c = { ...jwk }; delete c.d; return c; };
     const IK  = { priv: await importDH(data.IK),   privJwk: data.IK,  pubJwk: pubOnly(data.IK) };
     const IKS = { priv: await importSign(data.IKS), privJwk: data.IKS, pubJwk: pubOnly(data.IKS) };
-    const SPK = { priv: await importDH(data.SPK),   privJwk: data.SPK, pubJwk: pubOnly(data.SPK) };
+    const spkPubJwk = pubOnly(data.SPK);
+    const SPK = {
+      priv: await importDH(data.SPK),
+      privJwk: data.SPK,
+      pubJwk: spkPubJwk,
+      pub: await crypto.subtle.importKey('jwk', spkPubJwk, { name:'ECDH', namedCurve:'P-256' }, true, [])
+    };
     setMsg('OPKs werden importiert…');
     const opks = new Map();
     for (const [id, jwk] of data.opks) opks.set(id, { priv: await importDH(jwk), privJwk: jwk, pubJwk: pubOnly(jwk) });
@@ -967,12 +973,27 @@ async function ensureReceiverSession(env) {
   if (state.sessions.has(key)) return state.sessions.get(key);
   if (!env.header?.x3dh) throw new Error('Kein X3DH-Header — Sitzung nicht rekonstruierbar');
   const { senderIK, senderEK, opkId } = env.header.x3dh;
-  const usedOpk = opkId ? state.identity.opks.get(opkId) : null;
-  const SK = await X3DH.responder(state.identity.IK, state.identity.SPK, usedOpk, senderIK, senderEK);
-  const st = Ratchet.initReceiver(SK, state.identity.SPK);
+
+  /* SPK muss pub-Key enthalten — nach Vault-Reload ggf. neu importieren */
+  let mySPK = state.identity.SPK;
+  if (!mySPK.pub) {
+    const pubJwk = mySPK.pubJwk || (() => { const j = {...mySPK.privJwk}; delete j.d; j.key_ops = []; return j; })();
+    mySPK = {
+      ...mySPK,
+      pub: await crypto.subtle.importKey('jwk', pubJwk, { name:'ECDH', namedCurve:'P-256' }, true, []),
+      pubJwk
+    };
+    state.identity.SPK = mySPK;
+  }
+
+  /* OPK: nach Reload nicht mehr im Speicher — Server hat ihn verbraucht,
+     wir bauen X3DH ohne OPK (3-DH statt 4-DH, immer noch sicher) */
+  const usedOpk = opkId ? (state.identity.opks.get(opkId) || null) : null;
+
+  const SK = await X3DH.responder(state.identity.IK, mySPK, usedOpk, senderIK, senderEK);
+  const st = Ratchet.initReceiver(SK, mySPK);
   state.sessions.set(key, st);
   if (usedOpk) state.identity.opks.delete(opkId);
-  /* FIX 1: Neue Empfänger-Session sofort speichern */
   await SessionStore.save(key, st);
   return st;
 }
