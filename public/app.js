@@ -771,7 +771,14 @@ async function openRatchet(env) {
     let st = state.sessions.get(key);
     if (!st) st = await ensureReceiverSession(env);
     const { x3dh, ...ratchetHeader } = env.header || {};
-    const assoc = `v1|${env.senderId}|${env.convId}`;
+    /* AAD muss identisch mit dem Sender sein.
+       Bei Sealed Sender ist senderId null — aus convId ableiten */
+    let senderId = env.senderId;
+    if (!senderId && env.convId && env.convId.startsWith('dm_')) {
+      const parts = env.convId.replace('dm_', '').split('_');
+      senderId = parts.find(p => p !== state.me.id) || '';
+    }
+    const assoc = `v1|${senderId}|${env.convId}`;
     const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
     await SessionStore.save(key, st);
     return td.decode(buf);
