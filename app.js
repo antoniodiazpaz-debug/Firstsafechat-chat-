@@ -78,7 +78,7 @@ const Vault = {
     localStorage.setItem('sc:token', meta.token);
     localStorage.setItem('sc:userName', meta.userName || '');
     localStorage.setItem('sc:email', meta.email || '');
-    localStorage.setItem('sc:keys', JSON.stringify({
+    localSttorage.setItem('sc:keys', JSON.stringify({
       IK:   identityStore.IK.privJwk,
       IKS:  identityStore.IKS.privJwk,
       SPK:  identityStore.SPK.privJwk,
