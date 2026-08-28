@@ -789,15 +789,21 @@ async function openRatchet(env) {
   try {
     const key = sk(env.senderId, env.senderDeviceId);
     let st = state.sessions.get(key);
-    /* Header könnte als String vom Server kommen — parsen falls nötig */
+    /* Header parsen — Server speichert ihn als JSON-String */
     if (typeof env.header === 'string') {
       try { env.header = JSON.parse(env.header); } catch {}
     }
-    /* Wenn X3DH-Header vorhanden → immer neue Session aufbauen.
-       Die bestehende Session im RAM gehört zu einer anderen Konversation. */
-    if (env.header?.x3dh) {
+    const hdr = env.header || {};
+    const hasX3dh = !!(hdr.x3dh || (typeof hdr === 'object' && Object.keys(hdr).includes('x3dh')));
+    const hdrType = typeof env.header;
+    const hdrKeys = typeof env.header === 'object' ? Object.keys(env.header || {}).join(',') : 'string';
+    /* Bei X3DH-Header immer neue Session */
+    if (hasX3dh) {
       state.sessions.delete(key);
       st = null;
+    } else if (!st) {
+      /* Kein X3DH aber auch keine Session — unmöglich zu entschlüsseln */
+      throw new Error('Keine Session + kein X3DH. hdrType:' + hdrType + ' hdrKeys:' + hdrKeys + ' hadSess:' + !!state.sessions.get(key));
     }
     if (!st) st = await ensureReceiverSession(env);
     const { x3dh, ...ratchetHeader } = env.header || {};
