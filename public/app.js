@@ -74,8 +74,14 @@ function showDiagPanel(text) {
 const Vault = {
   save(deviceId, identityStore, meta) {
     localStorage.setItem('sc:deviceId', deviceId);
-    localStorage.setItem('sc:token', meta.token);
-    localStorage.setItem('sc:userName', meta.userName || '');
+async _db() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('securechat', 1);
+    req.onupgradeneeded = e => e.target.result.createObjectStore('messages', { keyPath: 'deviceId' });
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = () => reject(req.error);
+  });
+}    localStorage.setItem('sc:userName', meta.userName || '');
     localStorage.setItem('sc:email', meta.email || '');
     localStorage.setItem('sc:keys', JSON.stringify({
       IK:   identityStore.IK.privJwk,
@@ -117,7 +123,14 @@ const Vault = {
       .filter(k => k.startsWith('securechat:vault:'))
       .forEach(k => localStorage.removeItem(k));
   },
-  async _db() { return null; }
+  async _db() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('securechat', 1);
+    req.onupgradeneeded = e => e.target.result.createObjectStore('messages', { keyPath: 'deviceId' });
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = () => reject(req.error);
+  });
+  }
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -991,7 +1004,7 @@ async function handleEnvelope(env, live) {
     }).then(r => r.ok ? r.json() : null).then(u => {
       if (u?.user?.name) { conv.name = u.user.name; renderMain(); }
     }).catch(() => {});
-  }
+       }
   LocalCache.scheduleSave();
 
   if (live) api.ackViaSocket([env.id]);
