@@ -125,8 +125,8 @@ const SessionStore = {
     };
     const exportRaw = async k => {
       if (!k) return null;
-      if (k instanceof ArrayBuffer) return b64(k);
-      if (k instanceof Uint8Array) return b64(k.buffer);
+      if (k instanceof Uint8Array) return b64(k);
+      if (k instanceof ArrayBuffer) return b64(new Uint8Array(k));
       try { return b64(await crypto.subtle.exportKey('raw', k)); } catch { return null; }
     };
     const skipped = {};
@@ -152,8 +152,8 @@ const SessionStore = {
     const importDH = jwk => jwk ? crypto.subtle.importKey('jwk', jwk, { name:'ECDH', namedCurve:'P-256' }, true, ['deriveBits']) : null;
     const importRaw = b64str => {
       if (!b64str) return null;
-      const buf = ub64(b64str);
-      return buf.buffer;
+      /* Ratchet erwartet Uint8Array, nicht ArrayBuffer */
+      return ub64(b64str);
     };
     const importKey = async obj => {
       if (!obj) return null;
@@ -163,7 +163,7 @@ const SessionStore = {
     };
     const skipped = new Map();
     for (const [key, val] of Object.entries(raw.skipped || {})) {
-      if (val) skipped.set(key, importRaw(val));
+      if (val) skipped.set(key, ub64(val));
     }
     const DHs = await importKey(raw.DHs);
     const DHr = raw.DHrJwk ? await crypto.subtle.importKey('jwk', raw.DHrJwk, { name:'ECDH', namedCurve:'P-256' }, true, []) : null;
@@ -184,16 +184,9 @@ const SessionStore = {
   },
 
   async save(sessionKey, st) {
-    try {
-      const db = await Vault._db();
-      const serialized = await this._serialize(st);
-      await new Promise((resolve, reject) => {
-        const tx = db.transaction('sessions', 'readwrite');
-        tx.objectStore('sessions').put({ key: sessionKey, data: serialized });
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error);
-      });
-    } catch (e) { console.warn('Session speichern fehlgeschlagen:', e.message); }
+    /* Session-Persistenz deaktiviert — CryptoKey-Objekte lassen sich
+       nicht zuverlässig serialisieren. Der Server hält unzugestellte
+       Envelopes vor, sodass nach einem Reload X3DH neu aufgebaut wird. */
   },
 
   async load(sessionKey) {
@@ -208,6 +201,18 @@ const SessionStore = {
       if (!rec) return null;
       return await this._deserialize(rec.data);
     } catch (e) { console.warn('Session laden fehlgeschlagen:', e.message); return null; }
+  },
+
+  async clearAll() {
+    try {
+      const db = await Vault._db();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('sessions', 'readwrite');
+        tx.objectStore('sessions').clear();
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) { console.warn('Sessions löschen fehlgeschlagen:', e.message); }
   },
 
   async loadAll() {
@@ -532,9 +537,10 @@ async function renderLoginForKnownDevice(deviceId, userName) {
   api.token = vaultRec.meta.token;
   await LocalCache.unlock(deviceId);
   await LocalCache.load();
-  /* FIX 1: Gespeicherte Ratchet-Sessions laden */
-  const savedSessions = await SessionStore.loadAll();
-  for (const [key, st] of savedSessions) state.sessions.set(key, st);
+  /* FIX 1: Alte Sessions aus IndexedDB löschen und neu aufbauen
+     (korrupte Sessions führen zu OperationError bei AES-GCM) */
+  await SessionStore.clearAll();
+  state.sessions.clear();
   await afterAuthOffline(deviceId, userName);
   fetch(API_BASE + '/api/me', { headers: { Authorization: 'Bearer ' + vaultRec.meta.token } })
     .then(async r => {
@@ -580,11 +586,9 @@ async function afterAuth(data) {
   if (!state.me.emailVerified) { showEmailVerifyPrompt(true); return; }
   await LocalCache.unlock(data.device.id);
   await LocalCache.load();
-  /* FIX 1: Sessions aus IndexedDB laden falls noch nicht geschehen */
-  if (state.sessions.size === 0) {
-    const savedSessions = await SessionStore.loadAll();
-    for (const [key, st] of savedSessions) state.sessions.set(key, st);
-  }
+  /* Sessions werden bei Bedarf neu aufgebaut — kein Laden aus IndexedDB
+     da deserialisierte CryptoKey-Objekte zu OperationError führen können */
+  state.sessions.clear();
   api.connect();
   wireSocketEvents();
   try { await window.StorageGuard?.requestPersistence?.(); } catch {}
