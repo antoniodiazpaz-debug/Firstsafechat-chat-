@@ -795,59 +795,34 @@ async function handleEnvelope(env, live) {
 
 /* FIX 1: openRatchet speichert Session nach Entschlüsselung */
 async function openRatchet(env) {
-  try {
-    const key = sk(env.senderId, env.senderDeviceId);
-    let st = state.sessions.get(key);
-    /* Header parsen — Server speichert ihn als JSON-String */
-    if (typeof env.header === 'string') {
-      try { env.header = JSON.parse(env.header); } catch {}
-    }
-    const hdr = env.header || {};
-    const hasX3dh = !!(hdr.x3dh || (typeof hdr === 'object' && Object.keys(hdr).includes('x3dh')));
-    const hdrType = typeof env.header;
-    const hdrKeys = typeof env.header === 'object' ? Object.keys(env.header || {}).join(',') : 'string';
-    /* Bei X3DH-Header immer neue Session */
-    if (hasX3dh) {
-      state.sessions.delete(key);
-      st = null;
-    } else if (!st) {
-      /* Kein X3DH aber auch keine Session — unmöglich zu entschlüsseln */
-      throw new Error('Keine Session + kein X3DH. hdrType:' + hdrType + ' hdrKeys:' + hdrKeys + ' hadSess:' + !!state.sessions.get(key));
-    }
-    if (!st) st = await ensureReceiverSession(env);
-    const { x3dh, ...ratchetHeader } = env.header || {};
-    /* AAD muss identisch mit dem Sender sein.
-       Bei Sealed Sender ist senderId null — aus convId ableiten */
-    let senderId = env.senderId;
-    if (!senderId && env.convId && env.convId.startsWith('dm_')) {
-      const parts = env.convId.replace('dm_', '').split('_');
-      senderId = parts.find(p => p !== state.me.id) || '';
-    }
-    const assoc = `v1|${senderId}|${env.convId}`;
-    let buf;
-    try {
-      buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
-    } catch(decErr) {
-      throw new Error('decrypt fehlgeschlagen'
-        + ' assoc:' + assoc
-        + ' convId:' + env.convId
-        + ' senderId:' + senderId
-        + ' me:' + state.me?.id
-        + ' Nr:' + st?.Nr
-        + ' Ns:' + st?.Ns
-        + ' DHrJwk:' + (st?.DHrJwk?.x||'null').slice(0,8)
-        + ' hdrDH:' + (ratchetHeader?.dh?.x||'null').slice(0,8)
-      );
-    }
-    await SessionStore.save(key, st);
-    return td.decode(buf);
-  } catch(e) {
-    const info = 'hadSess:' + !!state.sessions.get(sk(env.senderId, env.senderDeviceId))
-      + ' hdr:' + JSON.stringify(env.header).slice(0,80)
-      + ' err:[' + (e?.name||'?') + ']' + (e?.message||'leer')
-      + ' stack:' + String(e?.stack||'').slice(0,120);
-    throw new Error(info);
+  /* Header als String parsen falls nötig */
+  if (typeof env.header === 'string') {
+    try { env.header = JSON.parse(env.header); } catch {}
   }
+  const key = sk(env.senderId, env.senderDeviceId);
+  const hdr = env.header || {};
+
+  /* Bei X3DH-Header IMMER neue Session aufbauen — alte verwerfen */
+  if (hdr.x3dh) {
+    state.sessions.delete(key);
+  }
+
+  let st = state.sessions.get(key);
+  if (!st) st = await ensureReceiverSession(env);
+
+  const { x3dh, ...ratchetHeader } = hdr;
+
+  /* AAD: muss identisch mit Sender sein (v1|senderId|convId) */
+  let senderId = env.senderId;
+  if (!senderId && env.convId?.startsWith('dm_')) {
+    const parts = env.convId.replace('dm_', '').split('_');
+    senderId = parts.find(p => p !== state.me?.id) || parts[0] || '';
+  }
+  const assoc = `v1|${senderId}|${env.convId}`;
+
+  const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) }, assoc);
+  await SessionStore.save(key, st);
+  return td.decode(buf);
 }
 
 async function openSealed(env) {
