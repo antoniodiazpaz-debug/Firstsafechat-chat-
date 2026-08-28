@@ -730,7 +730,10 @@ async function handleEnvelope(env, live) {
   let plaintext = '[verschlüsselt]';
   try {
     plaintext = env.sealed ? await openSealed(env) : await openRatchet(env);
-  } catch (e) { console.warn('Entschlüsselung fehlgeschlagen:', e.message); plaintext = '⚠️ Nicht entschlüsselbar'; }
+  } catch (e) {
+    console.warn('Entschlüsselung fehlgeschlagen:', e.message);
+    plaintext = '⚠️ ' + e.message;
+  }
 
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
 
