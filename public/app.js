@@ -1212,11 +1212,18 @@ function renderMain() {
   }
   convs.sort((a, b) => (b.lastMsg?.ts || 0) - (a.lastMsg?.ts || 0));
 
+  const selMode = !!state.selectMode;
   main.innerHTML = `
+    ${selMode ? `
+      <div class="selectbar">
+        <button class="iconbtn" onclick="window.__app.exitSelectMode()">✕</button>
+        <span class="selectcount">${state.selectedConvs.size} ausgewählt</span>
+        <button class="iconbtn" onclick="window.__app.deleteSelectedChats()" aria-label="Löschen">🗑️</button>
+      </div>` : ''}
     <div class="scroll" style="height:100%;position:relative">
       ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') :
         `<div class="empty"><div class="ic">💬</div><div>Noch keine Chats.<br>Tippe auf + um zu starten.</div></div>`}
-      <div class="fab" onclick="window.__app.newChat()">💬</div>
+      ${!selMode ? `<div class="fab" onclick="window.__app.newChat()">💬</div>` : ''}
     </div>`;
   window.__conv = convs;
 }
@@ -1228,8 +1235,17 @@ function convRow(c, i) {
     : (name[0] || '?').toUpperCase();
   const unread = c.unread || 0;
   const preview = c.lastMsg ? esc(c.lastMsg.text).slice(0, 60) : 'Noch keine Nachrichten';
+  const selMode = !!state.selectMode;
+  const isSelected = state.selectedConvs?.has(c.convId);
+  const rowClick = selMode
+    ? `window.__app.toggleSelectConv('${c.convId}')`
+    : `window.__app.openConv(${i})`;
   return `
-    <div class="row" onclick="window.__app.openConv(${i})">
+    <div class="row ${isSelected ? 'row-selected' : ''}" onclick="${rowClick}"
+      oncontextmenu="window.__app.enterSelectMode('${c.convId}');return false;"
+      ontouchstart="window.__app.longPressStart('${c.convId}')"
+      ontouchend="window.__app.longPressEnd()" ontouchmove="window.__app.longPressEnd()">
+      ${selMode ? `<div class="selectcheck">${isSelected ? '✅' : '⭕'}</div>` : ''}
       <div class="av">${avatar}${c.isGroup ? '' : `<div class="dot ${c.online ? 'online' : 'offline'}"></div>`}</div>
       <div class="meta">
         <div class="l1"><span class="nm">${esc(name)}</span>
@@ -1240,6 +1256,47 @@ function convRow(c, i) {
     </div>`;
 }
 
+/* ── Auswahlmodus für die Chatliste (Long-Press oder Rechtsklick) ──
+   Touch-Long-Press wird über einen einfachen Timer nachgebildet, da
+   'contextmenu' auf Touch-Geräten unzuverlässig feuert. */
+let _longPressTimer = null;
+function longPressStart(convId) {
+  _longPressTimer = setTimeout(() => enterSelectMode(convId), 500);
+}
+function longPressEnd() {
+  if (_longPressTimer) { clearTimeout(_longPressTimer); _longPressTimer = null; }
+}
+function enterSelectMode(convId) {
+  state.selectMode = true;
+  if (!state.selectedConvs) state.selectedConvs = new Set();
+  state.selectedConvs.add(convId);
+  renderMain();
+}
+function exitSelectMode() {
+  state.selectMode = false;
+  state.selectedConvs = new Set();
+  renderMain();
+}
+function toggleSelectConv(convId) {
+  if (!state.selectedConvs) state.selectedConvs = new Set();
+  if (state.selectedConvs.has(convId)) state.selectedConvs.delete(convId);
+  else state.selectedConvs.add(convId);
+  if (state.selectedConvs.size === 0) { exitSelectMode(); return; }
+  renderMain();
+}
+function deleteSelectedChats() {
+  const count = state.selectedConvs.size;
+  if (!count) return;
+  if (!confirm(`${count} Chat${count > 1 ? 's' : ''} wirklich löschen? Nur lokal — der Gesprächspartner behält seine Kopie.`)) return;
+  for (const convId of state.selectedConvs) {
+    state.convs.delete(convId);
+    state.messages.delete(convId);
+  }
+  LocalCache.scheduleSave();
+  exitSelectMode();
+  toast(`${count} Chat${count > 1 ? 's' : ''} gelöscht`);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
    AKTIONEN, vom UI aufgerufen
    ═══════════════════════════════════════════════════════════════════════ */
@@ -1248,6 +1305,12 @@ const appActions = {
   onSearch(v) { state.search = v; renderMain(); },
   go(tab) { go(tab); },
   openConv(i) { const c = window.__conv[i]; openChat(c); },
+  enterSelectMode(convId) { enterSelectMode(convId); },
+  exitSelectMode() { exitSelectMode(); },
+  toggleSelectConv(convId) { toggleSelectConv(convId); },
+  deleteSelectedChats() { deleteSelectedChats(); },
+  longPressStart(convId) { longPressStart(convId); },
+  longPressEnd() { longPressEnd(); },
   newChat() { openNewChatSheet(); },
   openCamera() { toast('Kamera folgt in einem späteren Schritt'); },
   startCall(kind) {
@@ -1293,6 +1356,8 @@ const appActions = {
   reportUser() { reportUser(); },
   submitReport() { submitReport(); },
   attachSheet() { attachSheet(); },
+  shareLocation() { shareLocation(); },
+  shareContact() { shareContact(); },
   pickMedia(accept, kind) { pickMedia(accept, kind); },
   loadMedia(msgId) {
     for (const list of state.messages.values()) {
@@ -2149,23 +2214,33 @@ function attachSheet() {
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'attachSheet';
   sheet.onclick = e => { if (e.target === sheet) sheet.remove(); };
+  const item = (icon, label, onclick) => `
+    <button class="attachitem" onclick="${onclick}">
+      <span class="attachbtn3d">${icon}</span>
+      <span class="attachlabel">${label}</span>
+    </button>`;
   sheet.innerHTML = `
     <div class="sheetbox">
       <div class="grabber"></div>
-      <div class="row" style="padding:10px 0" onclick="window.__app.pickMedia('image/*','image')">
-        <div style="font-size:20px;width:32px">🖼️</div>
-        <div class="meta" style="border-bottom:none"><div class="l1"><span class="nm">Foto</span></div></div>
-      </div>
-      <div class="row" style="padding:10px 0" onclick="window.__app.pickMedia('video/*','video')">
-        <div style="font-size:20px;width:32px">🎬</div>
-        <div class="meta" style="border-bottom:none"><div class="l1"><span class="nm">Video</span></div></div>
-      </div>
-      <div class="row" style="padding:10px 0" onclick="window.__app.pickMedia('*/*','file')">
-        <div style="font-size:20px;width:32px">📄</div>
-        <div class="meta" style="border-bottom:none"><div class="l1"><span class="nm">Datei</span></div></div>
+      <div class="attachgrid">
+        ${item('📷', 'Kamera', "window.__app.pickMedia('image/*','image')")}
+        ${item('🖼️', 'Galerie', "window.__app.pickMedia('image/*','image')")}
+        ${item('🎬', 'Video', "window.__app.pickMedia('video/*','video')")}
+        ${item('📄', 'Datei', "window.__app.pickMedia('*/*','file')")}
+        ${item('📍', 'Standort', "window.__app.shareLocation()")}
+        ${item('👤', 'Kontakt', "window.__app.shareContact()")}
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
+}
+
+function shareLocation() {
+  document.getElementById('attachSheet')?.remove();
+  toast('Standort teilen folgt in einem späteren Schritt');
+}
+function shareContact() {
+  document.getElementById('attachSheet')?.remove();
+  toast('Kontakt teilen folgt in einem späteren Schritt');
 }
 
 function pickMedia(accept, kind) {

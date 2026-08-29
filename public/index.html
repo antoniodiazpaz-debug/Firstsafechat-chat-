@@ -55,6 +55,18 @@ img{max-width:100%}
 .menuitem:last-child{border-bottom:none}
 .menuitem:active{background:rgba(255,255,255,.04)}
 .mi-ic{font-size:20px;width:26px;text-align:center;flex-shrink:0}
+.attachgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:12px 4px}
+.attachitem{display:flex;flex-direction:column;align-items:center;gap:8px;background:none;border:none;cursor:pointer;color:var(--tx)}
+.attachbtn3d{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:24px;background:radial-gradient(circle at 35% 30%,#5b9bf5,#1d4ed8 70%);
+  border:2px solid #b8bcc0;box-shadow:0 3px 6px rgba(0,0,0,.4),inset 0 1px 1px rgba(255,255,255,.35)}
+.attachitem:active .attachbtn3d{transform:scale(.94)}
+.attachlabel{font-size:12.5px;color:var(--sub)}
+.selectbar{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--panel);
+  border-bottom:1px solid var(--line)}
+.selectcount{flex:1;font-size:15px;font-weight:600}
+.row-selected{background:rgba(0,168,132,.12)}
+.selectcheck{font-size:20px;margin-right:4px;flex-shrink:0}
 
 /* Suchleiste */
 .searchwrap{padding:0 16px 10px}
