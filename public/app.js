@@ -2214,6 +2214,14 @@ function attachSheet() {
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'attachSheet';
   sheet.onclick = e => { if (e.target === sheet) sheet.remove(); };
+  const svg = {
+    camera: '<svg viewBox="0 0 24 24" width="26" height="26" fill="#fff"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>',
+    gallery: '<svg viewBox="0 0 24 24" width="26" height="26" fill="#fff"><path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zm1 2v9.6l4.3-4.3a1 1 0 0 1 1.4 0L14 15.6l2.3-2.3a1 1 0 0 1 1.4 0L19 14.6V7H5zm4-.5a1.8 1.8 0 1 1 0 3.6 1.8 1.8 0 0 1 0-3.6z"/></svg>',
+    video: '<svg viewBox="0 0 24 24" width="26" height="26" fill="#fff"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>',
+    file: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L14.5 3z"/><path d="M14 3v6h6"/></svg>',
+    pin: '<svg viewBox="0 0 24 24" width="24" height="24" fill="#fff"><path d="M12 2a7 7 0 0 0-7 7c0 5.25 7 13 7 13s7-7.75 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg>',
+    contact: '<svg viewBox="0 0 24 24" width="24" height="24" fill="#fff"><path d="M12 2a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 12c5 0 9 2.5 9 5.5V22H3v-2.5C3 16.5 7 14 12 14z"/></svg>'
+  };
   const item = (icon, label, onclick) => `
     <button class="attachitem" onclick="${onclick}">
       <span class="attachbtn3d">${icon}</span>
@@ -2223,12 +2231,12 @@ function attachSheet() {
     <div class="sheetbox">
       <div class="grabber"></div>
       <div class="attachgrid">
-        ${item('📷', 'Kamera', "window.__app.pickMedia('image/*','image')")}
-        ${item('🖼️', 'Galerie', "window.__app.pickMedia('image/*','image')")}
-        ${item('🎬', 'Video', "window.__app.pickMedia('video/*','video')")}
-        ${item('📄', 'Datei', "window.__app.pickMedia('*/*','file')")}
-        ${item('📍', 'Standort', "window.__app.shareLocation()")}
-        ${item('👤', 'Kontakt', "window.__app.shareContact()")}
+        ${item(svg.camera, 'Kamera', "window.__app.pickMedia('image/*','image')")}
+        ${item(svg.gallery, 'Galerie', "window.__app.pickMedia('image/*','image')")}
+        ${item(svg.video, 'Video', "window.__app.pickMedia('video/*','video')")}
+        ${item(svg.file, 'Datei', "window.__app.pickMedia('*/*','file')")}
+        ${item(svg.pin, 'Standort', "window.__app.shareLocation()")}
+        ${item(svg.contact, 'Kontakt', "window.__app.shareContact()")}
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
