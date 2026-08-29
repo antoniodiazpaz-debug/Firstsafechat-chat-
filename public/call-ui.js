@@ -318,8 +318,12 @@ function injectStyles() {
     .call-actions-connected{gap:20px}
     .call-btn{width:60px;height:60px;border-radius:50%;border:none;font-size:24px;
       display:flex;align-items:center;justify-content:center;cursor:pointer}
-    .call-btn-accept{background:#25d366;color:#04231a}
-    .call-btn-reject,.call-btn-end{background:#f15c6d;color:#fff}
+    .call-btn-accept{background:radial-gradient(circle at 35% 30%,#4ade80,#16a34a 70%);
+      color:#04231a;border:2px solid rgba(255,255,255,.4);
+      box-shadow:0 3px 6px rgba(0,0,0,.4),inset 0 1px 1px rgba(255,255,255,.3)}
+    .call-btn-reject,.call-btn-end{background:radial-gradient(circle at 35% 30%,#f87171,#dc2626 70%);
+      color:#fff;border:2px solid rgba(255,255,255,.4);
+      box-shadow:0 3px 6px rgba(0,0,0,.4),inset 0 1px 1px rgba(255,255,255,.3)}
     .call-btn-secondary{background:var(--panel2,#182229);color:var(--tx,#e9edef);width:52px;height:52px;font-size:20px}
     .call-btn-active{background:#f15c6d;color:#fff}
     .call-toast{position:fixed;top:24px;left:50%;transform:translateX(-50%);

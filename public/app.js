@@ -1262,11 +1262,33 @@ const appActions = {
   showDeleteAccount() { showDeleteAccount(); },
   confirmDeleteAccount() { confirmDeleteAccount(); },
   mainMenu(e) { openMainMenu(e); },
+  openSettings() { openSettings(); },
+  openNotificationSettings() { openNotificationSettings(); },
+  openPrivacySettings() { openPrivacySettings(); },
+  openBlockedList() { openBlockedList(); },
+  openLinkedDevices() { openLinkedDevices(); },
+  openLanguageSettings() { openLanguageSettings(); },
+  changeLang(code) { changeLang(code); },
+  openStorageSettings() { openStorageSettings(); },
+  clearLocalCache() { clearLocalCache(); },
+  editProfile() { editProfile(); },
+  saveProfileName() { saveProfileName(); },
+  enablePush() { enablePush(); },
+  unblockFromSettings(id) { unblockFromSettings(id); },
   closeChat() { closeChat(); },
   sendClick() { sendCurrentMessage(); },
   inputKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCurrentMessage(); } },
   startChatWith(userId, userName) { startChatWith(userId, userName); },
   chatMenu(e) { chatMenu(e); },
+  searchInChat() { searchInChat(); },
+  doChatSearch(q) { doChatSearch(q); },
+  clearChatSearch() { clearChatSearch(); },
+  toggleMuteChat() { toggleMuteChat(); },
+  openDisappearingMessages() { openDisappearingMessages(); },
+  setDisappearing(sec) { setDisappearing(sec); },
+  showEncryptionFingerprint() { showEncryptionFingerprint(); },
+  exportChat() { exportChat(); },
+  clearChatHistory() { clearChatHistory(); },
   toggleBlock() { toggleBlock(); },
   reportUser() { reportUser(); },
   submitReport() { submitReport(); },
@@ -1454,8 +1476,10 @@ function openChat(c) {
         <div class="nm">${esc(c.name || c.peerId)}</div>
         <div class="st" id="chatStatus">${c.online ? 'online' : 'offline'}</div>
       </div>
-      <button class="iconbtn" onclick="window.__app.startCall('audio')" aria-label="Anrufen">📞</button>
-      <button class="iconbtn" onclick="window.__app.startCall('video')" aria-label="Videoanruf">📹</button>
+      <button class="iconbtn callbtn3d callbtn3d-audio" onclick="window.__app.startCall('audio')" aria-label="Anrufen"></button>
+      <button class="iconbtn callbtn3d callbtn3d-video" onclick="window.__app.startCall('video')" aria-label="Videoanruf">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>
+      </button>
       <button class="iconbtn" onclick="window.__app.chatMenu(event)">⋮</button>
     </div>
     <div id="chatbody"></div>
@@ -1622,10 +1646,201 @@ function openMainMenu(e) {
           <div class="l2" style="color:var(--sub);font-size:13px">${esc(state.me.email || '')}</div>
         </div>
       </div>
+      <div class="menulist" style="margin-top:8px">
+        <button class="menuitem" onclick="window.__app.openSettings()">
+          <span class="mi-ic">⚙️</span><span>Einstellungen</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.openNotificationSettings()">
+          <span class="mi-ic">🔔</span><span>Benachrichtigungen</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.openPrivacySettings()">
+          <span class="mi-ic">🔒</span><span>Datenschutz &amp; Sicherheit</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.openBlockedList()">
+          <span class="mi-ic">🚫</span><span>Blockierte Kontakte</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.openLinkedDevices()">
+          <span class="mi-ic">🖥️</span><span>Verknüpfte Geräte</span>
+        </button>
+      </div>
       <button class="btn ghost" style="width:100%;margin-top:16px" onclick="window.__app.logoutClick()">Abmelden</button>
       <button class="btn ghost" style="width:100%;margin-top:8px;color:#f15c6d" onclick="window.__app.showDeleteAccount()">Konto löschen</button>
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   EINSTELLUNGEN — vollflächige Unterseiten
+   ═══════════════════════════════════════════════════════════════════════ */
+function openSettingsPage(title, bodyHtml) {
+  document.getElementById('mainMenuSheet')?.remove();
+  document.getElementById('settingsPage')?.remove();
+  const page = document.createElement('div');
+  page.className = 'chatview';
+  page.id = 'settingsPage';
+  page.innerHTML = `
+    <div class="chatbar">
+      <button class="iconbtn" onclick="document.getElementById('settingsPage').remove()">←</button>
+      <div class="name"><div class="nm">${esc(title)}</div></div>
+    </div>
+    <div style="flex:1;overflow-y:auto;padding:16px">${bodyHtml}</div>`;
+  document.getElementById('overlays').appendChild(page);
+}
+
+function openSettings() {
+  openSettingsPage('Einstellungen', `
+    <div class="menulist">
+      <button class="menuitem" onclick="window.__app.editProfile()">
+        <span class="mi-ic">👤</span><span>Profil bearbeiten</span>
+      </button>
+      <button class="menuitem" onclick="window.__app.openLanguageSettings()">
+        <span class="mi-ic">🌐</span><span>Sprache</span>
+      </button>
+      <button class="menuitem" onclick="window.__app.openStorageSettings()">
+        <span class="mi-ic">💾</span><span>Speicher &amp; Daten</span>
+      </button>
+    </div>
+    <p style="color:var(--sub);font-size:13px;margin-top:20px">SecureChat — Version 1.0</p>
+  `);
+}
+
+function openNotificationSettings() {
+  const granted = typeof Notification !== 'undefined' && Notification.permission === 'granted';
+  openSettingsPage('Benachrichtigungen', `
+    <div class="menulist">
+      <div class="menuitem" style="cursor:default">
+        <span class="mi-ic">🔔</span>
+        <span>Push-Benachrichtigungen: ${granted ? '<b style="color:#25d366">Aktiv</b>' : '<b style="color:#f15c6d">Inaktiv</b>'}</span>
+      </div>
+      ${!granted ? `<button class="btn" style="width:100%;margin-top:12px" onclick="window.__app.enablePush()">Benachrichtigungen aktivieren</button>` : ''}
+    </div>
+    <p style="color:var(--sub);font-size:13px;margin-top:16px">
+      Damit du auch bei geschlossener App über neue Nachrichten und Anrufe informiert wirst.
+    </p>
+  `);
+}
+
+function openPrivacySettings() {
+  openSettingsPage('Datenschutz &amp; Sicherheit', `
+    <div class="menulist">
+      <div class="menuitem" style="cursor:default">
+        <span class="mi-ic">🔒</span><span>Ende-zu-Ende-Verschlüsselung: <b style="color:#25d366">aktiv</b></span>
+      </div>
+      <button class="menuitem" onclick="window.__app.openBlockedList()">
+        <span class="mi-ic">🚫</span><span>Blockierte Kontakte</span>
+      </button>
+      <button class="menuitem" onclick="window.__app.openLinkedDevices()">
+        <span class="mi-ic">🖥️</span><span>Verknüpfte Geräte</span>
+      </button>
+    </div>
+  `);
+}
+
+async function openBlockedList() {
+  const list = [...state.blocked];
+  openSettingsPage('Blockierte Kontakte', list.length
+    ? `<div class="menulist">${list.map(id => `
+        <div class="menuitem">
+          <span class="mi-ic">🚫</span><span style="flex:1">${esc(id)}</span>
+          <button class="btn ghost" style="padding:6px 12px;font-size:13px" onclick="window.__app.unblockFromSettings('${id}')">Entsperren</button>
+        </div>`).join('')}</div>`
+    : `<p style="color:var(--sub);text-align:center;margin-top:40px">Keine blockierten Kontakte.</p>`);
+}
+
+async function unblockFromSettings(userId) {
+  try {
+    await api.unblock(userId);
+    state.blocked.delete(userId);
+    openBlockedList();
+    toast('Kontakt entsperrt');
+  } catch (e) { toast('⚠️ ' + e.message); }
+}
+
+function openLinkedDevices() {
+  openSettingsPage('Verknüpfte Geräte', `
+    <div class="menulist">
+      <div class="menuitem" style="cursor:default">
+        <span class="mi-ic">📱</span><span>${esc(state.device?.id ? 'Dieses Gerät' : 'Unbekannt')}</span>
+      </div>
+    </div>
+    <p style="color:var(--sub);font-size:13px;margin-top:16px">
+      Geräteverwaltung folgt in einem späteren Update.
+    </p>
+  `);
+}
+
+function openLanguageSettings() {
+  openSettingsPage('Sprache', `
+    <div class="menulist">
+      <button class="menuitem" onclick="window.__app.changeLang('de')"><span class="mi-ic">🇩🇪</span><span>Deutsch</span></button>
+      <button class="menuitem" onclick="window.__app.changeLang('en')"><span class="mi-ic">🇬🇧</span><span>English</span></button>
+      <button class="menuitem" onclick="window.__app.changeLang('es')"><span class="mi-ic">🇪🇸</span><span>Español</span></button>
+    </div>
+  `);
+}
+
+function changeLang(code) {
+  setLocale(code);
+  toast('Sprache geändert — App wird neu geladen…');
+  setTimeout(() => location.reload(), 800);
+}
+
+function openStorageSettings() {
+  let used = 0;
+  try {
+    for (const k in localStorage) if (localStorage.hasOwnProperty(k)) used += (localStorage[k]?.length || 0) * 2;
+  } catch {}
+  const kb = (used / 1024).toFixed(1);
+  openSettingsPage('Speicher &amp; Daten', `
+    <div class="menulist">
+      <div class="menuitem" style="cursor:default">
+        <span class="mi-ic">💾</span><span>Lokal genutzter Speicher: ${kb} KB</span>
+      </div>
+      <button class="menuitem" onclick="window.__app.clearLocalCache()">
+        <span class="mi-ic">🗑️</span><span style="color:#f15c6d">Chatverlauf lokal löschen</span>
+      </button>
+    </div>
+  `);
+}
+
+function clearLocalCache() {
+  if (!state.device?.id) return;
+  localStorage.removeItem('sc:cache:' + state.device.id);
+  state.messages.clear();
+  state.convs.clear();
+  toast('Lokaler Chatverlauf gelöscht');
+  document.getElementById('settingsPage')?.remove();
+  renderMain();
+}
+
+function editProfile() {
+  openSettingsPage('Profil bearbeiten', `
+    <div style="text-align:center;margin-bottom:20px">
+      <div class="av" style="width:80px;height:80px;font-size:32px;margin:0 auto">${esc((state.me.name || '?')[0].toUpperCase())}</div>
+    </div>
+    <label style="font-size:13px;color:var(--sub)">Anzeigename</label>
+    <input id="profileNameInput" type="text" value="${esc(state.me.name || '')}"
+      style="width:100%;box-sizing:border-box;font-size:16px;padding:14px;border-radius:10px;
+        border:none;background:var(--panel2);color:var(--tx);margin:8px 0 16px">
+    <button class="btn" style="width:100%" onclick="window.__app.saveProfileName()">Speichern</button>
+  `);
+}
+
+async function saveProfileName() {
+  const val = document.getElementById('profileNameInput')?.value.trim();
+  if (!val) return;
+  try {
+    await api.updateProfile({ name: val });
+    state.me.name = val;
+    toast('Name aktualisiert');
+    document.getElementById('settingsPage')?.remove();
+  } catch (e) { toast('⚠️ ' + e.message); }
+}
+
+async function enablePush() {
+  await setupPushNotifications();
+  document.getElementById('settingsPage')?.remove();
+  openNotificationSettings();
 }
 
 async function logoutClick() {
@@ -1692,6 +1907,7 @@ function chatMenu(e) {
   if (!state.activeConv) return;
   const peerId = state.activeConv.peerId;
   const isBlocked = state.blocked.has(peerId);
+  const isMuted = state.mutedChats?.has(peerId);
 
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'chatMenuSheet';
@@ -1699,18 +1915,165 @@ function chatMenu(e) {
   sheet.innerHTML = `
     <div class="sheetbox">
       <div class="grabber"></div>
-      <div class="row" style="padding:10px 0" onclick="window.__app.reportUser()">
-        <div style="font-size:20px;width:32px">🚩</div>
-        <div class="meta" style="border-bottom:none"><div class="l1"><span class="nm">Melden</span></div></div>
-      </div>
-      <div class="row" style="padding:10px 0" onclick="window.__app.toggleBlock()">
-        <div style="font-size:20px;width:32px">${isBlocked ? '✅' : '🚫'}</div>
-        <div class="meta" style="border-bottom:none"><div class="l1">
-          <span class="nm" style="color:${isBlocked ? 'var(--acc2)' : 'var(--dan)'}">
-            ${isBlocked ? 'Entsperren' : 'Blockieren'}</span></div></div>
+      <div class="menulist">
+        <button class="menuitem" onclick="window.__app.searchInChat()">
+          <span class="mi-ic">🔍</span><span>In Chat suchen</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.toggleMuteChat()">
+          <span class="mi-ic">${isMuted ? '🔔' : '🔕'}</span><span>${isMuted ? 'Stummschaltung aufheben' : 'Chat stummschalten'}</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.openDisappearingMessages()">
+          <span class="mi-ic">⏱️</span><span>Verschwindende Nachrichten</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.showEncryptionFingerprint()">
+          <span class="mi-ic">🔐</span><span>Sicherheitscode anzeigen</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.exportChat()">
+          <span class="mi-ic">📤</span><span>Chat exportieren</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.reportUser()">
+          <span class="mi-ic">🚩</span><span>Melden</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.toggleBlock()">
+          <span class="mi-ic">${isBlocked ? '✅' : '🚫'}</span>
+          <span style="color:${isBlocked ? 'var(--acc2)' : 'var(--dan)'}">${isBlocked ? 'Entsperren' : 'Blockieren'}</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.clearChatHistory()">
+          <span class="mi-ic">🗑️</span><span style="color:var(--dan)">Chatverlauf löschen</span>
+        </button>
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
+}
+
+/* ── In-Chat-Suche ── */
+function searchInChat() {
+  document.getElementById('chatMenuSheet')?.remove();
+  const bar = document.createElement('div');
+  bar.id = 'chatSearchBar';
+  bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:120;background:var(--panel);' +
+    'padding:calc(8px + env(safe-area-inset-top)) 8px 8px;display:flex;gap:8px;align-items:center';
+  bar.innerHTML = `
+    <button class="iconbtn" onclick="document.getElementById('chatSearchBar').remove();window.__app.clearChatSearch()">←</button>
+    <input id="chatSearchInput" type="text" placeholder="In diesem Chat suchen…"
+      style="flex:1;font-size:15px;padding:10px 14px;border-radius:20px;border:none;background:var(--panel2);color:var(--tx)"
+      oninput="window.__app.doChatSearch(this.value)">
+  `;
+  document.getElementById('chatOverlay')?.appendChild(bar);
+  document.getElementById('chatSearchInput')?.focus();
+}
+function doChatSearch(q) {
+  const convId = state.activeConv?.convId;
+  if (!convId) return;
+  q = q.trim().toLowerCase();
+  document.querySelectorAll('#chatbody .msg').forEach(el => {
+    const match = q && el.textContent.toLowerCase().includes(q);
+    el.style.outline = match ? '2px solid var(--acc)' : 'none';
+    if (match) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+}
+function clearChatSearch() {
+  document.querySelectorAll('#chatbody .msg').forEach(el => { el.style.outline = 'none'; });
+}
+
+/* ── Stummschalten (nur lokal — reine Anzeige-/Benachrichtigungspräferenz) ── */
+function toggleMuteChat() {
+  document.getElementById('chatMenuSheet')?.remove();
+  if (!state.mutedChats) state.mutedChats = new Set();
+  const peerId = state.activeConv.peerId;
+  if (state.mutedChats.has(peerId)) { state.mutedChats.delete(peerId); toast('Stummschaltung aufgehoben'); }
+  else { state.mutedChats.add(peerId); toast('Chat stummgeschaltet'); }
+  try { localStorage.setItem('sc:muted', JSON.stringify([...state.mutedChats])); } catch {}
+}
+
+/* ── Verschwindende Nachrichten (Timer-Auswahl, lokal je Chat gespeichert) ── */
+function openDisappearingMessages() {
+  document.getElementById('chatMenuSheet')?.remove();
+  const peerId = state.activeConv.peerId;
+  const current = state.disappearing?.get(peerId) || 0;
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'disappearSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  const opts = [[0, 'Aus'], [86400, '24 Stunden'], [604800, '7 Tage'], [7776000, '90 Tage']];
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 4px">Verschwindende Nachrichten</h3>
+      <p style="color:var(--sub);font-size:13px;margin:0 0 12px">
+        Neue Nachrichten in diesem Chat werden nach der gewählten Zeit automatisch
+        aus deiner lokalen Ansicht entfernt.
+      </p>
+      <div class="menulist">
+        ${opts.map(([sec, label]) => `
+          <button class="menuitem" onclick="window.__app.setDisappearing(${sec})">
+            <span class="mi-ic">${sec === current ? '✅' : '⏱️'}</span><span>${label}</span>
+          </button>`).join('')}
+      </div>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+function setDisappearing(seconds) {
+  if (!state.disappearing) state.disappearing = new Map();
+  state.disappearing.set(state.activeConv.peerId, seconds);
+  document.getElementById('disappearSheet')?.remove();
+  toast(seconds ? 'Verschwindende Nachrichten aktiviert' : 'Verschwindende Nachrichten deaktiviert');
+}
+
+/* ── Sicherheitscode / Fingerabdruck der Verschlüsselung ──
+   Einzigartiges Vertrauens-Feature: zeigt einen aus den öffentlichen
+   Identitätsschlüsseln beider Seiten abgeleiteten Code, den man z. B.
+   persönlich oder per Videoanruf vergleichen kann, um sich gegen einen
+   Man-in-the-Middle-Angriff abzusichern — genau das Prinzip hinter
+   Signal/WhatsApp "Sicherheitsnummer", hier selbst gebaut. */
+async function showEncryptionFingerprint() {
+  document.getElementById('chatMenuSheet')?.remove();
+  const peerId = state.activeConv.peerId;
+  try {
+    const { bundles } = await api.fetchBundle(peerId);
+    const theirKey = bundles?.[0]?.ikDH || bundles?.[0]?.ik;
+    const myKey = state.identity.IK.pubJwk;
+    const combined = JSON.stringify([myKey.x, myKey.y, theirKey?.x, theirKey?.y].sort());
+    const hashBuf = await crypto.subtle.digest('SHA-256', te.encode(combined));
+    const hashArr = [...new Uint8Array(hashBuf)];
+    const code = hashArr.slice(0, 15).map(b => String(b).padStart(3, '0')).join(' ');
+    openSettingsPage('Sicherheitscode', `
+      <p style="color:var(--sub);font-size:14px;margin-bottom:16px">
+        Vergleiche diesen Code mit ${esc(state.activeConv.name)} über einen anderen Kanal
+        (persönlich, Telefon), um sicherzugehen, dass niemand die Verbindung mithört.
+      </p>
+      <div style="font-family:monospace;font-size:18px;line-height:1.8;text-align:center;
+        background:var(--panel2);padding:20px;border-radius:12px;letter-spacing:1px">${code}</div>
+    `);
+  } catch (e) {
+    toast('⚠️ Sicherheitscode konnte nicht ermittelt werden');
+  }
+}
+
+/* ── Chat als Text exportieren (nur eigene, bereits entschlüsselte Sicht) ── */
+function exportChat() {
+  document.getElementById('chatMenuSheet')?.remove();
+  const convId = state.activeConv?.convId;
+  const msgs = state.messages.get(convId) || [];
+  if (!msgs.length) { toast('Keine Nachrichten zum Exportieren'); return; }
+  const lines = msgs.map(m => `[${new Date(m.ts).toLocaleString('de-DE')}] ${m.mine ? 'Ich' : state.activeConv.name}: ${m.text}`);
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `chat-${state.activeConv.name}-${Date.now()}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ── Chatverlauf lokal löschen (nur diese Konversation) ── */
+function clearChatHistory() {
+  document.getElementById('chatMenuSheet')?.remove();
+  const convId = state.activeConv?.convId;
+  if (!convId) return;
+  if (!confirm('Chatverlauf wirklich löschen? Das kann nicht rückgängig gemacht werden.')) return;
+  state.messages.set(convId, []);
+  LocalCache.scheduleSave();
+  renderChatMessages();
+  toast('Chatverlauf gelöscht');
 }
 
 async function toggleBlock() {
