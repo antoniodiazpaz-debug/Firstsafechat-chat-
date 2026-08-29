@@ -284,6 +284,55 @@ async function loadSessions() {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   PUSH-BENACHRICHTIGUNGEN — App bleibt "erreichbar" auch geschlossen
+   ─────────────────────────────────────────────────────────────────────
+   Ein Browser-Tab kann im Hintergrund keinen WebSocket offen halten —
+   das ist eine Grenze der Plattform, keine Design-Entscheidung. Die
+   einzige Möglichkeit, den Nutzer bei geschlossener App zu erreichen,
+   ist eine Push-Benachrichtigung über den Service Worker (funktioniert
+   auch, wenn kein Tab offen ist). Der Server weiß dabei nie, WAS in der
+   Nachricht steht — nur DASS eine da ist (siehe server.js notifyOffline
+   und sw.js für die Begründung). */
+async function setupPushNotifications() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  try {
+    const reg = await navigator.serviceWorker.register('/sw.js');
+
+    if (Notification.permission === 'default') {
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') return;
+    }
+    if (Notification.permission !== 'granted') return;
+
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const { publicKey } = await (await fetch(API_BASE + '/api/push/vapid-key')).json();
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey)
+      });
+    }
+    const json = sub.toJSON();
+    await fetch(API_BASE + '/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + api.token },
+      body: JSON.stringify({
+        platform: 'web', endpoint: json.endpoint,
+        p256dh: json.keys?.p256dh, auth: json.keys?.auth
+      })
+    });
+  } catch (e) {
+    console.warn('Push-Registrierung fehlgeschlagen:', e.message);
+  }
+}
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
+}
+
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -307,9 +356,10 @@ function updateOfflineBanner() {
     if (!bar) {
       const el = document.createElement('div');
       el.id = 'offlineBar';
-      el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:900;' +
+      el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9500;' +
         'background:var(--warn);color:#3a2a00;text-align:center;font-size:12.5px;' +
-        'font-weight:600;padding:6px 12px;padding-top:calc(6px + env(safe-area-inset-top))';
+        'font-weight:600;padding:6px 12px;padding-top:calc(6px + env(safe-area-inset-top));' +
+        'transform:translateZ(0);will-change:transform';
       el.textContent = '⚠️ Keine Verbindung — Nachrichten werden gesendet, sobald du wieder online bist';
       document.body.prepend(el);
     }
@@ -766,6 +816,7 @@ async function afterAuth(data) {
 
   api.connect();
   wireSocketEvents();
+  setupPushNotifications().catch(() => {});
 
   try { await window.StorageGuard?.requestPersistence?.(); } catch {}
   await loadBlockList();
