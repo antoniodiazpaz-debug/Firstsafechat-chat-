@@ -1897,6 +1897,8 @@ server.on('upgrade', async (req, sock) => {
   sock.setNoDelay(true);
 
   const uid = s.user_id, did = s.device_id;
+  const connectedUser = await q.userById.get(uid);
+  const myName = connectedUser?.name || uid;
   if (!live.has(did)) live.set(did, new Set());
   live.get(did).add(sock);
   deviceOwner.set(did, uid);
@@ -1950,7 +1952,7 @@ server.on('upgrade', async (req, sock) => {
        Anrufs nicht versehentlich einen neuen beeinflussen. */
     } else if (msg.type === 'call-offer' && msg.to && msg.callId && msg.sdp) {
       const online = deliverToUser(msg.to, {
-        type: 'call-offer', from: uid, fromDeviceId: did,
+        type: 'call-offer', from: uid, fromName: myName, fromDeviceId: did,
         callId: msg.callId, kind: msg.kind === 'video' ? 'video' : 'audio', sdp: msg.sdp
       });
       /* Empfänger komplett offline -> Anrufer muss das SOFORT erfahren,
