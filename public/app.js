@@ -1472,6 +1472,28 @@ function openChat(c) {
     </div>`;
   document.getElementById('overlays').appendChild(overlay);
 
+  /* Android/Chrome verschiebt bei geöffneter Tastatur den sichtbaren
+     Viewport, ohne dass CSS position:fixed zuverlässig darauf reagiert
+     (bekannter Chrome-Bug: fixed-Elemente bleiben am Layout-Viewport,
+     nicht am visuellen). visualViewport meldet die tatsächlich
+     sichtbare Höhe/Position — darüber wird die Chatbar aktiv
+     nachgeführt, statt sich auf CSS allein zu verlassen. */
+  const chatbarEl = overlay.querySelector('.chatbar');
+  const fixChatbarPosition = () => {
+    if (!chatbarEl || !window.visualViewport) return;
+    const vv = window.visualViewport;
+    chatbarEl.style.top = vv.offsetTop + 'px';
+  };
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fixChatbarPosition);
+    window.visualViewport.addEventListener('scroll', fixChatbarPosition);
+    overlay._vvCleanup = () => {
+      window.visualViewport.removeEventListener('resize', fixChatbarPosition);
+      window.visualViewport.removeEventListener('scroll', fixChatbarPosition);
+    };
+    fixChatbarPosition();
+  }
+
   ensureSessions(c.peerId).catch(e => toast('⚠️ ' + e.message));
   renderChatMessages();
   $('#msgInput')?.focus();
@@ -1479,6 +1501,7 @@ function openChat(c) {
 
 function closeChat() {
   const overlay = document.getElementById('chatOverlay');
+  overlay?._vvCleanup?.();
   overlay?.remove();
   state.view = 'list';
   state.activeConv = null;
