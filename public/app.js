@@ -1147,10 +1147,10 @@ function renderShell() {
     <div class="topbar">
       <h1>SecureChat</h1>
       <div class="topicons">
-        <button class="iconbtn" onclick="window.__app.openCamera()" aria-label="Kamera">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+        <button class="iconbtn navbtn3d" onclick="window.__app.openCamera()" aria-label="Kamera">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
         </button>
-        <button class="iconbtn" onclick="window.__app.mainMenu(event)">⋮</button>
+        <button class="iconbtn navbtn3d" onclick="window.__app.mainMenu(event)" style="font-size:18px;color:#fff">⋮</button>
       </div>
     </div>
     <div class="searchwrap">
@@ -1180,10 +1180,10 @@ function renderPills() {
 function renderNav() {
   const totalUnread = [...state.convs.values()].reduce((a, c) => a + (c.unread || 0), 0);
   const svg = {
-    chats: '<svg viewBox="0 0 24 24" width="23" height="23" fill="currentColor"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2z"/></svg>',
-    updates: '<svg viewBox="0 0 24 24" width="23" height="23" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg>',
-    communities: '<svg viewBox="0 0 24 24" width="23" height="23" fill="currentColor"><circle cx="8" cy="8" r="3.2"/><circle cx="16.5" cy="9" r="2.6"/><path d="M2 20c0-3.5 3-6 6-6s6 2.5 6 6H2z"/><path d="M14 20c.2-2.5 1.5-4.5 3.3-5.5 2.5.3 4.7 2.3 4.7 5.5h-8z"/></svg>',
-    calls: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg>'
+    chats: '<svg viewBox="0 0 24 24" width="20" height="20" fill="#fff"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2z"/></svg>',
+    updates: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="#fff" stroke="none"/></svg>',
+    communities: '<svg viewBox="0 0 24 24" width="20" height="20" fill="#fff"><circle cx="8" cy="8" r="3.2"/><circle cx="16.5" cy="9" r="2.6"/><path d="M2 20c0-3.5 3-6 6-6s6 2.5 6 6H2z"/><path d="M14 20c.2-2.5 1.5-4.5 3.3-5.5 2.5.3 4.7 2.3 4.7 5.5h-8z"/></svg>',
+    calls: '<svg viewBox="0 0 24 24" width="19" height="19" fill="#fff"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg>'
   };
   const tabs = [
     ['chats', svg.chats, 'Chats', totalUnread],
@@ -1193,8 +1193,8 @@ function renderNav() {
   ];
   $('#navbar').innerHTML = tabs.map(([id, ic, lb, bdg]) => `
     <button class="${state.tab === id ? 'on' : ''}" onclick="window.__app.go('${id}')">
-      <span class="navic">${ic}</span><span class="navlb">${lb}</span>
-      ${bdg ? `<span class="navbdg"></span>` : ''}
+      <span class="navbtn3d ${state.tab === id ? 'navbtn3d-on' : ''}">${ic}${bdg ? `<span class="navbdg"></span>` : ''}</span>
+      <span class="navlb">${lb}</span>
     </button>`).join('');
 }
 
