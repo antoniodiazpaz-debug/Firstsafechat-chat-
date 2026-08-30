@@ -89,6 +89,12 @@ CREATE TABLE IF NOT EXISTS users (
      is_email_verified prüfen. */
   email_verified   INTEGER DEFAULT 0,
   phone_verified   INTEGER DEFAULT 0,   -- nur über WebOTP im Browser möglich, siehe unten
+  /* Datenschutz-Präferenz: wenn 0, unterdrückt broadcastPresence()
+     die Online/Zuletzt-online-Anzeige dieses Nutzers gegenüber ALLEN
+     anderen — kein Ausnahmefall pro Kontakt, das würde die Logik
+     unnötig verkomplizieren und ist auch bei anderen Messengern die
+     übliche Alles-oder-nichts-Einstellung. */
+  show_last_seen   INTEGER DEFAULT 1,
   created_at    BIGINT NOT NULL,
   last_seen     BIGINT NOT NULL
 );
@@ -372,6 +378,7 @@ const q = {
   deleteUser:   db.prepare('DELETE FROM users WHERE id=?'),
   touchUser:    db.prepare('UPDATE users SET last_seen=? WHERE id=?'),
   updateProfile:db.prepare('UPDATE users SET name=?,bio=?,phone=? WHERE id=?'),
+  setShowLastSeen: db.prepare('UPDATE users SET show_last_seen=? WHERE id=?'),
   updateAvatar: db.prepare('UPDATE users SET avatar_path=? WHERE id=?'),
   markEmailVerified: db.prepare('UPDATE users SET email_verified=1 WHERE id=?'),
   markPhoneVerified: db.prepare('UPDATE users SET phone_verified=1 WHERE id=?'),
@@ -433,6 +440,7 @@ const q = {
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`),
   pending:      db.prepare('SELECT * FROM envelopes WHERE recipient_device_id=? AND acked=0 ORDER BY sent_at'),
   ackEnvelope:  db.prepare('UPDATE envelopes SET acked=1, delivered_at=? WHERE id=? AND recipient_device_id=?'),
+  envelopeById: db.prepare('SELECT id, sender_id, conv_id FROM envelopes WHERE id=?'),
   purgeAcked:   db.prepare('DELETE FROM envelopes WHERE acked=1 AND delivered_at < ?'),
 
   ktCount:      db.prepare('SELECT COUNT(*) AS n FROM kt_entries'),
@@ -940,10 +948,15 @@ async function auth(req) {
   if (!user || !device) return null;   // Gerät zwischenzeitlich entfernt
   return { user, device };
 }
-const pub = u => u && ({
+/* isSelf: True, wenn dies das eigene Profil des Abfragenden ist — dann
+   IMMER den echten Status zeigen, sonst wüsste man selbst nicht, ob die
+   Einstellung wirkt. Für alle anderen greift show_last_seen. */
+const pub = (u, isSelf = false) => u && ({
   id: u.id, name: u.name, avatarPath: u.avatar_path, bio: u.bio, phone: u.phone,
   email: u.email, emailVerified: !!u.email_verified,
-  lastSeen: u.last_seen, online: isOnline(u.id)
+  lastSeen: (isSelf || u.show_last_seen) ? u.last_seen : null,
+  online: (isSelf || u.show_last_seen) ? isOnline(u.id) : false,
+  ...(isSelf ? { showLastSeen: !!u.show_last_seen } : {})
 });
 const pubDevice = d => d && ({
   id: d.id, name: d.name, platform: d.platform, isPrimary: !!d.is_primary,
@@ -1234,7 +1247,7 @@ const routes = {
     const devices = await q.devicesOf.all(a.user.id);
     const opkCount = await q.countOPK.get(a.device.id);
     json(res, 200, {
-      user: pub(a.user), device: pubDevice(a.device),
+      user: pub(a.user, true), device: pubDevice(a.device),
       devices: devices.map(pubDevice),
       opksLeft: opkCount.n
     });
@@ -1244,7 +1257,10 @@ const routes = {
     const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const b = await readBody(req);
     await q.updateProfile.run(b.name || a.user.name, b.bio ?? a.user.bio, b.phone ?? a.user.phone, a.user.id);
-    json(res, 200, { user: pub(await q.userById.get(a.user.id)) });
+    if (typeof b.showLastSeen === 'boolean') {
+      await q.setShowLastSeen.run(b.showLastSeen ? 1 : 0, a.user.id);
+    }
+    json(res, 200, { user: pub(await q.userById.get(a.user.id), true) });
   },
 
   /* Presigned-Upload-URL ausstellen: Client verschlüsselt die Datei
@@ -1297,7 +1313,7 @@ const routes = {
     const userId = url.pathname.split('/').pop();
     const user = await q.userById.get(userId);
     if (!user) return json(res, 404, { error: 'Nicht gefunden' });
-    json(res, 200, { user: pub(user) });
+    json(res, 200, { user: pub(user, userId === a.user.id) });
   },
 
   'GET /api/users': async (req, res) => {
@@ -1353,7 +1369,7 @@ const routes = {
     for (const d of existingDevices) {
       if (d.id !== deviceId) deliverToDevice(d.id, { type: 'device-added', device: newDevicePub });
     }
-    json(res, 201, { token, user: pub(user), device: newDevicePub });
+    json(res, 201, { token, user: pub(user, true), device: newDevicePub });
   },
 
   'GET /api/devices': async (req, res) => {
@@ -2027,7 +2043,7 @@ server.on('upgrade', async (req, sock) => {
   deviceOwner.set(did, uid);
   await q.touchUser.run(Date.now(), uid);
   await q.touchDevice.run(Date.now(), did);
-  broadcastPresence(uid, true, did);
+  broadcastPresence(uid, true, did).catch(() => {});
 
   /* Wartende Umschläge NUR für dieses Gerät nachliefern — jedes andere
      Gerät desselben Nutzers hat seine eigene, unabhängige Warteschlange
@@ -2050,13 +2066,23 @@ server.on('upgrade', async (req, sock) => {
     if (set) { set.delete(sock); if (!set.size) { live.delete(did); deviceOwner.delete(did); } }
     await q.touchUser.run(Date.now(), uid);
     await q.touchDevice.run(Date.now(), did);
-    broadcastPresence(uid, isOnline(uid), did);
+    broadcastPresence(uid, isOnline(uid), did).catch(() => {});
     try { sock.destroy(); } catch {}
   };
 
   const parse = makeWsParser(async msg => {
     if (msg.type === 'ack' && Array.isArray(msg.ids)) {
-      for (const id of msg.ids) await q.ackEnvelope.run(Date.now(), id, did);
+      for (const id of msg.ids) {
+        await q.ackEnvelope.run(Date.now(), id, did);
+        /* Absender über die Zustellung informieren (einfaches Häkchen →
+           doppeltes graues Häkchen). Der Empfänger-uid/-Umschlag wird
+           dafür nachgeschlagen, da die WS-Nachricht selbst nur die
+           Envelope-ID kennt. */
+        const env = await q.envelopeById.get(id);
+        if (env?.sender_id) {
+          deliverToUser(env.sender_id, { type: 'delivered', ids: [id], convId: env.conv_id });
+        }
+      }
     } else if (msg.type === 'typing' && msg.to) {
       deliverToUser(msg.to, { type: 'typing', from: uid, convId: msg.convId });
     } else if (msg.type === 'read' && msg.to) {
@@ -2100,7 +2126,13 @@ server.on('upgrade', async (req, sock) => {
   sock.setTimeout(0);
 });
 
-function broadcastPresence(uid, online, fromDeviceId) {
+async function broadcastPresence(uid, online, fromDeviceId) {
+  /* Nutzer hat "Zuletzt online zeigen" deaktiviert — Presence-Update
+     gar nicht erst verschicken, statt es beim Empfänger zu filtern
+     (so bleibt der Server der einzige Ort, der diese Regel kennen
+     muss, kein Duplikat der Logik im Client). */
+  const u = await q.userById.get(uid);
+  if (!u || !u.show_last_seen) return;
   const msg = { type: 'presence', userId: uid, online, at: Date.now() };
   for (const [devId, owner] of deviceOwner) {
     if (devId === fromDeviceId) continue;   // nicht sich selbst benachrichtigen
