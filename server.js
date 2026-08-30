@@ -278,6 +278,34 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- GEPLANTE ANRUFE — Termin + Bestätigung + Push-Erinnerung
+-- ─────────────────────────────────────────────────────────────────────
+-- Der Server kennt nur WANN erinnert werden soll und WER die beiden
+-- Teilnehmer sind — Titel/Notiz bleiben client-seitig lokal (keine
+-- Klartext-Beschreibung auf dem Server, passend zum E2EE-Prinzip).
+-- reminded_at markiert, ob die Erinnerung schon verschickt wurde, damit
+-- der Hintergrund-Job sie nicht doppelt auslöst.
+-- status durchläuft: pending → accepted/declined durch den Eingeladenen.
+-- responded_at hält fest, wann geantwortet wurde, damit der Ersteller
+-- eine einmalige Benachrichtigung bekommt statt bei jedem Poll erneut.
+-- ═══════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS scheduled_calls (
+  id             TEXT PRIMARY KEY,
+  creator_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  peer_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind           TEXT NOT NULL DEFAULT 'audio',   -- audio | video
+  scheduled_at   BIGINT NOT NULL,                 -- Unix-ms, Zeitpunkt des Anrufs
+  status         TEXT NOT NULL DEFAULT 'pending', -- pending | accepted | declined | cancelled
+  reminded_at    BIGINT,                          -- Unix-ms, wann die Erinnerung verschickt wurde (NULL = noch nicht)
+  responded_at   BIGINT,                          -- Unix-ms, wann der Eingeladene reagiert hat
+  creator_notified BIGINT,                        -- Unix-ms, wann der Ersteller über die Antwort informiert wurde
+  created_at     BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_calls_due ON scheduled_calls(scheduled_at) WHERE reminded_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_scheduled_calls_creator ON scheduled_calls(creator_id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_calls_peer ON scheduled_calls(peer_id);
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- KONTAKTABGLEICH ("X nutzt die App auch")
 -- ─────────────────────────────────────────────────────────────────────
 -- Der Client hasht Telefonnummern/E-Mails LOKAL (SHA-256 + Salt) und
@@ -434,6 +462,22 @@ const q = {
     auth=excluded.auth, created_at=excluded.created_at`),
   pushForDevice:db.prepare('SELECT * FROM push_subscriptions WHERE device_id=?'),
   dropPush:     db.prepare('DELETE FROM push_subscriptions WHERE device_id=?'),
+
+  /* ---- Geplante Anrufe ---- */
+  createScheduledCall: db.prepare(`INSERT INTO scheduled_calls
+    (id,creator_id,peer_id,kind,scheduled_at,created_at) VALUES (?,?,?,?,?,?)`),
+  scheduledCallsForUser: db.prepare(`SELECT * FROM scheduled_calls
+    WHERE (creator_id=? OR peer_id=?) AND scheduled_at > ? AND status != 'cancelled' ORDER BY scheduled_at ASC`),
+  dueScheduledCalls: db.prepare(`SELECT * FROM scheduled_calls
+    WHERE reminded_at IS NULL AND scheduled_at <= ? AND scheduled_at > ? AND status = 'accepted'`),
+  markCallReminded: db.prepare('UPDATE scheduled_calls SET reminded_at=? WHERE id=?'),
+  deleteScheduledCall: db.prepare(`UPDATE scheduled_calls SET status='cancelled' WHERE id=? AND (creator_id=? OR peer_id=?)`),
+  scheduledCallById: db.prepare('SELECT * FROM scheduled_calls WHERE id=?'),
+  respondScheduledCall: db.prepare(`UPDATE scheduled_calls SET status=?, responded_at=?
+    WHERE id=? AND peer_id=? AND status='pending'`),
+  pendingCreatorNotifications: db.prepare(`SELECT * FROM scheduled_calls
+    WHERE creator_notified IS NULL AND status IN ('accepted','declined') AND responded_at IS NOT NULL`),
+  markCreatorNotified: db.prepare('UPDATE scheduled_calls SET creator_notified=? WHERE id=?'),
 
   /* ---- Kontaktabgleich ---- */
   putSelfHash:  db.prepare(`INSERT INTO contact_hashes (user_id,hash,kind) VALUES (?,?,'self') ON CONFLICT(user_id,hash) DO NOTHING`),
@@ -1361,6 +1405,85 @@ const routes = {
     json(res, 200, { ok: true });
   },
 
+  /* ---- Geplante Anrufe ---- */
+  'POST /api/scheduled-calls': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!b.peerId || !b.scheduledAt) return json(res, 400, { error: 'peerId oder scheduledAt fehlt' });
+    if (b.scheduledAt <= Date.now()) return json(res, 400, { error: 'Zeitpunkt liegt in der Vergangenheit' });
+    const peer = await q.userById.get(b.peerId);
+    if (!peer) return json(res, 404, { error: 'Unbekannter Nutzer' });
+    const id = crypto.randomUUID();
+    await q.createScheduledCall.run(id, a.user.id, b.peerId, b.kind === 'video' ? 'video' : 'audio', b.scheduledAt, Date.now());
+
+    /* Eingeladenen sofort informieren, damit er annehmen/ablehnen kann,
+       statt erst bei der nächsten Terminliste davon zu erfahren. */
+    const online = deliverToUser(b.peerId, {
+      type: 'call-invite', id, kind: b.kind === 'video' ? 'video' : 'audio',
+      scheduledAt: b.scheduledAt, fromId: a.user.id, fromName: a.user.name
+    });
+    if (!online) {
+      const devices = await q.devicesOf.all(b.peerId);
+      for (const d of devices) await notifyOffline(d.id).catch(() => {});
+    }
+    json(res, 200, { id });
+  },
+  'GET /api/scheduled-calls': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const rows = await q.scheduledCallsForUser.all(a.user.id, a.user.id, Date.now() - 3600000);
+    const calls = await Promise.all(rows.map(async r => {
+      const otherId = r.creator_id === a.user.id ? r.peer_id : r.creator_id;
+      const other = await q.userById.get(otherId);
+      return {
+        id: r.id, kind: r.kind, scheduledAt: r.scheduled_at, status: r.status,
+        isCreator: r.creator_id === a.user.id,
+        peerId: otherId, peerName: other?.name || otherId
+      };
+    }));
+    json(res, 200, { calls });
+  },
+  'DELETE /api/scheduled-calls': async (req, res, url) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const id = url.searchParams.get('id');
+    if (!id) return json(res, 400, { error: 'id fehlt' });
+    const call = await q.scheduledCallById.get(id);
+    await q.deleteScheduledCall.run(id, a.user.id, a.user.id);
+    /* Die jeweils andere Seite über die Absage informieren. */
+    if (call) {
+      const otherId = call.creator_id === a.user.id ? call.peer_id : call.creator_id;
+      const online = deliverToUser(otherId, { type: 'call-cancelled', id, byId: a.user.id, byName: a.user.name });
+      if (!online) {
+        const devices = await q.devicesOf.all(otherId);
+        for (const d of devices) await notifyOffline(d.id).catch(() => {});
+      }
+    }
+    json(res, 200, { ok: true });
+  },
+  'POST /api/scheduled-calls/respond': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!b.id || !['accepted', 'declined'].includes(b.status))
+      return json(res, 400, { error: 'id oder status fehlt/ungültig' });
+    const now = Date.now();
+    const result = await q.respondScheduledCall.run(b.status, now, b.id, a.user.id);
+    if (!result.changes) return json(res, 404, { error: 'Termin nicht gefunden oder bereits beantwortet' });
+
+    const call = await q.scheduledCallById.get(b.id);
+    /* Ersteller SOFORT informieren, nicht erst beim nächsten Polling-
+       Zyklus des Erinnerungs-Jobs — der Bestätigungsworkflow lebt genau
+       davon, dass die Antwort zeitnah ankommt. */
+    const online = deliverToUser(call.creator_id, {
+      type: 'call-response', id: b.id, status: b.status,
+      byId: a.user.id, byName: a.user.name
+    });
+    if (online) await q.markCreatorNotified.run(now, b.id);
+    else {
+      const devices = await q.devicesOf.all(call.creator_id);
+      for (const d of devices) await notifyOffline(d.id).catch(() => {});
+    }
+    json(res, 200, { ok: true });
+  },
+
   /* ---- Prekeys (pro Gerät) ---- */
   /* deviceId optional im Query-String: wenn angegeben, wird genau das
      Bundle DIESES Geräts geliefert (für gezielte Zustellung im Fanout).
@@ -2080,6 +2203,41 @@ if (require.main === module) {
     console.log(`  Log-Größe : ${logSize.n} Einträge`);
     console.log(`  Witnesses : ${witnesses.map(w => w.name).join(', ')}`);
   });
+
+  /* ── Erinnerungs-Job für geplante Anrufe ──
+     Prüft alle 30s, ob ein geplanter Anruf "fällig" ist (Zeitfenster:
+     jetzt bis 2 Minuten in der Zukunft — reicht, um den Job nicht auf
+     die Sekunde genau treffen zu müssen, ohne verspätete Erinnerungen
+     Stunden später nachzuholen). Jedem Teilnehmer, der online ist,
+     wird eine WebSocket-Nachricht geschickt (löst im Client ein
+     lokales System-Notification aus); wer offline ist, bekommt einen
+     Web-Push-Weckruf wie bei neuen Nachrichten. */
+  setInterval(async () => {
+    try {
+      const now = Date.now();
+      const due = await q.dueScheduledCalls.all(now + 120000, now - 300000);
+      for (const call of due) {
+        await q.markCallReminded.run(now, call.id);
+        for (const userId of [call.creator_id, call.peer_id]) {
+          const devices = await q.devicesOf.all(userId);
+          let anyOnline = false;
+          for (const d of devices) {
+            const online = deliverToUser(userId, {
+              type: 'call-reminder', callId: call.id, kind: call.kind,
+              scheduledAt: call.scheduled_at,
+              peerId: userId === call.creator_id ? call.peer_id : call.creator_id
+            });
+            if (online) anyOnline = true;
+          }
+          if (!anyOnline) {
+            for (const d of devices) await notifyOffline(d.id).catch(() => {});
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Erinnerungs-Job fehlgeschlagen:', e.message);
+    }
+  }, 30000);
 }
 
 return { server, db, q, issueSenderCertificate, certBytes, MTH, inclusionPath, consistencyProof, verifyConsistency,
