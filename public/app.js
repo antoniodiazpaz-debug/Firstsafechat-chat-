@@ -333,6 +333,35 @@ function urlBase64ToUint8Array(base64String) {
   return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
 }
 
+/* Aktualisiert den Zustellstatus eigener gesendeter Nachrichten anhand
+   ihrer Envelope-ID — 'delivered' (einfaches → doppeltes graues Häkchen)
+   kommt vom ack-Handler des Servers, 'read' (blaues Häkchen) von einer
+   expliziten Lesebestätigung des Empfängers (siehe sendReadReceipt). */
+function markMessagesStatus(convId, ids, status) {
+  if (!ids?.length) return;
+  const msgs = state.messages.get(convId);
+  if (!msgs) return;
+  let changed = false;
+  for (const m of msgs) {
+    if (ids.includes(m.id) && m.mine) {
+      /* 'read' überschreibt 'delivered', aber niemals umgekehrt —
+         eine bereits gelesene Nachricht kann nicht wieder nur
+         "zugestellt" werden. */
+      if (status === 'read' || m.status !== 'read') { m.status = status; changed = true; }
+    }
+  }
+  if (changed && state.activeConv?.convId === convId) renderChatMessages();
+}
+
+/* Lesebestätigung senden, sobald eine fremde Nachricht sichtbar
+   gerendert wurde — nur falls die Einstellung aktiviert ist (siehe
+   Chat-Einstellungen, readReceipts). */
+function sendReadReceipt(convId, peerId, msgIds) {
+  if (!msgIds.length) return;
+  if (state.chatPrefs?.readReceipts === false) return;
+  api.wsSend?.({ type: 'read', to: peerId, convId, ids: msgIds });
+}
+
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -398,6 +427,7 @@ async function flushOutbox() {
    ═══════════════════════════════════════════════════════════════════════ */
 async function boot() {
   loadDisappearingSettings();
+  loadChatPrefs();
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
@@ -789,6 +819,14 @@ async function afterAuth(data) {
   state.monitor = new KT.Monitor();
   await loadSessions();
 
+  /* Server-Wahrheit für showLastSeen übernehmen (falls auf einem
+     anderen Gerät geändert) — alle anderen Chat-Präferenzen bleiben
+     rein lokal und werden nicht überschrieben. */
+  if (typeof data.user.showLastSeen === 'boolean' && state.chatPrefs) {
+    state.chatPrefs.showLastSeen = data.user.showLastSeen;
+    saveChatPrefs();
+  }
+
   /* WICHTIG: window.__app muss HIER gesetzt werden, nicht erst in
      renderShell() — die E-Mail-Verifizierung (Pflicht, siehe unten)
      kann einen frühen return auslösen, BEVOR renderShell() je läuft. */
@@ -1020,6 +1058,12 @@ function wireSocketEvents() {
   api.on('call-cancelled', (msg) => {
     toast(`📅 ${msg.byName || msg.byId} hat den geplanten Anruf abgesagt`);
   });
+  api.on('delivered', (msg) => {
+    markMessagesStatus(msg.convId, msg.ids, 'delivered');
+  });
+  api.on('read', (msg) => {
+    if (msg.convId) markMessagesStatus(msg.convId, msg.ids, 'read');
+  });
   api.on('connected', () => {
     toast('🟢 WebSocket verbunden', 1500);
     state.isOffline = false;
@@ -1209,7 +1253,7 @@ function renderPills() {
 function renderNav() {
   const totalUnread = [...state.convs.values()].reduce((a, c) => a + (c.unread || 0), 0);
   const svg = {
-    chats: '<svg viewBox="0 0 24 24" width="20" height="20" fill="#fff"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2z"/></svg>',
+    chats: '<svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M10.5 3.5c-4.14 0-7.5 2.86-7.5 6.4 0 1.98 1.06 3.75 2.72 4.94-.09.94-.4 1.98-1.09 2.94a.4.4 0 0 0 .43.62c1.53-.35 2.7-1.02 3.5-1.62.6.13 1.24.2 1.94.2 4.14 0 7.5-2.86 7.5-6.4s-3.36-7.08-7.5-7.08z"/><path d="M18.9 15.5c1.3-1.05 2.1-2.5 2.1-4.1 0-2.55-2.1-4.7-4.9-5.4.15.6.24 1.23.24 1.9 0 4.2-3.98 7.6-8.9 7.6-.2 0-.4 0-.6-.02.9 2.1 3.4 3.62 6.36 3.62.5 0 .98-.05 1.44-.14.6.45 1.55 1 2.8 1.3a.32.32 0 0 0 .35-.5c-.55-.77-.8-1.6-.89-2.26z"/></svg>',
     updates: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="#fff" stroke="none"/></svg>',
     communities: '<svg viewBox="0 0 24 24" width="20" height="20" fill="#fff"><circle cx="8" cy="8" r="3.2"/><circle cx="16.5" cy="9" r="2.6"/><path d="M2 20c0-3.5 3-6 6-6s6 2.5 6 6H2z"/><path d="M14 20c.2-2.5 1.5-4.5 3.3-5.5 2.5.3 4.7 2.3 4.7 5.5h-8z"/></svg>',
     calls: '<svg viewBox="0 0 24 24" width="19" height="19" fill="#fff"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg>'
@@ -1453,6 +1497,9 @@ const appActions = {
   confirmDeleteAccount() { confirmDeleteAccount(); },
   mainMenu(e) { openMainMenu(e); },
   openSettings() { openSettings(); },
+  openChatSettings() { openChatSettings(); },
+  toggleChatPref(key, val) { toggleChatPref(key, val); },
+  setFontSizePref(size) { setFontSizePref(size); },
   openNotificationSettings() { openNotificationSettings(); },
   openPrivacySettings() { openPrivacySettings(); },
   openBlockedList() { openBlockedList(); },
@@ -1463,6 +1510,7 @@ const appActions = {
   clearLocalCache() { clearLocalCache(); },
   editProfile() { editProfile(); },
   pickAvatarPhoto() { pickAvatarPhoto(); },
+  pickAvatarFrom(useCamera) { pickAvatarFrom(useCamera); },
   saveProfileName() { saveProfileName(); },
   enablePush() { enablePush(); },
   unblockFromSettings(id) { unblockFromSettings(id); },
@@ -1472,7 +1520,13 @@ const appActions = {
   sendOrMicClick() { sendOrMicClick(); },
   startVoiceRecording() { startVoiceRecording(); },
   stopVoiceRecording(send) { stopVoiceRecording(send); },
-  inputKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCurrentMessage(); } },
+  inputKey(e) {
+    if (e.key !== 'Enter' || e.shiftKey) return;
+    const enterSends = state.chatPrefs?.enterToSend !== false;
+    if (enterSends) { e.preventDefault(); sendCurrentMessage(); }
+    /* Wenn enterToSend aus ist: Enter fügt normal einen Zeilenumbruch
+       ein (Standardverhalten des Textarea-Elements, kein Eingriff nötig). */
+  },
   startChatWith(userId, userName) { startChatWith(userId, userName); },
   copyMessage(id) { copyMessage(id); },
   deleteMessage(id) { deleteMessage(id); },
@@ -1842,6 +1896,16 @@ function openChat(c) {
   ensureSessions(c.peerId).catch(e => toast('⚠️ ' + e.message));
   renderChatMessages();
   $('#msgInput')?.focus();
+
+  /* Lesebestätigung für alle fremden Nachrichten senden, die noch nicht
+     als 'read' markiert wurden — passiert beim Öffnen, weil ab hier der
+     Nutzer sie tatsächlich sieht. */
+  const msgs = state.messages.get(c.convId) || [];
+  const unreadIds = msgs.filter(m => !m.mine && !m.readSent).map(m => m.id);
+  if (unreadIds.length) {
+    sendReadReceipt(c.convId, c.peerId, unreadIds);
+    for (const m of msgs) if (unreadIds.includes(m.id)) m.readSent = true;
+  }
 }
 
 function closeChat() {
@@ -1858,6 +1922,17 @@ function renderChatHeader() {
   if (!el || !state.activeConv) return;
   const conv = state.convs.get(state.activeConv.convId);
   el.textContent = conv?.online ? 'online' : 'offline';
+}
+
+/* Häkchen-Status: 🕐 wartet auf Versand (offline) → ✓ gesendet
+   (Server hat den Umschlag angenommen) → ✓✓ grau zugestellt (Empfänger-
+   gerät hat quittiert) → ✓✓ blau gelesen (explizite Lesebestätigung,
+   nur falls beim Empfänger aktiviert). */
+function renderCheckmark(m) {
+  if (m.pending) return `<span class="ck" title="Wird gesendet, sobald wieder online">🕐</span>`;
+  if (m.status === 'read') return `<span class="ck read" title="Gelesen">✓✓</span>`;
+  if (m.status === 'delivered') return `<span class="ck" title="Zugestellt">✓✓</span>`;
+  return `<span class="ck" title="Gesendet">✓</span>`;
 }
 
 function renderChatMessages() {
@@ -1936,9 +2011,7 @@ function renderChatMessages() {
         <div class="bub" style="${m.pending ? 'opacity:.65' : ''}">
           ${content}
           <div class="ft"><span class="tm">${time(m.ts)}</span>
-            ${m.mine ? (m.pending
-              ? `<span class="ck" title="Wird gesendet, sobald wieder online">🕐</span>`
-              : `<span class="ck">✓✓</span>`) : ''}
+            ${m.mine ? renderCheckmark(m) : ''}
             ${!m.mine && media ? `<span class="timerbadge" style="color:var(--sub);background:rgba(255,255,255,.08)"
               title="Direkt übertragen — Absender für den Speicherdienst sichtbar">📎 direkt</span>` : ''}</div>
         </div>
@@ -2171,6 +2244,9 @@ function openSettings() {
       <button class="menuitem" onclick="window.__app.editProfile()">
         <span class="mi-ic">👤</span><span>Profil bearbeiten</span>
       </button>
+      <button class="menuitem" onclick="window.__app.openChatSettings()">
+        <span class="mi-ic">💬</span><span>Chats</span>
+      </button>
       <button class="menuitem" onclick="window.__app.openLanguageSettings()">
         <span class="mi-ic">🌐</span><span>Sprache</span>
       </button>
@@ -2180,6 +2256,86 @@ function openSettings() {
     </div>
     <p style="color:var(--sub);font-size:13px;margin-top:20px">SecureChat — Version 1.0</p>
   `);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CHAT-EINSTELLUNGEN — Lese-/Schreibverhalten
+   ─────────────────────────────────────────────────────────────────────
+   Rein client-seitige Präferenzen, in localStorage gespeichert. Der
+   Server erfährt bei "Lesebestätigungen aus" nichts über den gesendeten
+   Haken selbst — er sieht ohnehin nur verschlüsselte Umschläge; die
+   Einstellung steuert nur, ob DIESES Gerät ein Lesebestätigungs-Signal
+   an den Absender schickt bzw. anzeigt.
+   ═══════════════════════════════════════════════════════════════════════ */
+const DEFAULT_CHAT_PREFS = {
+  readReceipts: true,
+  showLastSeen: true,
+  enterToSend: true,
+  fontSize: 'medium'   // small | medium | large
+};
+function loadChatPrefs() {
+  try {
+    const raw = localStorage.getItem('sc:chatPrefs');
+    state.chatPrefs = raw ? { ...DEFAULT_CHAT_PREFS, ...JSON.parse(raw) } : { ...DEFAULT_CHAT_PREFS };
+  } catch { state.chatPrefs = { ...DEFAULT_CHAT_PREFS }; }
+  applyFontSizePref();
+}
+function saveChatPrefs() {
+  try { localStorage.setItem('sc:chatPrefs', JSON.stringify(state.chatPrefs)); } catch {}
+}
+function applyFontSizePref() {
+  const sizes = { small: '14px', medium: '15.5px', large: '17.5px' };
+  document.documentElement.style.setProperty('--msg-font-size', sizes[state.chatPrefs?.fontSize] || sizes.medium);
+}
+function openChatSettings() {
+  const p = state.chatPrefs || DEFAULT_CHAT_PREFS;
+  const toggle = (key, label, desc) => `
+    <div class="menuitem" style="cursor:default">
+      <div style="flex:1">
+        <div>${label}</div>
+        ${desc ? `<div style="font-size:12px;color:var(--sub);margin-top:2px">${desc}</div>` : ''}
+      </div>
+      <label class="switch">
+        <input type="checkbox" ${p[key] ? 'checked' : ''} onchange="window.__app.toggleChatPref('${key}', this.checked)">
+        <span class="switch-slider"></span>
+      </label>
+    </div>`;
+  openSettingsPage('Chats', `
+    <div class="menulist">
+      ${toggle('readReceipts', 'Lesebestätigungen', 'Zeigt anderen, wenn du ihre Nachricht gelesen hast')}
+      ${toggle('showLastSeen', 'Zuletzt online zeigen', 'Andere sehen, wann du zuletzt aktiv warst')}
+      ${toggle('enterToSend', 'Enter zum Senden', 'Sonst: Enter fügt einen Zeilenumbruch ein')}
+    </div>
+    <div style="margin-top:20px">
+      <label style="font-size:13px;color:var(--sub)">Schriftgröße im Chat</label>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn ${p.fontSize === 'small' ? '' : 'ghost'}" style="flex:1" onclick="window.__app.setFontSizePref('small')">Klein</button>
+        <button class="btn ${p.fontSize === 'medium' ? '' : 'ghost'}" style="flex:1" onclick="window.__app.setFontSizePref('medium')">Mittel</button>
+        <button class="btn ${p.fontSize === 'large' ? '' : 'ghost'}" style="flex:1" onclick="window.__app.setFontSizePref('large')">Groß</button>
+      </div>
+    </div>
+  `);
+}
+function toggleChatPref(key, value) {
+  if (!state.chatPrefs) state.chatPrefs = { ...DEFAULT_CHAT_PREFS };
+  state.chatPrefs[key] = value;
+  saveChatPrefs();
+  /* showLastSeen ist die einzige Präferenz, die der Server kennen muss
+     — er entscheidet serverseitig, ob Presence-Updates überhaupt
+     verschickt werden (siehe broadcastPresence in server.js). Die
+     anderen Einstellungen (readReceipts, enterToSend, Schriftgröße)
+     bleiben rein lokal. */
+  if (key === 'showLastSeen') {
+    api._fetch('/api/profile', { method: 'POST', body: { showLastSeen: value } })
+      .catch(() => toast('⚠️ Einstellung konnte nicht gespeichert werden'));
+  }
+}
+function setFontSizePref(size) {
+  if (!state.chatPrefs) state.chatPrefs = { ...DEFAULT_CHAT_PREFS };
+  state.chatPrefs.fontSize = size;
+  saveChatPrefs();
+  applyFontSizePref();
+  openChatSettings();
 }
 
 function openNotificationSettings() {
@@ -2313,8 +2469,27 @@ function editProfile() {
 }
 
 function pickAvatarPhoto() {
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'avatarPickSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <div class="menulist">
+        <button class="menuitem" onclick="document.getElementById('avatarPickSheet').remove();window.__app.pickAvatarFrom(true)">
+          <span class="mi-ic">📷</span><span>Foto aufnehmen</span>
+        </button>
+        <button class="menuitem" onclick="document.getElementById('avatarPickSheet').remove();window.__app.pickAvatarFrom(false)">
+          <span class="mi-ic">🖼️</span><span>Aus Galerie wählen</span>
+        </button>
+      </div>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+function pickAvatarFrom(useCamera) {
   const input = document.createElement('input');
-  input.type = 'file'; input.accept = 'image/*'; input.capture = 'user';
+  input.type = 'file'; input.accept = 'image/*';
+  if (useCamera) input.capture = 'user';
   input.onchange = async () => {
     const file = input.files?.[0];
     if (!file) return;
