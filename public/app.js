@@ -1646,15 +1646,17 @@ function openChat(c) {
     <div id="chatbody"></div>
     <div id="composer">
       <div class="cbar">
-        <button class="iconbtn" onclick="window.__app.attachSheet()" aria-label="Anhängen">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        <button class="iconbtn navbtn3d" onclick="window.__app.attachSheet()" aria-label="Anhängen">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
         </button>
         <div class="cin">
           <textarea id="msgInput" rows="1" placeholder="Nachricht"
             oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,110)+'px'"
             onkeydown="window.__app.inputKey(event)"></textarea>
         </div>
-        <button class="sendbtn" onclick="window.__app.sendClick()">➤</button>
+        <button class="sendbtn navbtn3d navbtn3d-on" onclick="window.__app.sendClick()" aria-label="Senden">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M3 20l18-8L3 4v6l12 2-12 2v6z"/></svg>
+        </button>
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(overlay);

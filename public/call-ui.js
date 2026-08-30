@@ -157,9 +157,15 @@ function renderConnected(call, remoteStream) {
       ${isVideo
         ? '<video id="callRemoteVideo" class="call-remote-video" autoplay playsinline></video>'
         : `<div class="call-avatar call-avatar-large">${(call.peerName || '?')[0].toUpperCase()}</div>`}
+      <audio id="callRemoteAudio" autoplay playsinline></audio>
       <div class="call-peername ${isVideo ? 'call-peername-overlay' : ''}">${escapeHtml(call.peerName)}</div>
       <div class="call-status call-timer" id="callTimer">00:00</div>
       ${isVideo ? '<video id="callLocalVideo" class="call-local-preview call-local-preview-small call-local-mirrored" autoplay muted playsinline></video>' : ''}
+      <div class="call-volume">
+        <span class="call-volume-ic">🔉</span>
+        <input type="range" id="callVolumeSlider" min="0" max="100" value="100" aria-label="Lautstärke">
+        <span class="call-volume-ic">🔊</span>
+      </div>
       <div class="call-actions call-actions-connected">
         <button class="call-btn call-btn-secondary" id="callMuteBtn" aria-label="Stummschalten">🎤</button>
         ${isVideo ? '<button class="call-btn call-btn-secondary" id="callCamBtn" aria-label="Kamera">📷</button>' : ''}
@@ -171,8 +177,38 @@ function renderConnected(call, remoteStream) {
 
   remoteVideoEl = document.getElementById('callRemoteVideo');
   localVideoEl = document.getElementById('callLocalVideo');
+  const remoteAudioEl = document.getElementById('callRemoteAudio');
   if (remoteVideoEl && remoteStream) remoteVideoEl.srcObject = remoteStream;
+  /* Bei Audio-Anrufen kommt der Ton NUR über dieses <audio>-Element —
+     ohne dieses Element würde der Gesprächspartner zwar verbunden,
+     aber komplett lautlos bleiben. Bei Videoanrufen dient es als
+     redundante zweite Wiedergabequelle, schadet aber nicht (derselbe
+     MediaStream kann parallel an mehreren Elementen hängen). */
+  if (remoteAudioEl && remoteStream) remoteAudioEl.srcObject = remoteStream;
   if (localVideoEl) makeDraggable(localVideoEl);
+
+  /* In-App-Lautstärkeregler — steuert die Wiedergabelautstärke des
+     Remote-Streams direkt. Physische Lautstärketasten steuern parallel
+     die System-Medienlautstärke (Browser-Sicherheitsmodell erlaubt
+     keinen direkten JS-Zugriff auf Hardware-Tasten); dieser Slider ist
+     die einzige Möglichkeit, die Gesprächslautstärke ohne Tasten aus
+     der App heraus zu regeln. */
+  const volSlider = document.getElementById('callVolumeSlider');
+  if (volSlider) {
+    const savedVol = parseInt(localStorage.getItem('sc:callVolume') || '100', 10);
+    volSlider.value = savedVol;
+    const applyVolume = (v) => {
+      const vol = Math.max(0, Math.min(100, v)) / 100;
+      if (remoteAudioEl) remoteAudioEl.volume = vol;
+      if (remoteVideoEl) remoteVideoEl.volume = vol;
+    };
+    applyVolume(savedVol);
+    volSlider.oninput = (e) => {
+      const v = parseInt(e.target.value, 10);
+      applyVolume(v);
+      localStorage.setItem('sc:callVolume', String(v));
+    };
+  }
 
   document.getElementById('callEndBtn').onclick = () => Call.endCall();
   document.getElementById('callMuteBtn').onclick = (e) => {
@@ -316,6 +352,11 @@ function injectStyles() {
     .call-actions{display:flex;gap:24px;position:absolute;bottom:60px}
     .call-actions-incoming{gap:60px}
     .call-actions-connected{gap:20px}
+    .call-volume{display:flex;align-items:center;gap:10px;width:min(280px,80vw);
+      position:absolute;bottom:150px;padding:8px 16px;background:rgba(0,0,0,.35);
+      border-radius:24px;backdrop-filter:blur(4px)}
+    .call-volume-ic{font-size:16px;flex-shrink:0}
+    .call-volume input[type=range]{flex:1;accent-color:#25d366;height:4px}
     .call-btn{width:60px;height:60px;border-radius:50%;border:none;font-size:24px;
       display:flex;align-items:center;justify-content:center;cursor:pointer}
     .call-btn-accept{background:radial-gradient(circle at 35% 30%,#4ade80,#16a34a 70%);
