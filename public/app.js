@@ -1177,7 +1177,9 @@ function renderShell() {
         <button class="iconbtn navbtn3d" onclick="window.__app.openCamera()" aria-label="Kamera">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
         </button>
-        <button class="iconbtn navbtn3d" onclick="window.__app.mainMenu(event)" style="font-size:18px;color:#fff">⋮</button>
+        <button class="iconbtn navbtn3d" onclick="window.__app.mainMenu(event)" aria-label="Menü">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+        </button>
       </div>
     </div>
     <div class="searchwrap">
@@ -1345,7 +1347,9 @@ function renderMain() {
     <div class="scroll" style="height:100%;position:relative">
       ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') :
         `<div class="empty"><div class="ic">💬</div><div>Noch keine Chats.<br>Tippe auf + um zu starten.</div></div>`}
-      ${!selMode ? `<div class="fab" onclick="window.__app.newChat()">💬</div>` : ''}
+      ${!selMode ? `<div class="fab navbtn3d navbtn3d-on" onclick="window.__app.newChat()" aria-label="Neuer Chat">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="#fff"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM13 11h4v2h-4v4h-2v-4H7v-2h4V7h2v4z"/></svg>
+      </div>` : ''}
     </div>`;
   window.__conv = convs;
 }
@@ -1476,6 +1480,11 @@ const appActions = {
   openMsgMenu(id) { openMsgMenu(id); },
   msgLongPressStart(id) { msgLongPressStart(id); },
   msgLongPressEnd() { msgLongPressEnd(); },
+  enterMsgSelectMode(id) { enterMsgSelectMode(id); },
+  exitMsgSelectMode() { exitMsgSelectMode(); },
+  toggleSelectMsg(id) { toggleSelectMsg(id); },
+  deleteSelectedMsgs() { deleteSelectedMsgs(); },
+  forwardSelectedMsgs() { forwardSelectedMsgs(); },
   chatMenu(e) { chatMenu(e); },
   searchInChat() { searchInChat(); },
   doChatSearch(q) { doChatSearch(q); },
@@ -1880,8 +1889,22 @@ function renderChatMessages() {
     if (pollCard) {
       content = renderPollCard(pollCard, m.id);
     } else if (locationCard) {
-      content = `<a href="${esc(locationCard.url)}" target="_blank" rel="noopener" class="filemsg" style="text-decoration:none;color:inherit">
-        📍 <span>Standort — auf Google Maps öffnen</span></a>`;
+      /* Statisches Kartenbild über OpenStreetMap-Tiles — komplett
+         kostenlos, kein API-Key nötig (im Gegensatz zu Google Maps
+         Static API, das zahlungspflichtig ist). Der Link selbst öffnet
+         weiterhin Google Maps, weil dort Navigation/Details besser
+         funktionieren — nur die Vorschau kommt von OSM. */
+      const { lat, lng } = locationCard;
+      const zoom = 15;
+      const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom));
+      const tileY = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
+      const tileUrl = `https://tile.openstreetmap.org/${zoom}/${tileX}/${tileY}.png`;
+      content = `<a href="${esc(locationCard.url)}" target="_blank" rel="noopener" class="mapcard" style="text-decoration:none;color:inherit">
+        <div class="mapcard-thumb" style="background-image:url('${tileUrl}')">
+          <div class="mapcard-pin">📍</div>
+        </div>
+        <div class="mapcard-label">Standort — auf Google Maps öffnen</div>
+      </a>`;
     } else if (contactCard) {
       content = `<div class="filemsg">👤 <span>${esc(contactCard.name || contactCard.id)}</span></div>`;
     } else if (media) {
@@ -1900,11 +1923,16 @@ function renderChatMessages() {
       content = `<div class="tx">${esc(m.text)}</div>`;
     }
 
+    const msgSelMode = !!state.msgSelectMode;
+    const msgSelected = state.selectedMsgs?.has(m.id);
+    const rowClick = msgSelMode ? `window.__app.toggleSelectMsg('${esc(m.id)}')` : '';
     rows.push(`
-      <div class="msgrow ${m.mine ? 'mine' : ''}" data-msgid="${esc(m.id)}"
+      <div class="msgrow ${m.mine ? 'mine' : ''} ${msgSelected ? 'msgrow-selected' : ''}" data-msgid="${esc(m.id)}"
+        onclick="${rowClick}"
         ontouchstart="window.__app.msgLongPressStart('${esc(m.id)}')"
         ontouchend="window.__app.msgLongPressEnd()" ontouchmove="window.__app.msgLongPressEnd()"
         oncontextmenu="window.__app.openMsgMenu('${esc(m.id)}');return false;">
+        ${msgSelMode ? `<span class="msgselectcheck">${msgSelected ? '✅' : '⭕'}</span>` : ''}
         <div class="bub" style="${m.pending ? 'opacity:.65' : ''}">
           ${content}
           <div class="ft"><span class="tm">${time(m.ts)}</span>
@@ -1916,13 +1944,62 @@ function renderChatMessages() {
         </div>
       </div>`);
   }
-  body.innerHTML = rows.join('');
+  body.innerHTML = (state.msgSelectMode ? `
+    <div class="selectbar" style="position:sticky;top:0;z-index:10">
+      <button class="iconbtn" onclick="window.__app.exitMsgSelectMode()">✕</button>
+      <span class="selectcount">${state.selectedMsgs.size} ausgewählt</span>
+      <button class="iconbtn" onclick="window.__app.forwardSelectedMsgs()" aria-label="Weiterleiten">↪️</button>
+      <button class="iconbtn" onclick="window.__app.deleteSelectedMsgs()" aria-label="Löschen">🗑️</button>
+    </div>` : '') + rows.join('');
   body.scrollTop = body.scrollHeight;
 }
 
-/* ── Long-Press auf einzelne Nachricht → Kontextmenü ── */
+/* ── Mehrfachauswahl von Nachrichten (wie bei der Chatliste) ── */
+function enterMsgSelectMode(msgId) {
+  state.msgSelectMode = true;
+  if (!state.selectedMsgs) state.selectedMsgs = new Set();
+  state.selectedMsgs.add(msgId);
+  renderChatMessages();
+}
+function exitMsgSelectMode() {
+  state.msgSelectMode = false;
+  state.selectedMsgs = new Set();
+  renderChatMessages();
+}
+function toggleSelectMsg(msgId) {
+  if (!state.selectedMsgs) state.selectedMsgs = new Set();
+  if (state.selectedMsgs.has(msgId)) state.selectedMsgs.delete(msgId);
+  else state.selectedMsgs.add(msgId);
+  if (state.selectedMsgs.size === 0) { exitMsgSelectMode(); return; }
+  renderChatMessages();
+}
+function deleteSelectedMsgs() {
+  const convId = state.activeConv?.convId;
+  const msgs = state.messages.get(convId);
+  if (!msgs || !state.selectedMsgs?.size) return;
+  const count = state.selectedMsgs.size;
+  if (!confirm(`${count} Nachricht${count > 1 ? 'en' : ''} löschen? Nur bei dir — nicht rückgängig.`)) return;
+  const kept = msgs.filter(m => !state.selectedMsgs.has(m.id));
+  state.messages.set(convId, kept);
+  LocalCache.scheduleSave();
+  exitMsgSelectMode();
+  toast(`${count} Nachricht${count > 1 ? 'en' : ''} gelöscht`);
+}
+function forwardSelectedMsgs() {
+  const convId = state.activeConv?.convId;
+  const msgs = state.messages.get(convId) || [];
+  const selected = msgs.filter(m => state.selectedMsgs?.has(m.id));
+  if (!selected.length) return;
+  state.forwardPayload = { multiple: selected.map(m => ({ text: m.text, media: m.media })) };
+  exitMsgSelectMode();
+  openNewChatSheet();
+  toast('Kontakt auswählen, um weiterzuleiten');
+}
+
+/* ── Long-Press auf einzelne Nachricht → Kontextmenü oder Auswahl ── */
 let _msgLongPressTimer = null;
 function msgLongPressStart(msgId) {
+  if (state.msgSelectMode) return;   // im Auswahlmodus übernimmt der normale Klick
   _msgLongPressTimer = setTimeout(() => openMsgMenu(msgId), 450);
 }
 function msgLongPressEnd() {
@@ -1947,6 +2024,9 @@ function openMsgMenu(msgId) {
           </button>` : ''}
         <button class="menuitem" onclick="window.__app.forwardMessage('${esc(msgId)}')">
           <span class="mi-ic">↪️</span><span>Weiterleiten</span>
+        </button>
+        <button class="menuitem" onclick="document.getElementById('msgMenuSheet').remove();window.__app.enterMsgSelectMode('${esc(msgId)}')">
+          <span class="mi-ic">☑️</span><span>Mehrere auswählen</span>
         </button>
         <button class="menuitem" onclick="window.__app.deleteMessage('${esc(msgId)}')">
           <span class="mi-ic">🗑️</span><span style="color:var(--dan)">Löschen</span>
@@ -2822,19 +2902,19 @@ async function openScheduledCallsList() {
       ${calls.map(c => {
         const st = statusInfo(c);
         return `
-        <div class="menuitem" style="cursor:default;align-items:flex-start">
-          <span class="mi-ic">${c.kind === 'video' ? '🎥' : '🎤'}</span>
-          <div style="flex:1">
-            <div>${esc(c.peerName)}</div>
-            <div style="font-size:12px;color:var(--sub)">${new Date(c.scheduledAt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' })}</div>
+        <div style="display:flex;align-items:flex-start;gap:14px;padding:14px 4px;border-bottom:1px solid var(--line)">
+          <span class="mi-ic" style="margin-top:2px">${c.kind === 'video' ? '🎥' : '🎤'}</span>
+          <div style="flex:1;min-width:0">
+            <div style="font-weight:600">${esc(c.peerName)}</div>
+            <div style="font-size:12px;color:var(--sub);margin-top:2px">${new Date(c.scheduledAt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' })}</div>
             <div style="font-size:12px;color:${st.color};font-weight:600;margin-top:2px">${st.label}</div>
           </div>
-          <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+          <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;flex-shrink:0">
             ${!c.isCreator && c.status === 'pending' ? `
-              <button class="btn ghost" style="padding:5px 10px;font-size:12px" onclick="window.__app.respondScheduledCall('${esc(c.id)}','declined');window.__app.openScheduledCallsList()">Ablehnen</button>
-              <button class="btn" style="padding:5px 10px;font-size:12px" onclick="window.__app.respondScheduledCall('${esc(c.id)}','accepted');window.__app.openScheduledCallsList()">Annehmen</button>
+              <button class="btn ghost" style="padding:5px 10px;font-size:12px;white-space:nowrap" onclick="window.__app.respondScheduledCall('${esc(c.id)}','declined');window.__app.openScheduledCallsList()">Ablehnen</button>
+              <button class="btn" style="padding:5px 10px;font-size:12px;white-space:nowrap" onclick="window.__app.respondScheduledCall('${esc(c.id)}','accepted');window.__app.openScheduledCallsList()">Annehmen</button>
             ` : `
-              <button class="btn ghost" style="padding:6px 12px;font-size:13px" onclick="window.__app.cancelScheduledCall('${esc(c.id)}')">Absagen</button>
+              <button class="btn ghost" style="padding:6px 12px;font-size:13px;white-space:nowrap" onclick="window.__app.cancelScheduledCall('${esc(c.id)}')">Absagen</button>
             `}
           </div>
         </div>`;
