@@ -397,6 +397,7 @@ async function flushOutbox() {
    BOOT
    ═══════════════════════════════════════════════════════════════════════ */
 async function boot() {
+  loadDisappearingSettings();
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
@@ -1007,6 +1008,18 @@ function wireSocketEvents() {
     toast('Ein Kontakt nutzt jetzt auch SecureChat 👋');
   });
   api.on('need-prekeys', () => refillPrekeys().catch(() => {}));
+  api.on('call-reminder', (msg) => {
+    showCallReminderNotification(msg);
+  });
+  api.on('call-invite', (msg) => {
+    showCallInviteNotification(msg);
+  });
+  api.on('call-response', (msg) => {
+    showCallResponseNotification(msg);
+  });
+  api.on('call-cancelled', (msg) => {
+    toast(`📅 ${msg.byName || msg.byId} hat den geplanten Anruf abgesagt`);
+  });
   api.on('connected', () => {
     toast('🟢 WebSocket verbunden', 1500);
     state.isOffline = false;
@@ -1065,14 +1078,28 @@ async function handleEnvelope(env, live) {
   }
 
   if (!state.messages.has(convId)) state.messages.set(convId, []);
-  state.messages.get(convId).push({
-    id: env.id, from: env.senderId || '(versiegelt)', text: plaintext,
-    ts: env.sentAt, mine: false, sealed: !!env.sealed
-  });
+
+  /* Umfrage-Stimmen sind eine eigene, "unsichtbare" Nachrichtenart:
+     sie tragen keinen Chatverlauf-Eintrag, sondern aktualisieren nur
+     die lokal aggregierten Stimmen (state.pollVotes) — sonst würde
+     jede einzelne Stimme als eigene Chatzeile auftauchen. */
+  let pollVoteObj = null;
+  try { const parsed = JSON.parse(plaintext); if (parsed?.__pollVote) pollVoteObj = parsed.__pollVote; } catch {}
+  if (pollVoteObj && env.senderId) {
+    if (!state.pollVotes) state.pollVotes = new Map();
+    const votes = state.pollVotes.get(pollVoteObj.pollId) || {};
+    votes[env.senderId] = pollVoteObj.optionIdx;
+    state.pollVotes.set(pollVoteObj.pollId, votes);
+  } else {
+    state.messages.get(convId).push({
+      id: env.id, from: env.senderId || '(versiegelt)', text: plaintext,
+      ts: env.sentAt, mine: false, sealed: !!env.sealed
+    });
+  }
 
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
-  conv.lastMsg = { text: plaintext, ts: env.sentAt };
-  conv.unread = (conv.unread || 0) + 1;
+  conv.lastMsg = pollVoteObj ? conv.lastMsg : { text: plaintext, ts: env.sentAt };
+  conv.unread = pollVoteObj ? conv.unread : (conv.unread || 0) + 1;
   if (!conv.name && env.senderName) conv.name = env.senderName;
   state.convs.set(convId, conv);
   /* Name nachladen falls noch unbekannt */
@@ -1431,13 +1458,24 @@ const appActions = {
   openStorageSettings() { openStorageSettings(); },
   clearLocalCache() { clearLocalCache(); },
   editProfile() { editProfile(); },
+  pickAvatarPhoto() { pickAvatarPhoto(); },
   saveProfileName() { saveProfileName(); },
   enablePush() { enablePush(); },
   unblockFromSettings(id) { unblockFromSettings(id); },
   closeChat() { closeChat(); },
   sendClick() { sendCurrentMessage(); },
+  onMsgInputChange(v) { onMsgInputChange(v); },
+  sendOrMicClick() { sendOrMicClick(); },
+  startVoiceRecording() { startVoiceRecording(); },
+  stopVoiceRecording(send) { stopVoiceRecording(send); },
   inputKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCurrentMessage(); } },
   startChatWith(userId, userName) { startChatWith(userId, userName); },
+  copyMessage(id) { copyMessage(id); },
+  deleteMessage(id) { deleteMessage(id); },
+  forwardMessage(id) { forwardMessage(id); },
+  openMsgMenu(id) { openMsgMenu(id); },
+  msgLongPressStart(id) { msgLongPressStart(id); },
+  msgLongPressEnd() { msgLongPressEnd(); },
   chatMenu(e) { chatMenu(e); },
   searchInChat() { searchInChat(); },
   doChatSearch(q) { doChatSearch(q); },
@@ -1454,7 +1492,19 @@ const appActions = {
   attachSheet() { attachSheet(); },
   shareLocation() { shareLocation(); },
   shareContact() { shareContact(); },
-  pickMedia(accept, kind) { pickMedia(accept, kind); },
+  sendContactCard(id, name) { sendContactCard(id, name); },
+  openCreatePoll() { openCreatePoll(); },
+  addPollOption() { addPollOption(); },
+  sendPoll() { sendPoll(); },
+  votePoll(pollId, idx) { votePoll(pollId, idx); },
+  openScheduleCall() { openScheduleCall(); },
+  setScheduleKind(k) { setScheduleKind(k); },
+  confirmScheduleCall() { confirmScheduleCall(); },
+  openScheduledCallsList() { openScheduledCallsList(); },
+  cancelScheduledCall(id) { cancelScheduledCall(id); },
+  startScheduledCall(peerId, kind) { startScheduledCall(peerId, kind); },
+  respondScheduledCall(id, status) { respondScheduledCall(id, status); },
+  pickMedia(accept, kind, useCamera) { pickMedia(accept, kind, useCamera); },
   loadMedia(msgId) {
     for (const list of state.messages.values()) {
       const m = list.find(x => x.id === msgId);
@@ -1572,6 +1622,102 @@ async function sendMessage(peerId, convId, plaintext) {
   return result;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   MIC/SENDEN-UMSCHALTUNG — wie WhatsApp: leeres Feld → Mikrofon,
+   sobald Text eingegeben wird → Senden-Pfeil.
+   ═══════════════════════════════════════════════════════════════════════ */
+const SEND_ICON = '<path d="M3 20l18-8L3 4v6l12 2-12 2v6z"/>';
+const MIC_ICON = '<path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2z"/>';
+
+function onMsgInputChange(v) {
+  const icon = $('#sendMicIcon');
+  if (!icon) return;
+  icon.outerHTML = v.trim()
+    ? `<svg id="sendMicIcon" viewBox="0 0 24 24" width="18" height="18" fill="#fff">${SEND_ICON}</svg>`
+    : `<svg id="sendMicIcon" viewBox="0 0 24 24" width="18" height="18" fill="#fff">${MIC_ICON}</svg>`;
+}
+
+function sendOrMicClick() {
+  const input = $('#msgInput');
+  if (input?.value.trim()) {
+    sendCurrentMessage();
+  } else {
+    startVoiceRecording();
+  }
+}
+
+/* ── Sprachnachricht aufnehmen ──
+   Halten zum Aufnehmen (wie WhatsApp): pointerdown startet, pointerup
+   stoppt+sendet, Wegziehen bricht ab. Nutzt MediaRecorder — läuft nur
+   während des Haltens, damit aus Versehen offen gelassene Mikrofone
+   nicht endlos aufnehmen. */
+let _voiceRecorder = null;
+let _voiceChunks = [];
+let _voiceStream = null;
+
+async function startVoiceRecording() {
+  if (!state.activeConv) return;
+  try {
+    _voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    toast('⚠️ Mikrofonzugriff verweigert');
+    return;
+  }
+  _voiceChunks = [];
+  _voiceRecorder = new MediaRecorder(_voiceStream);
+  _voiceRecorder.ondataavailable = (e) => { if (e.data.size) _voiceChunks.push(e.data); };
+  _voiceRecorder.start();
+
+  const btn = $('#sendOrMicBtn');
+  btn?.classList.add('recording-active');
+  showVoiceRecordingBar();
+}
+
+function showVoiceRecordingBar() {
+  const bar = document.createElement('div');
+  bar.id = 'voiceRecBar';
+  bar.style.cssText = 'position:absolute;bottom:0;left:0;right:0;background:var(--panel);' +
+    'display:flex;align-items:center;gap:10px;padding:12px 16px;z-index:50';
+  bar.innerHTML = `
+    <span style="color:#f15c6d;font-size:18px">●</span>
+    <span id="voiceRecTimer" style="flex:1;font-variant-numeric:tabular-nums">0:00</span>
+    <button class="btn ghost" style="padding:8px 16px" onclick="window.__app.stopVoiceRecording(false)">Abbrechen</button>
+    <button class="sendbtn navbtn3d navbtn3d-on" onclick="window.__app.stopVoiceRecording(true)" aria-label="Senden">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff">${SEND_ICON}</svg>
+    </button>`;
+  $('#composer')?.appendChild(bar);
+  const start = Date.now();
+  const timerEl = () => $('#voiceRecTimer');
+  bar._timer = setInterval(() => {
+    const s = Math.floor((Date.now() - start) / 1000);
+    const el = timerEl();
+    if (el) el.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }, 250);
+}
+
+async function stopVoiceRecording(send) {
+  const bar = document.getElementById('voiceRecBar');
+  if (bar) { clearInterval(bar._timer); bar.remove(); }
+  $('#sendOrMicBtn')?.classList.remove('recording-active');
+
+  if (!_voiceRecorder) return;
+  const recorder = _voiceRecorder;
+  const stream = _voiceStream;
+  _voiceRecorder = null; _voiceStream = null;
+
+  const blobPromise = new Promise((resolve) => {
+    recorder.onstop = () => resolve(new Blob(_voiceChunks, { type: 'audio/webm' }));
+  });
+  recorder.stop();
+  stream.getTracks().forEach(t => t.stop());
+  const blob = await blobPromise;
+
+  if (!send || blob.size < 500) return;   // Abbruch oder zu kurz zum Senden
+
+  const file = new File([blob], 'voice-' + Date.now() + '.webm', { type: 'audio/webm' });
+  await sendMediaMessage(file, 'audio');
+}
+
 async function sendCurrentMessage() {
   const input = $('#msgInput');
   if (!input) return;
@@ -1632,10 +1778,10 @@ function openChat(c) {
   overlay.innerHTML = `
     <div class="chatbar">
       <button class="iconbtn" onclick="window.__app.closeChat()">←</button>
-      <div class="av" style="width:38px;height:38px;font-size:16px">${(c.name || '?')[0].toUpperCase()}</div>
+      <div class="av" style="width:38px;height:38px;font-size:16px">${((c.name || c.peerId || '?'))[0].toUpperCase()}</div>
       <div class="name">
-        <div class="nm">${esc(c.name || c.peerId)}</div>
-        <div class="st" id="chatStatus">${c.online ? 'online' : 'offline'}</div>
+        <div class="nm">${c.name ? esc(c.name) : 'Unbekannt'}</div>
+        <div class="st" id="chatStatus">${c.name ? (c.online ? 'online' : 'offline') : esc(c.peerId)}</div>
       </div>
       <button class="iconbtn callbtn3d callbtn3d-audio" onclick="window.__app.startCall('audio')" aria-label="Anrufen"></button>
       <button class="iconbtn callbtn3d callbtn3d-video" onclick="window.__app.startCall('video')" aria-label="Videoanruf">
@@ -1651,11 +1797,12 @@ function openChat(c) {
         </button>
         <div class="cin">
           <textarea id="msgInput" rows="1" placeholder="Nachricht"
-            oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,110)+'px'"
+            oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,110)+'px';window.__app.onMsgInputChange(this.value)"
             onkeydown="window.__app.inputKey(event)"></textarea>
         </div>
-        <button class="sendbtn navbtn3d navbtn3d-on" onclick="window.__app.sendClick()" aria-label="Senden">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M3 20l18-8L3 4v6l12 2-12 2v6z"/></svg>
+        <button class="sendbtn navbtn3d navbtn3d-on" id="sendOrMicBtn"
+          onclick="window.__app.sendOrMicClick()" aria-label="Senden">
+          <svg id="sendMicIcon" viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2z"/></svg>
         </button>
       </div>
     </div>`;
@@ -1722,9 +1869,22 @@ function renderChatMessages() {
        entschlüsselten JSON-Text erkannt. */
     const incomingMedia = !m.media && !m.mine ? parseIncomingMedia(m.text) : null;
     const media = m.media || incomingMedia;
+    const locationCard = !media ? parseStructured(m.text, '__location') : null;
+    const contactCard = !media ? parseStructured(m.text, '__contact') : null;
+    const pollCard = !media ? parseStructured(m.text, '__poll') : null;
+    const pollVote = !media ? parseStructured(m.text, '__pollVote') : null;
+
+    if (pollVote) continue;   // Stimmen werden separat verarbeitet (siehe onIncomingEnvelope), nicht als eigene Chatzeile gezeigt
 
     let content;
-    if (media) {
+    if (pollCard) {
+      content = renderPollCard(pollCard, m.id);
+    } else if (locationCard) {
+      content = `<a href="${esc(locationCard.url)}" target="_blank" rel="noopener" class="filemsg" style="text-decoration:none;color:inherit">
+        📍 <span>Standort — auf Google Maps öffnen</span></a>`;
+    } else if (contactCard) {
+      content = `<div class="filemsg">👤 <span>${esc(contactCard.name || contactCard.id)}</span></div>`;
+    } else if (media) {
       if (m.mediaUrl) {
         content = media.kind === 'image'
           ? `<div class="media"><img src="${m.mediaUrl}"></div>`
@@ -1741,7 +1901,10 @@ function renderChatMessages() {
     }
 
     rows.push(`
-      <div class="msgrow ${m.mine ? 'mine' : ''}">
+      <div class="msgrow ${m.mine ? 'mine' : ''}" data-msgid="${esc(m.id)}"
+        ontouchstart="window.__app.msgLongPressStart('${esc(m.id)}')"
+        ontouchend="window.__app.msgLongPressEnd()" ontouchmove="window.__app.msgLongPressEnd()"
+        oncontextmenu="window.__app.openMsgMenu('${esc(m.id)}');return false;">
         <div class="bub" style="${m.pending ? 'opacity:.65' : ''}">
           ${content}
           <div class="ft"><span class="tm">${time(m.ts)}</span>
@@ -1755,6 +1918,73 @@ function renderChatMessages() {
   }
   body.innerHTML = rows.join('');
   body.scrollTop = body.scrollHeight;
+}
+
+/* ── Long-Press auf einzelne Nachricht → Kontextmenü ── */
+let _msgLongPressTimer = null;
+function msgLongPressStart(msgId) {
+  _msgLongPressTimer = setTimeout(() => openMsgMenu(msgId), 450);
+}
+function msgLongPressEnd() {
+  if (_msgLongPressTimer) { clearTimeout(_msgLongPressTimer); _msgLongPressTimer = null; }
+}
+function openMsgMenu(msgId) {
+  const convId = state.activeConv?.convId;
+  const msgs = state.messages.get(convId) || [];
+  const msg = msgs.find(m => m.id === msgId);
+  if (!msg) return;
+
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'msgMenuSheet';
+  sheet.onclick = e => { if (e.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <div class="menulist">
+        ${!msg.media ? `
+          <button class="menuitem" onclick="window.__app.copyMessage('${esc(msgId)}')">
+            <span class="mi-ic">📋</span><span>Kopieren</span>
+          </button>` : ''}
+        <button class="menuitem" onclick="window.__app.forwardMessage('${esc(msgId)}')">
+          <span class="mi-ic">↪️</span><span>Weiterleiten</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.deleteMessage('${esc(msgId)}')">
+          <span class="mi-ic">🗑️</span><span style="color:var(--dan)">Löschen</span>
+        </button>
+      </div>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+function copyMessage(msgId) {
+  document.getElementById('msgMenuSheet')?.remove();
+  const msgs = state.messages.get(state.activeConv?.convId) || [];
+  const msg = msgs.find(m => m.id === msgId);
+  if (!msg?.text) return;
+  navigator.clipboard?.writeText(msg.text).then(() => toast('Kopiert')).catch(() => toast('⚠️ Kopieren fehlgeschlagen'));
+}
+function deleteMessage(msgId) {
+  document.getElementById('msgMenuSheet')?.remove();
+  const convId = state.activeConv?.convId;
+  const msgs = state.messages.get(convId);
+  if (!msgs) return;
+  const idx = msgs.findIndex(m => m.id === msgId);
+  if (idx === -1) return;
+  /* Nur lokal — kein "Für alle löschen", das würde eine Serverfunktion
+     brauchen, die die Nachricht beim Empfänger nachträglich entfernt
+     (technisch bei E2EE nur als Hinweis möglich, nicht als Garantie). */
+  msgs.splice(idx, 1);
+  LocalCache.scheduleSave();
+  renderChatMessages();
+  toast('Nachricht gelöscht (nur bei dir)');
+}
+function forwardMessage(msgId) {
+  document.getElementById('msgMenuSheet')?.remove();
+  const msgs = state.messages.get(state.activeConv?.convId) || [];
+  const msg = msgs.find(m => m.id === msgId);
+  if (!msg) return;
+  state.forwardPayload = { text: msg.text, media: msg.media };
+  openNewChatSheet();
+  toast('Kontakt auswählen, um weiterzuleiten');
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -1826,6 +2056,9 @@ function openMainMenu(e) {
         </button>
         <button class="menuitem" onclick="window.__app.openLinkedDevices()">
           <span class="mi-ic">🖥️</span><span>Verknüpfte Geräte</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.openScheduledCallsList()">
+          <span class="mi-ic">📅</span><span>Geplante Anrufe</span>
         </button>
       </div>
       <button class="btn ghost" style="width:100%;margin-top:16px" onclick="window.__app.logoutClick()">Abmelden</button>
@@ -1979,9 +2212,17 @@ function clearLocalCache() {
 }
 
 function editProfile() {
+  const avatarPreview = state.me.avatarUrl
+    ? `<img src="${state.me.avatarUrl}" style="width:80px;height:80px;border-radius:50%;object-fit:cover">`
+    : `<div class="av" style="width:80px;height:80px;font-size:32px">${esc((state.me.name || '?')[0].toUpperCase())}</div>`;
   openSettingsPage('Profil bearbeiten', `
-    <div style="text-align:center;margin-bottom:20px">
-      <div class="av" style="width:80px;height:80px;font-size:32px;margin:0 auto">${esc((state.me.name || '?')[0].toUpperCase())}</div>
+    <div style="text-align:center;margin-bottom:8px">
+      <div id="avatarPreviewWrap" style="display:inline-block;position:relative">${avatarPreview}
+        <button class="navbtn3d" style="position:absolute;bottom:-2px;right:-2px;width:30px;height:30px"
+          onclick="window.__app.pickAvatarPhoto()" aria-label="Profilfoto ändern">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="#fff"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+        </button>
+      </div>
     </div>
     <label style="font-size:13px;color:var(--sub)">Anzeigename</label>
     <input id="profileNameInput" type="text" value="${esc(state.me.name || '')}"
@@ -1989,6 +2230,37 @@ function editProfile() {
         border:none;background:var(--panel2);color:var(--tx);margin:8px 0 16px">
     <button class="btn" style="width:100%" onclick="window.__app.saveProfileName()">Speichern</button>
   `);
+}
+
+function pickAvatarPhoto() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = 'image/*'; input.capture = 'user';
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    await uploadAvatarPhoto(file);
+  };
+  input.click();
+}
+
+async function uploadAvatarPhoto(file) {
+  if (!window.MediaStorage || !window.MEDIA_CONFIG?.uploadUrl) {
+    toast('⚠️ Kein Medienspeicher konfiguriert'); return;
+  }
+  toast('📷 Profilfoto wird hochgeladen…', 4000);
+  try {
+    const shrunk = await window.MediaStorage.shrinkImage(file).catch(() => file);
+    const uploaded = await window.MediaStorage.uploadMedia(shrunk,
+      { uploadUrl: window.MEDIA_CONFIG.uploadUrl, kind: 'image' });
+    const path = uploaded.path || uploaded.key;
+    const { user } = await api._fetch('/api/profile/avatar', { method: 'POST', body: { path } });
+    state.me.avatarPath = user.avatarPath;
+    if (window.MediaStorage.mediaUrlFor) state.me.avatarUrl = await window.MediaStorage.mediaUrlFor(user.avatarPath);
+    toast('Profilfoto aktualisiert');
+    editProfile();
+  } catch (e) {
+    toast('⚠️ Upload fehlgeschlagen: ' + e.message);
+  }
 }
 
 async function saveProfileName() {
@@ -2090,6 +2362,9 @@ function chatMenu(e) {
         <button class="menuitem" onclick="window.__app.openDisappearingMessages()">
           <span class="mi-ic">⏱️</span><span>Verschwindende Nachrichten</span>
         </button>
+        <button class="menuitem" onclick="window.__app.openScheduleCall()">
+          <span class="mi-ic">📅</span><span>Anruf planen</span>
+        </button>
         <button class="menuitem" onclick="window.__app.showEncryptionFingerprint()">
           <span class="mi-ic">🔐</span><span>Sicherheitscode anzeigen</span>
         </button>
@@ -2159,7 +2434,10 @@ function openDisappearingMessages() {
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'disappearSheet';
   sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
-  const opts = [[0, 'Aus'], [86400, '24 Stunden'], [604800, '7 Tage'], [7776000, '90 Tage']];
+  const opts = [
+    [0, 'Aus'], [300, '5 Minuten'], [1800, '30 Minuten'], [3600, '1 Stunde'],
+    [86400, '24 Stunden'], [604800, '7 Tage'], [7776000, '90 Tage']
+  ];
   sheet.innerHTML = `
     <div class="sheetbox">
       <div class="grabber"></div>
@@ -2180,8 +2458,49 @@ function openDisappearingMessages() {
 function setDisappearing(seconds) {
   if (!state.disappearing) state.disappearing = new Map();
   state.disappearing.set(state.activeConv.peerId, seconds);
+  try {
+    localStorage.setItem('sc:disappearing', JSON.stringify([...state.disappearing.entries()]));
+  } catch {}
   document.getElementById('disappearSheet')?.remove();
   toast(seconds ? 'Verschwindende Nachrichten aktiviert' : 'Verschwindende Nachrichten deaktiviert');
+}
+
+/* ── Ablauf tatsächlich durchsetzen ──
+   Läuft periodisch im Hintergrund: prüft für jeden Chat mit aktivem
+   Timer, ob Nachrichten älter als die eingestellte Frist sind, und
+   entfernt sie aus der lokalen Ansicht. Rein lokal — beeinflusst nicht,
+   was der Gesprächspartner auf seinem Gerät sieht (das würde eine
+   Server-Koordination brauchen, die bei E2EE ohnehin nur ein Hinweis,
+   nie eine Garantie wäre). */
+function pruneDisappearingMessages() {
+  if (!state.disappearing || !state.disappearing.size) return;
+  const now = Date.now();
+  let changed = false;
+  for (const [convId, conv] of state.convs.entries()) {
+    const ttlSec = state.disappearing.get(conv.peerId);
+    if (!ttlSec) continue;
+    const msgs = state.messages.get(convId);
+    if (!msgs?.length) continue;
+    const kept = msgs.filter(m => (now - m.ts) < ttlSec * 1000);
+    if (kept.length !== msgs.length) {
+      state.messages.set(convId, kept);
+      changed = true;
+    }
+  }
+  if (changed) {
+    LocalCache.scheduleSave();
+    if (state.view === 'chat') renderChatMessages();
+    renderMain();
+  }
+}
+function loadDisappearingSettings() {
+  try {
+    const raw = localStorage.getItem('sc:disappearing');
+    if (raw) state.disappearing = new Map(JSON.parse(raw));
+  } catch {}
+  /* Alle 30s prüfen — reicht für Minuten-Timer, ohne unnötig oft
+     durchzulaufen. */
+  setInterval(pruneDisappearingMessages, 30000);
 }
 
 /* ── Sicherheitscode / Fingerabdruck der Verschlüsselung ──
@@ -2320,7 +2639,8 @@ function attachSheet() {
     video: '<svg viewBox="0 0 24 24" width="26" height="26" fill="#fff"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>',
     file: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L14.5 3z"/><path d="M14 3v6h6"/></svg>',
     pin: '<svg viewBox="0 0 24 24" width="24" height="24" fill="#fff"><path d="M12 2a7 7 0 0 0-7 7c0 5.25 7 13 7 13s7-7.75 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z"/></svg>',
-    contact: '<svg viewBox="0 0 24 24" width="24" height="24" fill="#fff"><path d="M12 2a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 12c5 0 9 2.5 9 5.5V22H3v-2.5C3 16.5 7 14 12 14z"/></svg>'
+    contact: '<svg viewBox="0 0 24 24" width="24" height="24" fill="#fff"><path d="M12 2a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 12c5 0 9 2.5 9 5.5V22H3v-2.5C3 16.5 7 14 12 14z"/></svg>',
+    poll: '<svg viewBox="0 0 24 24" width="22" height="22" fill="#fff"><path d="M4 10h4v10H4V10zm6-6h4v16h-4V4zm6 9h4v7h-4v-7z"/></svg>'
   };
   const item = (icon, label, onclick) => `
     <button class="attachitem" onclick="${onclick}">
@@ -2331,30 +2651,332 @@ function attachSheet() {
     <div class="sheetbox">
       <div class="grabber"></div>
       <div class="attachgrid">
-        ${item(svg.camera, 'Kamera', "window.__app.pickMedia('image/*','image')")}
-        ${item(svg.gallery, 'Galerie', "window.__app.pickMedia('image/*','image')")}
-        ${item(svg.video, 'Video', "window.__app.pickMedia('video/*','video')")}
-        ${item(svg.file, 'Datei', "window.__app.pickMedia('*/*','file')")}
+        ${item(svg.camera, 'Kamera', "window.__app.pickMedia('image/*','image',true)")}
+        ${item(svg.gallery, 'Galerie', "window.__app.pickMedia('image/*','image',false)")}
+        ${item(svg.video, 'Video', "window.__app.pickMedia('video/*','video',true)")}
+        ${item(svg.file, 'Datei', "window.__app.pickMedia('*/*','file',false)")}
         ${item(svg.pin, 'Standort', "window.__app.shareLocation()")}
         ${item(svg.contact, 'Kontakt', "window.__app.shareContact()")}
+        ${item(svg.poll, 'Umfrage', "window.__app.openCreatePoll()")}
       </div>
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
 }
 
-function shareLocation() {
+/* ── Umfrage-Feature ──
+   Eine Umfrage ist eine strukturierte Nachricht (__poll) mit Frage +
+   Optionen. Stimmen werden als eigene, an alle Teilnehmer gesendete
+   __pollVote-Nachrichten übertragen und lokal aggregiert — ohne
+   zentralen Server, der die Ergebnisse kennen müsste (passt zum
+   Ende-zu-Ende-Prinzip: der Server sieht nur verschlüsselte Umschläge,
+   nie den Inhalt der Frage oder wer wie abgestimmt hat). */
+function openCreatePoll() {
   document.getElementById('attachSheet')?.remove();
-  toast('Standort teilen folgt in einem späteren Schritt');
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'createPollSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 12px">Umfrage erstellen</h3>
+      <input id="pollQuestion" type="text" placeholder="Frage"
+        style="width:100%;box-sizing:border-box;font-size:16px;padding:12px;border-radius:10px;
+          border:none;background:var(--panel2);color:var(--tx);margin-bottom:10px">
+      <div id="pollOptionsWrap">
+        <input class="pollopt" type="text" placeholder="Option 1"
+          style="width:100%;box-sizing:border-box;font-size:15px;padding:10px;border-radius:8px;
+            border:none;background:var(--panel2);color:var(--tx);margin-bottom:8px">
+        <input class="pollopt" type="text" placeholder="Option 2"
+          style="width:100%;box-sizing:border-box;font-size:15px;padding:10px;border-radius:8px;
+            border:none;background:var(--panel2);color:var(--tx);margin-bottom:8px">
+      </div>
+      <button class="btn ghost" style="width:100%;margin-bottom:10px" onclick="window.__app.addPollOption()">+ Option hinzufügen</button>
+      <button class="btn" style="width:100%" onclick="window.__app.sendPoll()">Umfrage senden</button>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
 }
-function shareContact() {
-  document.getElementById('attachSheet')?.remove();
-  toast('Kontakt teilen folgt in einem späteren Schritt');
+function addPollOption() {
+  const wrap = document.getElementById('pollOptionsWrap');
+  const count = wrap.children.length + 1;
+  const input = document.createElement('input');
+  input.className = 'pollopt'; input.type = 'text'; input.placeholder = 'Option ' + count;
+  input.style.cssText = 'width:100%;box-sizing:border-box;font-size:15px;padding:10px;border-radius:8px;' +
+    'border:none;background:var(--panel2);color:var(--tx);margin-bottom:8px';
+  wrap.appendChild(input);
+}
+async function sendPoll() {
+  const question = document.getElementById('pollQuestion')?.value.trim();
+  const options = [...document.querySelectorAll('.pollopt')]
+    .map(i => i.value.trim()).filter(Boolean);
+  if (!question || options.length < 2) { toast('⚠️ Frage und mindestens 2 Optionen nötig'); return; }
+  if (!state.activeConv) return;
+  const pollId = 'poll_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  document.getElementById('createPollSheet')?.remove();
+  try {
+    await sendMessage(state.activeConv.peerId, state.activeConv.convId,
+      JSON.stringify({ __poll: { id: pollId, question, options } }));
+    if (!state.pollVotes) state.pollVotes = new Map();
+    renderChatMessages();
+  } catch (e) { toast('⚠️ ' + e.message); }
+}
+function votePoll(pollId, optionIdx, question, options) {
+  if (!state.pollVotes) state.pollVotes = new Map();
+  const votes = state.pollVotes.get(pollId) || {};
+  votes[state.me.id] = optionIdx;
+  state.pollVotes.set(pollId, votes);
+  if (state.activeConv) {
+    sendMessage(state.activeConv.peerId, state.activeConv.convId,
+      JSON.stringify({ __pollVote: { pollId, optionIdx } })).catch(() => {});
+  }
+  renderChatMessages();
+}
+function renderPollCard(poll, msgId) {
+  const votes = state.pollVotes?.get(poll.id) || {};
+  const myVote = votes[state.me.id];
+  const counts = poll.options.map((_, i) => Object.values(votes).filter(v => v === i).length);
+  const total = counts.reduce((a, b) => a + b, 0) || 1;
+  return `
+    <div class="pollcard">
+      <div class="pollq">📊 ${esc(poll.question)}</div>
+      ${poll.options.map((opt, i) => {
+        const pct = Math.round((counts[i] / total) * 100);
+        const chosen = myVote === i;
+        return `
+          <button class="polloption ${chosen ? 'polloption-chosen' : ''}"
+            onclick="window.__app.votePoll('${esc(poll.id)}',${i},'${esc(poll.question)}',null)">
+            <div class="polloption-bar" style="width:${myVote != null ? pct : 0}%"></div>
+            <span class="polloption-label">${chosen ? '✅ ' : ''}${esc(opt)}</span>
+            ${myVote != null ? `<span class="polloption-pct">${pct}%</span>` : ''}
+          </button>`;
+      }).join('')}
+      <div class="pollmeta">${total} Stimme${total !== 1 ? 'n' : ''}</div>
+    </div>`;
 }
 
-function pickMedia(accept, kind) {
+/* ═══════════════════════════════════════════════════════════════════════
+   GEPLANTE ANRUFE — Termin vereinbaren, Push-Erinnerung zur Fälligkeit
+   ═══════════════════════════════════════════════════════════════════════ */
+function openScheduleCall() {
+  document.getElementById('chatMenuSheet')?.remove();
+  if (!state.activeConv) return;
+  const now = new Date();
+  now.setMinutes(now.getMinutes() + 30 - (now.getMinutes() % 5));   // auf nächste 5-Min-Marke runden
+  const localIso = new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'scheduleCallSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 12px">Anruf planen mit ${esc(state.activeConv.name)}</h3>
+      <label style="font-size:13px;color:var(--sub)">Datum &amp; Uhrzeit</label>
+      <input id="scheduleDateInput" type="datetime-local" value="${localIso}" min="${localIso}"
+        style="width:100%;box-sizing:border-box;font-size:16px;padding:12px;border-radius:10px;
+          border:none;background:var(--panel2);color:var(--tx);margin:8px 0 16px">
+      <div style="display:flex;gap:10px;margin-bottom:16px">
+        <button class="btn ghost" style="flex:1" id="scheduleKindAudio" onclick="window.__app.setScheduleKind('audio')">🎤 Audio</button>
+        <button class="btn ghost" style="flex:1" id="scheduleKindVideo" onclick="window.__app.setScheduleKind('video')">🎥 Video</button>
+      </div>
+      <button class="btn" style="width:100%" onclick="window.__app.confirmScheduleCall()">Anruf planen</button>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+  state._scheduleKind = 'audio';
+  setScheduleKind('audio');
+}
+function setScheduleKind(kind) {
+  state._scheduleKind = kind;
+  document.getElementById('scheduleKindAudio')?.classList.toggle('btn', kind === 'audio');
+  document.getElementById('scheduleKindAudio')?.classList.toggle('ghost', kind !== 'audio');
+  document.getElementById('scheduleKindVideo')?.classList.toggle('btn', kind === 'video');
+  document.getElementById('scheduleKindVideo')?.classList.toggle('ghost', kind !== 'video');
+}
+async function confirmScheduleCall() {
+  const dtVal = document.getElementById('scheduleDateInput')?.value;
+  if (!dtVal || !state.activeConv) return;
+  const scheduledAt = new Date(dtVal).getTime();
+  if (scheduledAt <= Date.now()) { toast('⚠️ Zeitpunkt liegt in der Vergangenheit'); return; }
+  try {
+    await api._fetch('/api/scheduled-calls', {
+      method: 'POST',
+      body: { peerId: state.activeConv.peerId, kind: state._scheduleKind || 'audio', scheduledAt }
+    });
+    document.getElementById('scheduleCallSheet')?.remove();
+    toast('📅 Anruf geplant für ' + new Date(scheduledAt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' }));
+  } catch (e) { toast('⚠️ ' + e.message); }
+}
+
+async function openScheduledCallsList() {
+  let calls = [];
+  try { ({ calls } = await api._fetch('/api/scheduled-calls')); }
+  catch (e) { toast('⚠️ ' + e.message); return; }
+
+  const statusInfo = (c) => {
+    if (c.status === 'accepted') return { label: 'Bestätigt', color: 'var(--acc2)' };
+    if (c.status === 'declined') return { label: 'Abgelehnt', color: '#f15c6d' };
+    return { label: c.isCreator ? 'Wartet auf Antwort' : 'Antwort ausstehend', color: 'var(--sub)' };
+  };
+
+  openSettingsPage('Geplante Anrufe', calls.length ? `
+    <div class="menulist">
+      ${calls.map(c => {
+        const st = statusInfo(c);
+        return `
+        <div class="menuitem" style="cursor:default;align-items:flex-start">
+          <span class="mi-ic">${c.kind === 'video' ? '🎥' : '🎤'}</span>
+          <div style="flex:1">
+            <div>${esc(c.peerName)}</div>
+            <div style="font-size:12px;color:var(--sub)">${new Date(c.scheduledAt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' })}</div>
+            <div style="font-size:12px;color:${st.color};font-weight:600;margin-top:2px">${st.label}</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+            ${!c.isCreator && c.status === 'pending' ? `
+              <button class="btn ghost" style="padding:5px 10px;font-size:12px" onclick="window.__app.respondScheduledCall('${esc(c.id)}','declined');window.__app.openScheduledCallsList()">Ablehnen</button>
+              <button class="btn" style="padding:5px 10px;font-size:12px" onclick="window.__app.respondScheduledCall('${esc(c.id)}','accepted');window.__app.openScheduledCallsList()">Annehmen</button>
+            ` : `
+              <button class="btn ghost" style="padding:6px 12px;font-size:13px" onclick="window.__app.cancelScheduledCall('${esc(c.id)}')">Absagen</button>
+            `}
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
+  ` : `<p style="color:var(--sub);text-align:center;margin-top:40px">Keine geplanten Anrufe.</p>`);
+}
+async function cancelScheduledCall(id) {
+  try {
+    await api._fetch('/api/scheduled-calls?id=' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Anruf abgesagt');
+    openScheduledCallsList();
+  } catch (e) { toast('⚠️ ' + e.message); }
+}
+
+/* Erinnerung, die über den WebSocket eintrifft (siehe wireSocketEvents,
+   'call-reminder') oder als Push ankommt (siehe sw.js) — zeigt eine
+   auffällige In-App-Karte mit direktem "Jetzt anrufen"-Knopf. */
+function showCallReminderNotification(msg) {
+  const conv = [...state.convs.values()].find(c => c.peerId === msg.peerId);
+  const peerName = conv?.name || msg.peerId;
+  const banner = document.createElement('div');
+  banner.className = 'sheet'; banner.id = 'callReminderSheet';
+  banner.onclick = ev => { if (ev.target === banner) banner.remove(); };
+  banner.innerHTML = `
+    <div class="sheetbox" style="text-align:center">
+      <div style="font-size:40px;margin-bottom:8px">${msg.kind === 'video' ? '🎥' : '📞'}</div>
+      <h3 style="margin:0 0 4px">Geplanter Anruf</h3>
+      <p style="color:var(--sub);margin:0 0 20px">Zeit für deinen Anruf mit ${esc(peerName)}</p>
+      <button class="btn" style="width:100%;margin-bottom:8px" onclick="window.__app.startScheduledCall('${esc(msg.peerId)}','${msg.kind}')">Jetzt anrufen</button>
+      <button class="btn ghost" style="width:100%" onclick="document.getElementById('callReminderSheet').remove()">Später</button>
+    </div>`;
+  document.getElementById('overlays').appendChild(banner);
+  if ('vibrate' in navigator) navigator.vibrate([200, 100, 200]);
+}
+function startScheduledCall(peerId, kind) {
+  document.getElementById('callReminderSheet')?.remove();
+  const conv = [...state.convs.values()].find(c => c.peerId === peerId);
+  if (conv) { openChat(conv); setTimeout(() => Call.start(peerId, conv.name, kind), 300); }
+}
+
+/* Eingeladener bekommt diese Karte, sobald jemand einen Anruf mit ihm
+   plant — Annehmen/Ablehnen wird sofort an den Ersteller zurückgemeldet
+   (siehe respondScheduledCall), nicht erst beim Ablauf der Erinnerung. */
+function showCallInviteNotification(msg) {
+  const when = new Date(msg.scheduledAt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' });
+  const banner = document.createElement('div');
+  banner.className = 'sheet'; banner.id = 'callInviteSheet';
+  banner.onclick = ev => { if (ev.target === banner) banner.remove(); };
+  banner.innerHTML = `
+    <div class="sheetbox" style="text-align:center">
+      <div style="font-size:40px;margin-bottom:8px">${msg.kind === 'video' ? '🎥' : '📞'}</div>
+      <h3 style="margin:0 0 4px">Anrufeinladung</h3>
+      <p style="color:var(--sub);margin:0 0 4px">${esc(msg.fromName || msg.fromId)} möchte dich anrufen</p>
+      <p style="color:var(--sub);margin:0 0 20px;font-weight:600">${when}</p>
+      <div style="display:flex;gap:10px">
+        <button class="btn ghost" style="flex:1" onclick="window.__app.respondScheduledCall('${esc(msg.id)}','declined')">Ablehnen</button>
+        <button class="btn" style="flex:1" onclick="window.__app.respondScheduledCall('${esc(msg.id)}','accepted')">Annehmen</button>
+      </div>
+    </div>`;
+  document.getElementById('overlays').appendChild(banner);
+  if ('vibrate' in navigator) navigator.vibrate([200, 100, 200]);
+}
+async function respondScheduledCall(id, status) {
+  document.getElementById('callInviteSheet')?.remove();
+  try {
+    await api._fetch('/api/scheduled-calls/respond', { method: 'POST', body: { id, status } });
+    toast(status === 'accepted' ? '✅ Anruf bestätigt' : 'Anruf abgelehnt');
+  } catch (e) { toast('⚠️ ' + e.message); }
+}
+
+/* Ersteller bekommt diese Karte, sobald der Eingeladene reagiert hat —
+   das ist der Kern des Bestätigungsworkflows: er erfährt aktiv, nicht
+   erst durch Nachschauen in der Terminliste. */
+function showCallResponseNotification(msg) {
+  const accepted = msg.status === 'accepted';
+  toast(`${accepted ? '✅' : '❌'} ${esc(msg.byName || msg.byId)} hat den geplanten Anruf ${accepted ? 'bestätigt' : 'abgelehnt'}`, 4000);
+}
+
+function shareLocation() {
+  document.getElementById('attachSheet')?.remove();
+  if (!navigator.geolocation) { toast('⚠️ Standort auf diesem Gerät nicht verfügbar'); return; }
+  toast('📍 Standort wird ermittelt…', 4000);
+  navigator.geolocation.getCurrentPosition(
+    async (pos) => {
+      const { latitude, longitude } = pos.coords;
+      const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
+      if (!state.activeConv) return;
+      try {
+        await sendMessage(state.activeConv.peerId, state.activeConv.convId,
+          JSON.stringify({ __location: { lat: latitude, lng: longitude, url: mapsUrl } }));
+        renderChatMessages();
+      } catch (e) { toast('⚠️ ' + e.message); }
+    },
+    () => toast('⚠️ Standortzugriff verweigert'),
+    { enableHighAccuracy: true, timeout: 10000 }
+  );
+}
+
+/* ── Kontakt teilen — aus den eigenen SecureChat-Kontakten auswählen,
+   Name + userId werden als strukturierte Nachricht gesendet. ── */
+async function shareContact() {
+  document.getElementById('attachSheet')?.remove();
+  let users;
+  try { ({ users } = await api.listUsers()); }
+  catch (e) { toast('⚠️ ' + e.message); return; }
+
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'shareContactSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 12px">Kontakt teilen</h3>
+      <div class="menulist" style="max-height:50vh;overflow-y:auto">
+        ${users.map(u => `
+          <button class="menuitem" onclick="window.__app.sendContactCard('${esc(u.id)}','${esc(u.name || '')}')">
+            <div class="av" style="width:32px;height:32px;font-size:14px">${esc((u.name || '?')[0].toUpperCase())}</div>
+            <span>${esc(u.name || u.id)}</span>
+          </button>`).join('')}
+      </div>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+async function sendContactCard(userId, name) {
+  document.getElementById('shareContactSheet')?.remove();
+  if (!state.activeConv) return;
+  try {
+    await sendMessage(state.activeConv.peerId, state.activeConv.convId,
+      JSON.stringify({ __contact: { id: userId, name } }));
+    renderChatMessages();
+  } catch (e) { toast('⚠️ ' + e.message); }
+}
+
+function pickMedia(accept, kind, useCamera) {
   document.getElementById('attachSheet')?.remove();
   const input = document.createElement('input');
   input.type = 'file'; input.accept = accept;
+  /* capture="environment" weist mobile Browser an, direkt die Kamera-
+     App zu öffnen statt der Dateiauswahl — Foto/Video wird sofort nach
+     Aufnahme als Anhang zurückgegeben und automatisch weiterverarbeitet. */
+  if (useCamera) input.capture = 'environment';
   input.onchange = async () => {
     const file = input.files?.[0];
     if (!file) return;
@@ -2405,6 +3027,17 @@ function parseIncomingMedia(text) {
   try {
     const obj = JSON.parse(text);
     if (obj && obj.__media) return { ref: obj.__media, kind: obj.kind };
+  } catch {}
+  return null;
+}
+
+/* Generischer Parser für strukturierte Nachrichtentypen (__location,
+   __contact) — dasselbe Muster wie parseIncomingMedia, aber ohne
+   Medien-Download-Logik, da diese Karten nur Text/Links enthalten. */
+function parseStructured(text, key) {
+  try {
+    const obj = JSON.parse(text);
+    if (obj && obj[key]) return obj[key];
   } catch {}
   return null;
 }
