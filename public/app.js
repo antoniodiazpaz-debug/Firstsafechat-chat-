@@ -1147,14 +1147,17 @@ function renderShell() {
     <div class="topbar">
       <h1>SecureChat</h1>
       <div class="topicons">
-        <button class="iconbtn" onclick="window.__app.openCamera()">📷</button>
+        <button class="iconbtn" onclick="window.__app.openCamera()" aria-label="Kamera">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+        </button>
         <button class="iconbtn" onclick="window.__app.mainMenu(event)">⋮</button>
       </div>
     </div>
     <div class="searchwrap">
       <div class="search"><span class="ic">🔍</span>
-        <input id="searchInput" placeholder="Meta AI fragen oder suchen" oninput="window.__app.onSearch(this.value)"></div>
+        <input id="searchInput" placeholder="Chats und Nachrichten durchsuchen" oninput="window.__app.onSearch(this.value)"></div>
     </div>
+    <div id="searchResults" style="display:none"></div>
     <div class="pillbar" id="pillbar"></div>
     <div id="main"></div>
     <div id="navbar"></div>`;
@@ -1176,11 +1179,17 @@ function renderPills() {
 
 function renderNav() {
   const totalUnread = [...state.convs.values()].reduce((a, c) => a + (c.unread || 0), 0);
+  const svg = {
+    chats: '<svg viewBox="0 0 24 24" width="23" height="23" fill="currentColor"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2z"/></svg>',
+    updates: '<svg viewBox="0 0 24 24" width="23" height="23" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg>',
+    communities: '<svg viewBox="0 0 24 24" width="23" height="23" fill="currentColor"><circle cx="8" cy="8" r="3.2"/><circle cx="16.5" cy="9" r="2.6"/><path d="M2 20c0-3.5 3-6 6-6s6 2.5 6 6H2z"/><path d="M14 20c.2-2.5 1.5-4.5 3.3-5.5 2.5.3 4.7 2.3 4.7 5.5h-8z"/></svg>',
+    calls: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg>'
+  };
   const tabs = [
-    ['chats', '💬', 'Chats', totalUnread],
-    ['updates', '📸', 'Aktuelles', 0],
-    ['communities', '👥', 'Communitys', 0],
-    ['calls', '📞', 'Anrufe', 0]
+    ['chats', svg.chats, 'Chats', totalUnread],
+    ['updates', svg.updates, 'Aktuelles', 0],
+    ['communities', svg.communities, 'Communitys', 0],
+    ['calls', svg.calls, 'Anrufe', 0]
   ];
   $('#navbar').innerHTML = tabs.map(([id, ic, lb, bdg]) => `
     <button class="${state.tab === id ? 'on' : ''}" onclick="window.__app.go('${id}')">
@@ -1192,6 +1201,92 @@ function renderNav() {
 function go(tab) {
   state.tab = tab; state.view = 'list';
   renderNav(); renderMain();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   VOLLTEXTSUCHE — Chat-Namen UND bereits entschlüsselte Nachrichten
+   ─────────────────────────────────────────────────────────────────────
+   Durchsucht ausschließlich lokal vorhandenen, bereits entschlüsselten
+   Text (state.messages) — es gibt serverseitig nichts zu durchsuchen,
+   das wäre bei Ende-zu-Ende-Verschlüsselung ohnehin unmöglich. Zeigt
+   Treffer mit Chatname + Textausschnitt, Antippen öffnet den Chat.
+   ═══════════════════════════════════════════════════════════════════════ */
+function onSearch(v) {
+  state.search = v.trim();
+  const resultsEl = $('#searchResults');
+  const mainEl = $('#main');
+  if (!state.search) {
+    resultsEl.style.display = 'none';
+    resultsEl.innerHTML = '';
+    mainEl.style.display = '';
+    renderMain();
+    return;
+  }
+
+  const q = state.search.toLowerCase();
+  const hits = [];
+  for (const [convId, msgs] of state.messages.entries()) {
+    const conv = state.convs.get(convId);
+    const name = conv?.name || conv?.peerId || 'Unbekannt';
+    for (const m of msgs) {
+      if (m.text && m.text.toLowerCase().includes(q)) {
+        hits.push({ convId, name, text: m.text, ts: m.ts, conv });
+      }
+    }
+  }
+  hits.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+
+  const nameMatches = [...state.convs.values()]
+    .filter(c => (c.name || c.peerId || '').toLowerCase().includes(q));
+
+  mainEl.style.display = 'none';
+  resultsEl.style.display = 'block';
+
+  if (!hits.length && !nameMatches.length) {
+    resultsEl.innerHTML = `<div class="empty"><div class="ic">🔍</div><div>Keine Treffer für „${esc(state.search)}"</div></div>`;
+    return;
+  }
+
+  const highlight = (text) => {
+    const idx = text.toLowerCase().indexOf(q);
+    if (idx === -1) return esc(text.slice(0, 80));
+    const start = Math.max(0, idx - 20);
+    const end = Math.min(text.length, idx + q.length + 40);
+    const before = esc(text.slice(start, idx));
+    const match = esc(text.slice(idx, idx + q.length));
+    const after = esc(text.slice(idx + q.length, end));
+    return (start > 0 ? '…' : '') + before + `<mark>${match}</mark>` + after + (end < text.length ? '…' : '');
+  };
+
+  resultsEl.innerHTML = `
+    ${nameMatches.length ? `
+      <div class="searchsection">Chats</div>
+      ${nameMatches.map(c => `
+        <div class="row" onclick="window.__app.openConvById('${c.convId}')">
+          <div class="av">${(c.name || '?')[0].toUpperCase()}</div>
+          <div class="meta"><div class="l1"><span class="nm">${esc(c.name || c.peerId)}</span></div></div>
+        </div>`).join('')}
+    ` : ''}
+    ${hits.length ? `
+      <div class="searchsection">Nachrichten</div>
+      ${hits.slice(0, 50).map(h => `
+        <div class="row" onclick="window.__app.openConvById('${h.convId}')">
+          <div class="av">${(h.name || '?')[0].toUpperCase()}</div>
+          <div class="meta">
+            <div class="l1"><span class="nm">${esc(h.name)}</span><span class="tm">${h.ts ? time(h.ts) : ''}</span></div>
+            <div class="l2"><span class="pv">${highlight(h.text)}</span></div>
+          </div>
+        </div>`).join('')}
+    ` : ''}
+  `;
+}
+
+function openConvById(convId) {
+  const conv = state.convs.get(convId);
+  if (!conv) return;
+  $('#searchInput').value = '';
+  onSearch('');
+  openChat(conv);
 }
 
 function renderMain() {
@@ -1302,9 +1397,10 @@ function deleteSelectedChats() {
    ═══════════════════════════════════════════════════════════════════════ */
 const appActions = {
   setPill(id) { activePill = id; renderPills(); renderMain(); },
-  onSearch(v) { state.search = v; renderMain(); },
+  onSearch(v) { onSearch(v); },
   go(tab) { go(tab); },
   openConv(i) { const c = window.__conv[i]; openChat(c); },
+  openConvById(convId) { openConvById(convId); },
   enterSelectMode(convId) { enterSelectMode(convId); },
   exitSelectMode() { exitSelectMode(); },
   toggleSelectConv(convId) { toggleSelectConv(convId); },
@@ -1550,7 +1646,9 @@ function openChat(c) {
     <div id="chatbody"></div>
     <div id="composer">
       <div class="cbar">
-        <button class="iconbtn" onclick="window.__app.attachSheet()">📎</button>
+        <button class="iconbtn" onclick="window.__app.attachSheet()" aria-label="Anhängen">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
         <div class="cin">
           <textarea id="msgInput" rows="1" placeholder="Nachricht"
             oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,110)+'px'"
