@@ -428,6 +428,7 @@ async function flushOutbox() {
 async function boot() {
   loadDisappearingSettings();
   loadChatPrefs();
+  loadAccentTheme();
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
@@ -1497,6 +1498,8 @@ const appActions = {
   confirmDeleteAccount() { confirmDeleteAccount(); },
   mainMenu(e) { openMainMenu(e); },
   openSettings() { openSettings(); },
+  openDesignSettings() { openDesignSettings(); },
+  setAccentTheme(theme) { setAccentTheme(theme); },
   openChatSettings() { openChatSettings(); },
   toggleChatPref(key, val) { toggleChatPref(key, val); },
   setFontSizePref(size) { setFontSizePref(size); },
@@ -2234,7 +2237,7 @@ function openSettingsPage(title, bodyHtml) {
       <button class="iconbtn" onclick="document.getElementById('settingsPage').remove()">←</button>
       <div class="name"><div class="nm">${esc(title)}</div></div>
     </div>
-    <div style="flex:1;overflow-y:auto;padding:16px">${bodyHtml}</div>`;
+    <div style="flex:1;overflow-y:auto;padding:16px;margin-top:calc(58px + env(safe-area-inset-top))">${bodyHtml}</div>`;
   document.getElementById('overlays').appendChild(page);
 }
 
@@ -2247,6 +2250,9 @@ function openSettings() {
       <button class="menuitem" onclick="window.__app.openChatSettings()">
         <span class="mi-ic">💬</span><span>Chats</span>
       </button>
+      <button class="menuitem" onclick="window.__app.openDesignSettings()">
+        <span class="mi-ic">🎨</span><span>Design</span>
+      </button>
       <button class="menuitem" onclick="window.__app.openLanguageSettings()">
         <span class="mi-ic">🌐</span><span>Sprache</span>
       </button>
@@ -2255,6 +2261,55 @@ function openSettings() {
       </button>
     </div>
     <p style="color:var(--sub);font-size:13px;margin-top:20px">SecureChat — Version 1.0</p>
+  `);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   DESIGN-EINSTELLUNGEN — Akzentfarbe für Buttons/aktive Elemente
+   ─────────────────────────────────────────────────────────────────────
+   Setzt --acc/--acc2 zur Laufzeit per CSS-Custom-Property auf dem
+   Root-Element — betrifft dadurch automatisch ALLE Stellen, die diese
+   Variablen nutzen (Buttons, Sende-Icon, Häkchen, aktive Tab-Farbe),
+   ohne dass jede einzelne Komponente angepasst werden muss.
+   ═══════════════════════════════════════════════════════════════════════ */
+const ACCENT_THEMES = {
+  green:  { acc: '#00a884', acc2: '#25d366', label: 'Grün (Standard)' },
+  blue:   { acc: '#1d4ed8', acc2: '#5b9bf5', label: 'Blau' },
+  purple: { acc: '#7c3aed', acc2: '#a78bfa', label: 'Violett' },
+  orange: { acc: '#ea580c', acc2: '#fb923c', label: 'Orange' },
+  pink:   { acc: '#db2777', acc2: '#f472b6', label: 'Pink' },
+  red:    { acc: '#dc2626', acc2: '#f87171', label: 'Rot' }
+};
+function loadAccentTheme() {
+  let theme = 'green';
+  try { theme = localStorage.getItem('sc:accentTheme') || 'green'; } catch {}
+  applyAccentTheme(theme);
+}
+function applyAccentTheme(theme) {
+  const t = ACCENT_THEMES[theme] || ACCENT_THEMES.green;
+  document.documentElement.style.setProperty('--acc', t.acc);
+  document.documentElement.style.setProperty('--acc2', t.acc2);
+  state.accentTheme = theme;
+}
+function setAccentTheme(theme) {
+  applyAccentTheme(theme);
+  try { localStorage.setItem('sc:accentTheme', theme); } catch {}
+  openDesignSettings();
+}
+function openDesignSettings() {
+  const current = state.accentTheme || 'green';
+  openSettingsPage('Design', `
+    <label style="font-size:13px;color:var(--sub)">Akzentfarbe</label>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px">
+      ${Object.entries(ACCENT_THEMES).map(([key, t]) => `
+        <button onclick="window.__app.setAccentTheme('${key}')"
+          style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 4px;
+            border-radius:12px;border:2px solid ${current === key ? t.acc2 : 'transparent'};
+            background:var(--panel2);cursor:pointer">
+          <span style="width:32px;height:32px;border-radius:50%;background:${t.acc2}"></span>
+          <span style="font-size:12px;color:var(--tx)">${t.label}</span>
+        </button>`).join('')}
+    </div>
   `);
 }
 
