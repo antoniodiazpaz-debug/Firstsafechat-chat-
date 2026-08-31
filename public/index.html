@@ -95,10 +95,10 @@ img{max-width:100%}
 .switch input:checked + .switch-slider{background:var(--acc2)}
 .switch input:checked + .switch-slider::before{transform:translateX(18px)}
 .navbtn3d{position:relative;width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-  background:radial-gradient(circle at 35% 30%,#5b9bf5,#1d4ed8 70%);
+  background:radial-gradient(circle at 35% 30%,var(--acc2,#5b9bf5),var(--acc,#1d4ed8) 70%);
   border:2px solid #b8bcc0;box-shadow:0 2px 5px rgba(0,0,0,.4),inset 0 1px 1px rgba(255,255,255,.35);
   margin:0 auto 2px}
-.navbtn3d-on{background:radial-gradient(circle at 35% 30%,var(--acc2,#4ade80),var(--acc,#16a34a) 70%)}
+.navbtn3d-on{filter:brightness(1.15) saturate(1.2)}
 
 /* Suchleiste */
 .searchwrap{padding:0 16px 10px}

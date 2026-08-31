@@ -1385,9 +1385,14 @@ function renderMain() {
   main.innerHTML = `
     ${selMode ? `
       <div class="selectbar">
-        <button class="iconbtn" onclick="window.__app.exitSelectMode()">✕</button>
+        <button class="iconbtn" onclick="window.__app.exitSelectMode()" aria-label="Schließen">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
         <span class="selectcount">${state.selectedConvs.size} ausgewählt</span>
-        <button class="iconbtn" onclick="window.__app.deleteSelectedChats()" aria-label="Löschen">🗑️</button>
+        <button class="iconbtn navbtn3d" style="background:radial-gradient(circle at 35% 30%,#f87171,#dc2626 70%)"
+          onclick="window.__app.deleteSelectedChats()" aria-label="Löschen">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M6 7h12l-1 13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7zm3-3h6l1 2H8l1-2z"/></svg>
+        </button>
       </div>` : ''}
     <div class="scroll" style="height:100%;position:relative">
       ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') :
@@ -1853,7 +1858,9 @@ function openChat(c) {
       <button class="iconbtn callbtn3d callbtn3d-video" onclick="window.__app.startCall('video')" aria-label="Videoanruf">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>
       </button>
-      <button class="iconbtn" onclick="window.__app.chatMenu(event)">⋮</button>
+      <button class="iconbtn navbtn3d" onclick="window.__app.chatMenu(event)" aria-label="Menü">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+      </button>
     </div>
     <div id="chatbody"></div>
     <div id="composer">
@@ -2022,10 +2029,17 @@ function renderChatMessages() {
   }
   body.innerHTML = (state.msgSelectMode ? `
     <div class="selectbar" style="position:sticky;top:0;z-index:10">
-      <button class="iconbtn" onclick="window.__app.exitMsgSelectMode()">✕</button>
+      <button class="iconbtn" onclick="window.__app.exitMsgSelectMode()" aria-label="Schließen">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
       <span class="selectcount">${state.selectedMsgs.size} ausgewählt</span>
-      <button class="iconbtn" onclick="window.__app.forwardSelectedMsgs()" aria-label="Weiterleiten">↪️</button>
-      <button class="iconbtn" onclick="window.__app.deleteSelectedMsgs()" aria-label="Löschen">🗑️</button>
+      <button class="iconbtn navbtn3d" onclick="window.__app.forwardSelectedMsgs()" aria-label="Weiterleiten">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M14 5l7 7-7 7v-4c-5.5 0-9 2-11 5 .5-6 4-11 11-11V5z"/></svg>
+      </button>
+      <button class="iconbtn navbtn3d" style="background:radial-gradient(circle at 35% 30%,#f87171,#dc2626 70%)"
+        onclick="window.__app.deleteSelectedMsgs()" aria-label="Löschen">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M6 7h12l-1 13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7zm3-3h6l1 2H8l1-2z"/></svg>
+      </button>
     </div>` : '') + rows.join('');
   body.scrollTop = body.scrollHeight;
 }
