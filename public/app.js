@@ -1256,13 +1256,13 @@ function renderNav() {
   const svg = {
     chats: '<svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M10.5 3.5c-4.14 0-7.5 2.86-7.5 6.4 0 1.98 1.06 3.75 2.72 4.94-.09.94-.4 1.98-1.09 2.94a.4.4 0 0 0 .43.62c1.53-.35 2.7-1.02 3.5-1.62.6.13 1.24.2 1.94.2 4.14 0 7.5-2.86 7.5-6.4s-3.36-7.08-7.5-7.08z"/><path d="M18.9 15.5c1.3-1.05 2.1-2.5 2.1-4.1 0-2.55-2.1-4.7-4.9-5.4.15.6.24 1.23.24 1.9 0 4.2-3.98 7.6-8.9 7.6-.2 0-.4 0-.6-.02.9 2.1 3.4 3.62 6.36 3.62.5 0 .98-.05 1.44-.14.6.45 1.55 1 2.8 1.3a.32.32 0 0 0 .35-.5c-.55-.77-.8-1.6-.89-2.26z"/></svg>',
     updates: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="#fff" stroke="none"/></svg>',
-    communities: '<svg viewBox="0 0 24 24" width="20" height="20" fill="#fff"><circle cx="8" cy="8" r="3.2"/><circle cx="16.5" cy="9" r="2.6"/><path d="M2 20c0-3.5 3-6 6-6s6 2.5 6 6H2z"/><path d="M14 20c.2-2.5 1.5-4.5 3.3-5.5 2.5.3 4.7 2.3 4.7 5.5h-8z"/></svg>',
+    scheduled: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/><path d="M12 14v3l2 1"/></svg>',
     calls: '<svg viewBox="0 0 24 24" width="19" height="19" fill="#fff"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg>'
   };
   const tabs = [
     ['chats', svg.chats, 'Chats', totalUnread],
     ['updates', svg.updates, 'Aktuelles', 0],
-    ['communities', svg.communities, 'Communitys', 0],
+    ['scheduled', svg.scheduled, 'Geplant', 0],
     ['calls', svg.calls, 'Anrufe', 0]
   ];
   $('#navbar').innerHTML = tabs.map(([id, ic, lb, bdg]) => `
@@ -1367,6 +1367,10 @@ function renderMain() {
   if (state.view !== 'list') return;
   const main = $('#main');
   if (!main) return;
+  if (state.tab === 'scheduled') {
+    renderScheduledTab(main);
+    return;
+  }
   if (state.tab !== 'chats') {
     main.innerHTML = `<div class="empty"><div class="ic">🚧</div><div>Noch nicht verfügbar</div></div>`;
     return;
@@ -1385,9 +1389,14 @@ function renderMain() {
   main.innerHTML = `
     ${selMode ? `
       <div class="selectbar">
-        <button class="iconbtn" onclick="window.__app.exitSelectMode()">✕</button>
+        <button class="iconbtn" onclick="window.__app.exitSelectMode()" aria-label="Schließen">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
         <span class="selectcount">${state.selectedConvs.size} ausgewählt</span>
-        <button class="iconbtn" onclick="window.__app.deleteSelectedChats()" aria-label="Löschen">🗑️</button>
+        <button class="iconbtn navbtn3d" style="background:radial-gradient(circle at 35% 30%,#f87171,#dc2626 70%)"
+          onclick="window.__app.deleteSelectedChats()" aria-label="Löschen">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M6 7h12l-1 13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7zm3-3h6l1 2H8l1-2z"/></svg>
+        </button>
       </div>` : ''}
     <div class="scroll" style="height:100%;position:relative">
       ${convs.length ? convs.map((c, i) => convRow(c, i)).join('') :
@@ -1557,6 +1566,9 @@ const appActions = {
   submitReport() { submitReport(); },
   attachSheet() { attachSheet(); },
   shareLocation() { shareLocation(); },
+  sendLocationOnce() { sendLocationOnce(); },
+  startLiveLocation(min) { startLiveLocation(min); },
+  stopLiveLocation() { stopLiveLocation(); },
   shareContact() { shareContact(); },
   sendContactCard(id, name) { sendContactCard(id, name); },
   openCreatePoll() { openCreatePoll(); },
@@ -1853,7 +1865,9 @@ function openChat(c) {
       <button class="iconbtn callbtn3d callbtn3d-video" onclick="window.__app.startCall('video')" aria-label="Videoanruf">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>
       </button>
-      <button class="iconbtn" onclick="window.__app.chatMenu(event)">⋮</button>
+      <button class="iconbtn navbtn3d" onclick="window.__app.chatMenu(event)" aria-label="Menü">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+      </button>
     </div>
     <div id="chatbody"></div>
     <div id="composer">
@@ -1977,11 +1991,16 @@ function renderChatMessages() {
       const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom));
       const tileY = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
       const tileUrl = `https://tile.openstreetmap.org/${zoom}/${tileX}/${tileY}.png`;
+      const isLive = !!locationCard.liveId;
+      const expired = isLive && locationCard.expiresAt && Date.now() > locationCard.expiresAt;
+      const label = expired ? 'Live-Standort beendet'
+        : isLive ? `🔴 Live-Standort — endet ${new Date(locationCard.expiresAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}`
+        : 'Standort — auf Google Maps öffnen';
       content = `<a href="${esc(locationCard.url)}" target="_blank" rel="noopener" class="mapcard" style="text-decoration:none;color:inherit">
-        <div class="mapcard-thumb" style="background-image:url('${tileUrl}')">
+        <div class="mapcard-thumb" style="background-image:url('${tileUrl}')${expired ? ';filter:grayscale(1)' : ''}">
           <div class="mapcard-pin">📍</div>
         </div>
-        <div class="mapcard-label">Standort — auf Google Maps öffnen</div>
+        <div class="mapcard-label">${esc(label)}</div>
       </a>`;
     } else if (contactCard) {
       content = `<div class="filemsg">👤 <span>${esc(contactCard.name || contactCard.id)}</span></div>`;
@@ -2022,10 +2041,17 @@ function renderChatMessages() {
   }
   body.innerHTML = (state.msgSelectMode ? `
     <div class="selectbar" style="position:sticky;top:0;z-index:10">
-      <button class="iconbtn" onclick="window.__app.exitMsgSelectMode()">✕</button>
+      <button class="iconbtn" onclick="window.__app.exitMsgSelectMode()" aria-label="Schließen">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
       <span class="selectcount">${state.selectedMsgs.size} ausgewählt</span>
-      <button class="iconbtn" onclick="window.__app.forwardSelectedMsgs()" aria-label="Weiterleiten">↪️</button>
-      <button class="iconbtn" onclick="window.__app.deleteSelectedMsgs()" aria-label="Löschen">🗑️</button>
+      <button class="iconbtn navbtn3d" onclick="window.__app.forwardSelectedMsgs()" aria-label="Weiterleiten">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M14 5l7 7-7 7v-4c-5.5 0-9 2-11 5 .5-6 4-11 11-11V5z"/></svg>
+      </button>
+      <button class="iconbtn navbtn3d" style="background:radial-gradient(circle at 35% 30%,#f87171,#dc2626 70%)"
+        onclick="window.__app.deleteSelectedMsgs()" aria-label="Löschen">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M6 7h12l-1 13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7zm3-3h6l1 2H8l1-2z"/></svg>
+      </button>
     </div>` : '') + rows.join('');
   body.scrollTop = body.scrollHeight;
 }
@@ -3116,40 +3142,60 @@ async function confirmScheduleCall() {
   } catch (e) { toast('⚠️ ' + e.message); }
 }
 
+function scheduledCallStatusInfo(c) {
+  if (c.status === 'accepted') return { label: 'Bestätigt', color: 'var(--acc2)' };
+  if (c.status === 'declined') return { label: 'Abgelehnt', color: '#f15c6d' };
+  return { label: c.isCreator ? 'Wartet auf Antwort' : 'Antwort ausstehend', color: 'var(--sub)' };
+}
+function scheduledCallCard(c, onRespondReload) {
+  const st = scheduledCallStatusInfo(c);
+  return `
+    <div style="display:flex;align-items:flex-start;gap:14px;padding:14px 4px;border-bottom:1px solid var(--line)">
+      <span class="mi-ic" style="margin-top:2px">${c.kind === 'video' ? '🎥' : '🎤'}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600">${esc(c.peerName)}</div>
+        <div style="font-size:12px;color:var(--sub);margin-top:2px">${new Date(c.scheduledAt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' })}</div>
+        <div style="font-size:12px;color:${st.color};font-weight:600;margin-top:2px">${st.label}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;flex-shrink:0">
+        ${!c.isCreator && c.status === 'pending' ? `
+          <button class="btn ghost" style="padding:5px 10px;font-size:12px;white-space:nowrap" onclick="window.__app.respondScheduledCall('${esc(c.id)}','declined');${onRespondReload}">Ablehnen</button>
+          <button class="btn" style="padding:5px 10px;font-size:12px;white-space:nowrap" onclick="window.__app.respondScheduledCall('${esc(c.id)}','accepted');${onRespondReload}">Annehmen</button>
+        ` : c.status === 'accepted' ? `
+          <button class="btn" style="padding:6px 12px;font-size:13px;white-space:nowrap" onclick="window.__app.startScheduledCall('${esc(c.peerId)}','${c.kind}')">Anrufen</button>
+          <button class="btn ghost" style="padding:5px 10px;font-size:12px;white-space:nowrap" onclick="window.__app.cancelScheduledCall('${esc(c.id)}');${onRespondReload}">Absagen</button>
+        ` : `
+          <button class="btn ghost" style="padding:6px 12px;font-size:13px;white-space:nowrap" onclick="window.__app.cancelScheduledCall('${esc(c.id)}');${onRespondReload}">Absagen</button>
+        `}
+      </div>
+    </div>`;
+}
+
+/* Direkt im "Geplant"-Tab der Chatliste eingebettet — Alternative zum
+   Sheet unter dem Hauptmenü, für schnelleren Zugriff ohne extra Klick. */
+async function renderScheduledTab(main) {
+  main.innerHTML = `<div class="empty"><div class="ic">📅</div><div>Lade…</div></div>`;
+  let calls = [];
+  try { ({ calls } = await api._fetch('/api/scheduled-calls')); }
+  catch (e) {
+    main.innerHTML = `<div class="empty"><div class="ic">⚠️</div><div>Konnte nicht geladen werden</div></div>`;
+    return;
+  }
+  if (state.tab !== 'scheduled') return;   // Tab könnte während des await gewechselt worden sein
+  main.innerHTML = `
+    <div class="scroll" style="height:100%;position:relative">
+      ${calls.length ? `<div class="menulist">${calls.map(c => scheduledCallCard(c, "window.__app.go('scheduled')")).join('')}</div>`
+        : `<div class="empty"><div class="ic">📅</div><div>Noch keine geplanten Anrufe.<br>Öffne einen Chat → Menü → Anruf planen.</div></div>`}
+    </div>`;
+}
+
 async function openScheduledCallsList() {
   let calls = [];
   try { ({ calls } = await api._fetch('/api/scheduled-calls')); }
   catch (e) { toast('⚠️ ' + e.message); return; }
 
-  const statusInfo = (c) => {
-    if (c.status === 'accepted') return { label: 'Bestätigt', color: 'var(--acc2)' };
-    if (c.status === 'declined') return { label: 'Abgelehnt', color: '#f15c6d' };
-    return { label: c.isCreator ? 'Wartet auf Antwort' : 'Antwort ausstehend', color: 'var(--sub)' };
-  };
-
   openSettingsPage('Geplante Anrufe', calls.length ? `
-    <div class="menulist">
-      ${calls.map(c => {
-        const st = statusInfo(c);
-        return `
-        <div style="display:flex;align-items:flex-start;gap:14px;padding:14px 4px;border-bottom:1px solid var(--line)">
-          <span class="mi-ic" style="margin-top:2px">${c.kind === 'video' ? '🎥' : '🎤'}</span>
-          <div style="flex:1;min-width:0">
-            <div style="font-weight:600">${esc(c.peerName)}</div>
-            <div style="font-size:12px;color:var(--sub);margin-top:2px">${new Date(c.scheduledAt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' })}</div>
-            <div style="font-size:12px;color:${st.color};font-weight:600;margin-top:2px">${st.label}</div>
-          </div>
-          <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;flex-shrink:0">
-            ${!c.isCreator && c.status === 'pending' ? `
-              <button class="btn ghost" style="padding:5px 10px;font-size:12px;white-space:nowrap" onclick="window.__app.respondScheduledCall('${esc(c.id)}','declined');window.__app.openScheduledCallsList()">Ablehnen</button>
-              <button class="btn" style="padding:5px 10px;font-size:12px;white-space:nowrap" onclick="window.__app.respondScheduledCall('${esc(c.id)}','accepted');window.__app.openScheduledCallsList()">Annehmen</button>
-            ` : `
-              <button class="btn ghost" style="padding:6px 12px;font-size:13px;white-space:nowrap" onclick="window.__app.cancelScheduledCall('${esc(c.id)}')">Absagen</button>
-            `}
-          </div>
-        </div>`;
-      }).join('')}
-    </div>
+    <div class="menulist">${calls.map(c => scheduledCallCard(c, 'window.__app.openScheduledCallsList()')).join('')}</div>
   ` : `<p style="color:var(--sub);text-align:center;margin-top:40px">Keine geplanten Anrufe.</p>`);
 }
 async function cancelScheduledCall(id) {
@@ -3227,6 +3273,33 @@ function showCallResponseNotification(msg) {
 function shareLocation() {
   document.getElementById('attachSheet')?.remove();
   if (!navigator.geolocation) { toast('⚠️ Standort auf diesem Gerät nicht verfügbar'); return; }
+
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'shareLocationSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 12px">Standort teilen</h3>
+      <div class="menulist">
+        <button class="menuitem" onclick="window.__app.sendLocationOnce()">
+          <span class="mi-ic">📍</span><span>Aktueller Standort (einmalig)</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.startLiveLocation(15)">
+          <span class="mi-ic">🔴</span><span>Live-Standort für 15 Minuten</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.startLiveLocation(60)">
+          <span class="mi-ic">🔴</span><span>Live-Standort für 1 Stunde</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.startLiveLocation(480)">
+          <span class="mi-ic">🔴</span><span>Live-Standort für 8 Stunden</span>
+        </button>
+      </div>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+function sendLocationOnce() {
+  document.getElementById('shareLocationSheet')?.remove();
   toast('📍 Standort wird ermittelt…', 4000);
   navigator.geolocation.getCurrentPosition(
     async (pos) => {
@@ -3242,6 +3315,49 @@ function shareLocation() {
     () => toast('⚠️ Standortzugriff verweigert'),
     { enableHighAccuracy: true, timeout: 10000 }
   );
+}
+
+/* ── Live-Standort ──
+   Sendet den eigenen Standort periodisch (alle 20s) als aktualisierte
+   __location-Nachricht mit einer gemeinsamen liveId, damit der Empfänger
+   sie als EINE sich bewegende Karte darstellen kann statt vieler
+   einzelner Chatzeilen (siehe renderChatMessages: nur die neueste
+   Position pro liveId wird gezeigt). Läuft automatisch nach der
+   gewählten Dauer ab; watchPosition() statt wiederholtem
+   getCurrentPosition() spart Akku, weil das Betriebssystem selbst
+   entscheidet, wann eine neue Messung nötig ist. */
+let _liveLocationWatchId = null;
+let _liveLocationTimer = null;
+function startLiveLocation(minutes) {
+  document.getElementById('shareLocationSheet')?.remove();
+  if (!state.activeConv) return;
+  if (_liveLocationWatchId != null) { toast('⚠️ Live-Standort läuft bereits'); return; }
+
+  const liveId = 'live_' + Date.now();
+  const conv = state.activeConv;
+  const endAt = Date.now() + minutes * 60000;
+
+  const sendUpdate = async (pos) => {
+    const { latitude, longitude } = pos.coords;
+    const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
+    try {
+      await sendMessage(conv.peerId, conv.convId, JSON.stringify({
+        __location: { lat: latitude, lng: longitude, url: mapsUrl, liveId, expiresAt: endAt }
+      }));
+      if (state.activeConv?.convId === conv.convId) renderChatMessages();
+    } catch {}
+  };
+
+  navigator.geolocation.getCurrentPosition(sendUpdate, () => toast('⚠️ Standortzugriff verweigert'), { enableHighAccuracy: true });
+  _liveLocationWatchId = navigator.geolocation.watchPosition(sendUpdate, () => {}, { enableHighAccuracy: true });
+
+  toast(`🔴 Live-Standort aktiv für ${minutes >= 60 ? (minutes / 60) + ' Std.' : minutes + ' Min.'}`);
+  _liveLocationTimer = setTimeout(() => stopLiveLocation(true), minutes * 60000);
+}
+function stopLiveLocation(silent) {
+  if (_liveLocationWatchId != null) { navigator.geolocation.clearWatch(_liveLocationWatchId); _liveLocationWatchId = null; }
+  if (_liveLocationTimer) { clearTimeout(_liveLocationTimer); _liveLocationTimer = null; }
+  if (!silent) toast('Live-Standort beendet');
 }
 
 /* ── Kontakt teilen — aus den eigenen SecureChat-Kontakten auswählen,

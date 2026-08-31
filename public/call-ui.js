@@ -106,8 +106,8 @@ function renderRinging(call) {
       <div class="call-peername">${escapeHtml(call.peerName)}</div>
       <div class="call-status">${call.kind === 'video' ? 'Video-Anruf' : 'Anruf'} …</div>
       <div class="call-actions call-actions-incoming">
-        <button class="call-btn call-btn-reject" id="callRejectBtn" aria-label="Ablehnen">✕</button>
-        <button class="call-btn call-btn-accept" id="callAcceptBtn" aria-label="Annehmen">✓</button>
+        <button class="call-btn call-btn-reject" id="callRejectBtn" aria-label="Ablehnen"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" style="transform:rotate(135deg)"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg></button>
+        <button class="call-btn call-btn-accept" id="callAcceptBtn" aria-label="Annehmen"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg></button>
       </div>
     </div>
   `));
@@ -124,7 +124,7 @@ function renderCalling(call) {
       <div class="call-status">Klingelt …</div>
       ${call.kind === 'video' ? '<video id="callLocalVideo" class="call-local-preview call-local-mirrored" autoplay muted playsinline></video>' : ''}
       <div class="call-actions">
-        <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen">✕</button>
+        <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" style="transform:rotate(135deg)"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg></button>
       </div>
     </div>
   `));
@@ -141,7 +141,7 @@ function renderConnecting(call) {
       <div class="call-status">Verbinde …</div>
       ${call.kind === 'video' ? '<video id="callLocalVideo" class="call-local-preview call-local-mirrored" autoplay muted playsinline></video>' : ''}
       <div class="call-actions">
-        <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen">✕</button>
+        <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" style="transform:rotate(135deg)"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg></button>
       </div>
     </div>
   `));
@@ -170,7 +170,7 @@ function renderConnected(call, remoteStream) {
         <button class="call-btn call-btn-secondary" id="callMuteBtn" aria-label="Stummschalten">🎤</button>
         ${isVideo ? '<button class="call-btn call-btn-secondary" id="callCamBtn" aria-label="Kamera">📷</button>' : ''}
         ${isVideo ? '<button class="call-btn call-btn-secondary" id="callFlipBtn" aria-label="Kamera wechseln">🔄</button>' : ''}
-        <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen">✕</button>
+        <button class="call-btn call-btn-end" id="callEndBtn" aria-label="Auflegen"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" style="transform:rotate(135deg)"><path d="M6.6 10.8c1.4 2.8 3.7 5 6.5 6.5l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C9.6 21 3 14.4 3 6c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.2 1L6.6 10.8z"/></svg></button>
       </div>
     </div>
   `));
@@ -359,10 +359,10 @@ function injectStyles() {
     .call-volume input[type=range]{flex:1;accent-color:#25d366;height:4px}
     .call-btn{width:60px;height:60px;border-radius:50%;border:none;font-size:24px;
       display:flex;align-items:center;justify-content:center;cursor:pointer}
-    .call-btn-accept{background:radial-gradient(circle at 35% 30%,#4ade80,#16a34a 70%);
+    .call-btn-accept{background:radial-gradient(circle at 35% 30%,var(--call-accept-2,#4ade80),var(--call-accept-1,#16a34a) 70%);
       color:#04231a;border:2px solid rgba(255,255,255,.4);
       box-shadow:0 3px 6px rgba(0,0,0,.4),inset 0 1px 1px rgba(255,255,255,.3)}
-    .call-btn-reject,.call-btn-end{background:radial-gradient(circle at 35% 30%,#f87171,#dc2626 70%);
+    .call-btn-reject,.call-btn-end{background:radial-gradient(circle at 35% 30%,var(--call-end-2,#f87171),var(--call-end-1,#dc2626) 70%);
       color:#fff;border:2px solid rgba(255,255,255,.4);
       box-shadow:0 3px 6px rgba(0,0,0,.4),inset 0 1px 1px rgba(255,255,255,.3)}
     .call-btn-secondary{background:var(--panel2,#182229);color:var(--tx,#e9edef);width:52px;height:52px;font-size:20px}
