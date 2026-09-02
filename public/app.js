@@ -860,7 +860,9 @@ async function afterAuth(data) {
 
   try { await window.StorageGuard?.requestPersistence?.(); } catch {}
   await loadBlockList();
+  await loadGroupKeysLocal();
   await refreshInbox();
+  await refreshGroups();
 
   /* UI nur neu aufbauen wenn noch nicht sichtbar */
   if ($('#app').classList.contains('hide')) {
@@ -1108,11 +1110,30 @@ async function onIncomingEnvelope(env) {
     renderMain();
   }
 }
+/* ── Gruppennachricht entschlüsseln ──
+   ciphertext-Format: "<iv-b64>.<ct-b64>" (siehe sendGroupMessage).
+   Fehlt der Gruppenschlüssel lokal (z. B. neue Gruppe, deren Wrap noch
+   nicht verarbeitet wurde), einmal versuchen ihn nachzuladen. */
+async function openGroupMessage(env) {
+  let groupKey = state.groupKeys?.get(env.groupId);
+  if (!groupKey) {
+    await refreshGroups();
+    groupKey = state.groupKeys?.get(env.groupId);
+    if (!groupKey) throw new Error('Kein Gruppenschlüssel verfügbar');
+  }
+  const [ivB64, ctB64] = env.ciphertext.split('.');
+  const plain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: ub64(ivB64) }, groupKey, ub64(ctB64));
+  return td.decode(plain);
+}
+
 async function handleEnvelope(env, live) {
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
   let plaintext = '[verschlüsselt]';
   try {
-    if (env.sealed) {
+    if (env.groupId || env.kind === 'group') {
+      plaintext = await openGroupMessage(env);
+    } else if (env.sealed) {
       plaintext = await openSealed(env);
     } else {
       plaintext = await openRatchet(env);
@@ -1123,6 +1144,12 @@ async function handleEnvelope(env, live) {
   }
 
   if (!state.messages.has(convId)) state.messages.set(convId, []);
+
+  /* Gruppen-Conv anlegen, falls noch nicht bekannt (z. B. erste
+     Nachricht kam an, bevor refreshGroups() gelaufen ist). */
+  if (env.groupId && !state.convs.has(convId)) {
+    state.convs.set(convId, { convId, groupId: env.groupId, isGroup: true, name: 'Gruppe', memberIds: [], unread: 0 });
+  }
 
   /* Umfrage-Stimmen sind eine eigene, "unsichtbare" Nachrichtenart:
      sie tragen keinen Chatverlauf-Eintrag, sondern aktualisieren nur
@@ -1215,9 +1242,10 @@ async function loadBlockList() {
    SHELL — Kopfzeile, Filter-Pillen, Chat-Liste, untere Navigation
    ═══════════════════════════════════════════════════════════════════════ */
 function renderShell() {
+  const branding = getAppBranding();
   $('#app').innerHTML = `
     <div class="topbar">
-      <h1>SecureChat</h1>
+      <h1>${branding.logoUrl ? `<img src="${esc(branding.logoUrl)}" class="app-logo-img" alt="">` : ''}${esc(branding.name)}</h1>
       <div class="topicons">
         <button class="iconbtn navbtn3d" onclick="window.__app.openCamera()" aria-label="Kamera">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
@@ -1509,6 +1537,9 @@ const appActions = {
   openSettings() { openSettings(); },
   openDesignSettings() { openDesignSettings(); },
   setAccentTheme(theme) { setAccentTheme(theme); },
+  saveBrandingName() { saveBrandingName(); },
+  pickBrandingLogo() { pickBrandingLogo(); },
+  clearBrandingLogo() { clearBrandingLogo(); },
   openChatSettings() { openChatSettings(); },
   toggleChatPref(key, val) { toggleChatPref(key, val); },
   setFontSizePref(size) { setFontSizePref(size); },
@@ -1540,6 +1571,8 @@ const appActions = {
        ein (Standardverhalten des Textarea-Elements, kein Eingriff nötig). */
   },
   startChatWith(userId, userName) { startChatWith(userId, userName); },
+  openCreateGroup() { openCreateGroup(); },
+  confirmCreateGroup() { confirmCreateGroup(); },
   copyMessage(id) { copyMessage(id); },
   deleteMessage(id) { deleteMessage(id); },
   forwardMessage(id) { forwardMessage(id); },
@@ -1648,6 +1681,48 @@ async function ensureReceiverSession(env) {
 /* ═══════════════════════════════════════════════════════════════════════
    NACHRICHT SENDEN — Fanout an alle aktiven Empfängergeräte
    ═══════════════════════════════════════════════════════════════════════ */
+/* ── Gruppennachricht senden ──
+   Verschlüsselt mit dem gemeinsamen AES-Gruppenschlüssel (siehe
+   confirmCreateGroup) statt einer 1:1-Ratchet-Session — eine
+   Nachricht, ein Chiffrat, an alle Mitgliedergeräte verteilt (kein
+   individuelles Neuverschlüsseln pro Empfänger nötig, im Gegensatz
+   zu 1:1). AES-GCM mit zufälligem IV pro Nachricht. */
+async function sendGroupMessage(groupId, convId, plaintext) {
+  const groupKey = state.groupKeys?.get(groupId);
+  if (!groupKey) throw new Error('Kein Gruppenschlüssel vorhanden — bitte Gruppe neu laden');
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, groupKey, te.encode(plaintext));
+  const ciphertext = b64(iv) + '.' + b64(new Uint8Array(ct));
+
+  const conv = state.convs.get(convId);
+  const memberIds = (conv?.memberIds || []).filter(id => id !== state.me.id);
+  if (!memberIds.length) throw new Error('Keine anderen Mitglieder in dieser Gruppe');
+
+  const results = [];
+  for (const memberId of memberIds) {
+    let bundles = [];
+    try { ({ bundles } = await api.fetchBundle(memberId)); } catch { continue; }
+    const devices = (bundles || []).map(b => ({ deviceId: b.deviceId, ciphertext, header: null }));
+    if (!devices.length) continue;
+    try {
+      const r = await api.send({ recipientId: memberId, convId, groupId, kind: 'group', perDevice: devices });
+      results.push(r);
+    } catch (e) {
+      console.warn('Senden an Gruppenmitglied', memberId, 'fehlgeschlagen:', e.message);
+    }
+  }
+  if (!results.length) throw new Error('Nachricht konnte an kein Mitglied zugestellt werden');
+
+  const sentAt = Date.now();
+  conv.lastMsg = { text: plaintext, ts: sentAt };
+  conv.unread = 0;
+  if (!state.messages.has(convId)) state.messages.set(convId, []);
+  state.messages.get(convId).push({ id: 'local-' + sentAt, text: plaintext, ts: sentAt, mine: true });
+  LocalCache.scheduleSave();
+  return { sentAt };
+}
+
 async function sendMessage(peerId, convId, plaintext) {
   const bundles = await ensureSessions(peerId);
   const perDevice = [];
@@ -1803,7 +1878,23 @@ async function sendCurrentMessage() {
   if (!text || !state.activeConv) return;
   input.value = '';
   input.style.height = 'auto';
-  const { peerId, convId } = state.activeConv;
+  const { peerId, convId, groupId, isGroup } = state.activeConv;
+
+  /* Gruppen-Chats laufen über einen eigenen Pfad (AES-Gruppenschlüssel
+     statt 1:1-Ratchet) — siehe sendGroupMessage. Kein Offline-Queueing
+     für Gruppen in dieser ersten Version: die Zustellung an mehrere
+     Mitglieder gleichzeitig würde die Warteschlangen-Logik unnötig
+     verkomplizieren, ohne dass es aktuell einen dringenden Bedarf gibt. */
+  if (isGroup) {
+    try {
+      await sendGroupMessage(groupId, convId, text);
+      renderChatMessages();
+    } catch (e) {
+      toast('⚠️ ' + e.message);
+      input.value = text;
+    }
+    return;
+  }
 
   /* Schon bekannt offline: gar nicht erst versuchen — sofort in die
      Warteschlange, mit sichtbarem "wird gesendet"-Zustand statt eines
@@ -2098,7 +2189,73 @@ function forwardSelectedMsgs() {
   toast('Kontakt auswählen, um weiterzuleiten');
 }
 
-/* ── Long-Press auf einzelne Nachricht → Kontextmenü oder Auswahl ── */
+/* ── Gruppenschlüssel lokal persistieren (nur dieses Gerät) ── */
+function saveGroupKeyLocal(groupId, rawKeyB64) {
+  try {
+    const store = JSON.parse(localStorage.getItem('sc:groupKeys') || '{}');
+    store[groupId] = rawKeyB64;
+    localStorage.setItem('sc:groupKeys', JSON.stringify(store));
+  } catch {}
+}
+async function loadGroupKeysLocal() {
+  if (!state.groupKeys) state.groupKeys = new Map();
+  try {
+    const store = JSON.parse(localStorage.getItem('sc:groupKeys') || '{}');
+    for (const [groupId, rawKeyB64] of Object.entries(store)) {
+      const key = await crypto.subtle.importKey('raw', ub64(rawKeyB64), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+      state.groupKeys.set(groupId, key);
+    }
+  } catch {}
+}
+
+/* Wird aufgerufen, wenn eine neue Gruppe für mich als Mitglied
+   eintrifft (siehe refreshGroups) — entschlüsselt den für mich
+   gewrappten Gruppenschlüssel über meine bestehende Ratchet-Session
+   mit dem Gruppen-ERSTELLER (der hat ihn gewrappt, siehe
+   confirmCreateGroup). */
+async function unwrapGroupKey(groupId, creatorId, wrappedB64) {
+  try {
+    const wrappedJson = JSON.parse(td.decode(ub64(wrappedB64)));
+    await ensureSessions(creatorId);
+    const sessionKey = [...state.sessions.keys()].find(k => k.startsWith(creatorId + '>'));
+    const st = state.sessions.get(sessionKey);
+    if (!st) throw new Error('Keine Session zum Gruppen-Ersteller');
+    const rawKeyBuf = await Ratchet.decrypt(st,
+      { header: wrappedJson.header, ct: ub64(wrappedJson.ct) },
+      `v1|${creatorId}|group-key`);
+    scheduleSessionSave();
+    const rawKeyB64 = td.decode(rawKeyBuf);
+    const key = await crypto.subtle.importKey('raw', ub64(rawKeyB64), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+    if (!state.groupKeys) state.groupKeys = new Map();
+    state.groupKeys.set(groupId, key);
+    saveGroupKeyLocal(groupId, rawKeyB64);
+    return key;
+  } catch (e) {
+    console.warn('Gruppenschlüssel konnte nicht entschlüsselt werden:', e.message);
+    return null;
+  }
+}
+
+/* Eigene Gruppen vom Server laden und in state.convs einpflegen —
+   analog zu refreshInbox für 1:1-Chats. */
+async function refreshGroups() {
+  let groups;
+  try { ({ groups } = await api._fetch('/api/groups')); }
+  catch { return; }
+
+  for (const g of groups) {
+    const convId = 'grp_' + g.id;
+    let conv = state.convs.get(convId);
+    if (!conv) {
+      conv = { convId, groupId: g.id, isGroup: true, name: g.name, memberIds: g.members.map(m => m.userId), unread: 0 };
+      state.convs.set(convId, conv);
+    }
+    if (!state.groupKeys?.has(g.id) && g.wrapped && g.ownerId !== state.me.id) {
+      await unwrapGroupKey(g.id, g.ownerId, g.wrapped);
+    }
+  }
+  renderMain();
+}
 let _msgLongPressTimer = null;
 function msgLongPressStart(msgId) {
   if (state.msgSelectMode) return;   // im Auswahlmodus übernimmt der normale Klick
@@ -2184,6 +2341,12 @@ async function openNewChatSheet() {
     <div class="sheetbox">
       <div class="grabber"></div>
       <h3 style="margin:0 0 12px">Neuer Chat</h3>
+      <div class="row" style="padding:8px 0" onclick="window.__app.openCreateGroup()">
+        <div class="av" style="background:var(--panel2)">👥</div>
+        <div class="meta" style="border-bottom:none">
+          <div class="l1"><span class="nm">Neue Gruppe</span></div>
+        </div>
+      </div>
       ${users.length ? users.map(u => `
         <div class="row" style="padding:8px 0" onclick="window.__app.startChatWith('${u.id}', '${esc(u.name || '')}')">
           <div class="av">${esc((u.name || '?')[0].toUpperCase())}
@@ -2207,6 +2370,125 @@ function startChatWith(userId, userName) {
     conv.name = userName || conv.name;
   }
   openChat(conv);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   GRUPPEN — pragmatisches Modell ohne eigenes Sender-Keys-Protokoll
+   ─────────────────────────────────────────────────────────────────────
+   Statt eines vollständigen Gruppen-Ratchets (wie Signals Sender Keys,
+   deutlich komplexer zu implementieren und zu verifizieren) nutzt
+   SecureChat einen einzigen zufälligen AES-256-Gruppenschlüssel:
+   - Beim Erstellen wird er einmal generiert
+   - Für JEDES Mitglied wird er über dessen bestehende 1:1-Ratchet-
+     Session verschlüsselt (also mit der schon vorhandenen X3DH/Double-
+     Ratchet-Infrastruktur, kein neues Kryptoprimitiv nötig)
+   - Der Server speichert nur den verschlüsselten "wrapped"-Blob pro
+     Mitglied (siehe group_members.wrapped) — sieht den Klartext-
+     schlüssel nie
+   - Gruppennachrichten werden direkt mit dem AES-Gruppenschlüssel
+     versiegelt und per bestehendem /api/send an alle Mitgliedergeräte
+     verteilt (perDevice-Liste, wie bei 1:1)
+
+   Trade-off: Kein Forward Secrecy INNERHALB der Gruppe (der Schlüssel
+   ändert sich nicht bei jeder Nachricht) und kein automatisches Neu-
+   verschlüsseln bei Mitgliederaustritt — für den aktuellen Umfang
+   akzeptabel, aber im Kommentar dokumentiert für eine spätere Härtung. */
+async function openCreateGroup() {
+  document.getElementById('newChatSheet')?.remove();
+  let users;
+  try { ({ users } = await api.listUsers()); }
+  catch (e) { toast('⚠️ ' + e.message); return; }
+
+  const sheet = document.createElement('div');
+  sheet.className = 'sheet'; sheet.id = 'createGroupSheet';
+  sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
+  sheet.innerHTML = `
+    <div class="sheetbox">
+      <div class="grabber"></div>
+      <h3 style="margin:0 0 12px">Neue Gruppe</h3>
+      <input id="groupNameInput" type="text" placeholder="Gruppenname"
+        style="width:100%;box-sizing:border-box;font-size:16px;padding:12px;border-radius:10px;
+          border:none;background:var(--panel2);color:var(--tx);margin-bottom:14px">
+      <label style="font-size:13px;color:var(--sub)">Mitglieder auswählen</label>
+      <div style="max-height:40vh;overflow-y:auto;margin-top:8px">
+        ${users.map(u => `
+          <label class="row" style="padding:8px 0;cursor:pointer">
+            <input type="checkbox" class="groupmember-cb" value="${esc(u.id)}" data-name="${esc(u.name || u.id)}"
+              style="width:20px;height:20px;margin-right:10px;accent-color:var(--acc2)">
+            <div class="av" style="width:32px;height:32px;font-size:14px">${esc((u.name || '?')[0].toUpperCase())}</div>
+            <div class="meta" style="border-bottom:none"><div class="l1"><span class="nm">${esc(u.name || u.id)}</span></div></div>
+          </label>`).join('')}
+      </div>
+      <button class="btn" style="width:100%;margin-top:16px" onclick="window.__app.confirmCreateGroup()">Gruppe erstellen</button>
+    </div>`;
+  document.getElementById('overlays').appendChild(sheet);
+}
+
+async function confirmCreateGroup() {
+  const name = document.getElementById('groupNameInput')?.value.trim();
+  const checked = [...document.querySelectorAll('.groupmember-cb:checked')];
+  if (!name) { toast('⚠️ Bitte einen Gruppennamen eingeben'); return; }
+  if (!checked.length) { toast('⚠️ Bitte mindestens ein Mitglied auswählen'); return; }
+
+  const members = checked.map(cb => ({ id: cb.value, name: cb.dataset.name }));
+  document.getElementById('createGroupSheet')?.remove();
+  toast('Gruppe wird erstellt…', 3000);
+
+  try {
+    /* Gruppenschlüssel generieren, exportieren, für jedes Mitglied
+       (inkl. mich selbst, für Multi-Device-Zugriff) über die
+       bestehende 1:1-Session verschlüsseln. */
+    const groupKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const rawKey = await crypto.subtle.exportKey('raw', groupKey);
+    const rawKeyB64 = b64(rawKey);
+
+    const wrapped = {};
+    /* Für das eigene Konto wird KEIN Server-Wrap angelegt — der
+       Schlüssel bleibt ausschließlich lokal (state.groupKeys +
+       localStorage, siehe unten). Ein "Wrap für mich selbst" würde
+       bedeuten, entweder den Klartextschlüssel unverschlüsselt zum
+       Server zu schicken (Sicherheitsloch) oder eine eigene Geräte-zu-
+       Geräte-Verschlüsselung zu bauen, die hier noch fehlt. Preis
+       dafür: Gruppen sind aktuell an EIN Gerät pro Ersteller gebunden,
+       bis Multi-Device-Sync für Gruppen ergänzt wird. */
+
+    for (const m of members) {
+      try {
+        await ensureSessions(m.id);
+        const key = sk(m.id, [...state.sessions.keys()].find(k => k.startsWith(m.id + '>'))?.split('>')[1]);
+        const st = state.sessions.get(key);
+        if (!st) continue;
+        const env = await Ratchet.encrypt(st, te.encode(rawKeyB64), `v1|${state.me.id}|group-key`);
+        scheduleSessionSave();
+        wrapped[m.id] = b64(te.encode(JSON.stringify({ header: env.header, ct: b64(new Uint8Array(env.ct)) })));
+      } catch (e) {
+        console.warn('Gruppenschlüssel konnte nicht an', m.id, 'verteilt werden:', e.message);
+      }
+    }
+
+    const { groupId } = await api._fetch('/api/group', {
+      method: 'POST',
+      body: { name, avatar: '👥', members: members.map(m => m.id), wrapped }
+    });
+
+    /* Gruppenschlüssel lokal cachen — spart erneutes Entschlüsseln bei
+       jeder Nachricht in dieser Sitzung, UND persistent speichern,
+       damit er einen Reload übersteht (nur auf diesem Gerät, siehe
+       Hinweis oben zu Multi-Device). */
+    if (!state.groupKeys) state.groupKeys = new Map();
+    state.groupKeys.set(groupId, groupKey);
+    saveGroupKeyLocal(groupId, rawKeyB64);
+
+    const conv = {
+      convId: 'grp_' + groupId, groupId, isGroup: true,
+      name, memberIds: [state.me.id, ...members.map(m => m.id)], unread: 0
+    };
+    state.convs.set(conv.convId, conv);
+    openChat(conv);
+    toast('Gruppe "' + name + '" erstellt');
+  } catch (e) {
+    toast('⚠️ Gruppe konnte nicht erstellt werden: ' + e.message);
+  }
 }
 
 function openMainMenu(e) {
@@ -2324,6 +2606,7 @@ function setAccentTheme(theme) {
 }
 function openDesignSettings() {
   const current = state.accentTheme || 'green';
+  const branding = getAppBranding();
   openSettingsPage('Design', `
     <label style="font-size:13px;color:var(--sub)">Akzentfarbe</label>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px">
@@ -2336,7 +2619,78 @@ function openDesignSettings() {
           <span style="font-size:12px;color:var(--tx)">${t.label}</span>
         </button>`).join('')}
     </div>
+
+    <label style="font-size:13px;color:var(--sub);display:block;margin-top:24px">App-Name im Kopfbereich</label>
+    <input id="brandingNameInput" type="text" value="${esc(branding.name)}" placeholder="SecureChat"
+      style="width:100%;box-sizing:border-box;font-size:16px;padding:12px;border-radius:10px;
+        border:none;background:var(--panel2);color:var(--tx);margin:8px 0 16px">
+
+    <label style="font-size:13px;color:var(--sub)">Logo im Kopfbereich</label>
+    <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+      ${branding.logoUrl ? `<img src="${esc(branding.logoUrl)}" style="width:36px;height:36px;border-radius:8px;object-fit:cover">` : ''}
+      <button class="btn ghost" onclick="window.__app.pickBrandingLogo()">${branding.logoUrl ? 'Logo ändern' : 'Logo hinzufügen'}</button>
+      ${branding.logoUrl ? `<button class="btn ghost" onclick="window.__app.clearBrandingLogo()">Entfernen</button>` : ''}
+    </div>
+    <button class="btn" style="width:100%;margin-top:16px" onclick="window.__app.saveBrandingName()">Speichern</button>
   `);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   APP-BRANDING — Name und Logo im Kopfbereich, rein lokal/pro Gerät
+   ─────────────────────────────────────────────────────────────────────
+   Bewusst clientseitig statt serverseitig: dies ist eine persönliche
+   Anpassung der eigenen Ansicht (z. B. für Nutzer, die die App unter
+   eigenem Namen/Branding weitergeben), keine Einstellung, die andere
+   Nutzer sehen sollten. Das Logo wird als Data-URL gespeichert (kleine
+   Bilder, kein Server-Upload nötig für reine UI-Kosmetik). */
+const DEFAULT_BRANDING = { name: 'SecureChat', logoUrl: null };
+function getAppBranding() {
+  try {
+    const raw = localStorage.getItem('sc:branding');
+    return raw ? { ...DEFAULT_BRANDING, ...JSON.parse(raw) } : { ...DEFAULT_BRANDING };
+  } catch { return { ...DEFAULT_BRANDING }; }
+}
+function saveAppBranding(branding) {
+  try { localStorage.setItem('sc:branding', JSON.stringify(branding)); } catch {}
+}
+function saveBrandingName() {
+  const name = document.getElementById('brandingNameInput')?.value.trim() || 'SecureChat';
+  const branding = getAppBranding();
+  branding.name = name;
+  saveAppBranding(branding);
+  toast('App-Name aktualisiert');
+  renderShell();
+  go(state.tab);
+  document.getElementById('settingsPage')?.remove();
+}
+function pickBrandingLogo() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = 'image/*';
+  input.onchange = () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    if (file.size > 500000) { toast('⚠️ Bild zu groß (max. 500 KB)'); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const branding = getAppBranding();
+      branding.logoUrl = reader.result;
+      saveAppBranding(branding);
+      toast('Logo aktualisiert');
+      renderShell();
+      go(state.tab);
+      openDesignSettings();
+    };
+    reader.readAsDataURL(file);
+  };
+  input.click();
+}
+function clearBrandingLogo() {
+  const branding = getAppBranding();
+  branding.logoUrl = null;
+  saveAppBranding(branding);
+  renderShell();
+  go(state.tab);
+  openDesignSettings();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -2580,18 +2934,36 @@ function pickAvatarFrom(useCamera) {
 }
 
 async function uploadAvatarPhoto(file) {
-  if (!window.MediaStorage || !window.MEDIA_CONFIG?.uploadUrl) {
-    toast('⚠️ Kein Medienspeicher konfiguriert'); return;
-  }
   toast('📷 Profilfoto wird hochgeladen…', 4000);
   try {
-    const shrunk = await window.MediaStorage.shrinkImage(file).catch(() => file);
-    const uploaded = await window.MediaStorage.uploadMedia(shrunk,
-      { uploadUrl: window.MEDIA_CONFIG.uploadUrl, kind: 'image' });
-    const path = uploaded.path || uploaded.key;
-    const { user } = await api._fetch('/api/profile/avatar', { method: 'POST', body: { path } });
+    let toUpload = file;
+    if (window.MediaStorage?.shrinkImage) {
+      toUpload = await window.MediaStorage.shrinkImage(file).catch(() => file);
+    }
+    const { path: mediaPath, uploadUrl } = await api._fetch('/api/media/upload-url', { method: 'POST' });
+    /* Profilbilder werden BEWUSST unverschlüsselt gespeichert — jeder
+       Kontakt soll sie ohne eigenen Schlüssel sehen können, anders als
+       Chat-Anhänge (siehe sendMediaMessage), die Ende-zu-Ende
+       verschlüsselt bleiben. */
+    const uploadResp = await fetch(uploadUrl, { method: 'PUT', body: toUpload });
+    if (!uploadResp.ok) throw new Error('Hochladen fehlgeschlagen (' + uploadResp.status + ')');
+
+    const { user } = await api._fetch('/api/profile/avatar', { method: 'POST', body: { path: mediaPath } });
     state.me.avatarPath = user.avatarPath;
-    if (window.MediaStorage.mediaUrlFor) state.me.avatarUrl = await window.MediaStorage.mediaUrlFor(user.avatarPath);
+    /* Anzeige-URL selbst zusammenbauen: bei R2 wäre eine öffentliche
+       CDN-URL üblich. Im lokalen Fallback funktioniert das NICHT
+       direkt in einem <img src="...">-Tag, weil GET /api/media/local-
+       download einen Bearer-Token verlangt, den <img> nicht mitschicken
+       kann — bekannte Einschränkung von authentifizierten Bild-URLs.
+       Für den produktiven Einsatz mit vielen Avataren ist R2 (oder ein
+       anderer öffentlich erreichbarer Objektspeicher) weiterhin nötig;
+       der lokale Fallback deckt in erster Linie Chat-Anhänge ab, die
+       ohnehin über einen expliziten "Herunterladen"-Klick laufen
+       (siehe downloadAndShowMedia), nicht über <img>. */
+    try {
+      const { downloadUrl } = await api._fetch('/api/media/download-url?path=' + encodeURIComponent(mediaPath));
+      state.me.avatarUrl = downloadUrl;
+    } catch {}
     toast('Profilfoto aktualisiert');
     editProfile();
   } catch (e) {
@@ -3411,21 +3783,46 @@ function pickMedia(accept, kind, useCamera) {
   input.click();
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   MEDIEN-UPLOAD — client-seitige Verschlüsselung + Server-Speicherung
+   ─────────────────────────────────────────────────────────────────────
+   /api/media/upload-url liefert bei JEDEM Aufruf einen frischen,
+   einmaligen Schlüssel + URL — egal ob dahinter R2 (Produktion) oder
+   der lokale Fallback-Ordner steckt (siehe server.js), das Frontend
+   muss den Unterschied nicht kennen. Die Datei wird VOR dem Hochladen
+   mit einem zufälligen AES-Schlüssel verschlüsselt; nur dieser
+   Schlüssel (nicht die Datei selbst) geht durch den Ende-zu-Ende-
+   verschlüsselten Ratchet-Kanal zum Empfänger — der Server sieht in
+   beiden Fällen nur Chiffretext, nie den Klartext der Datei. */
+async function encryptFileForUpload(file) {
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plainBuf = await file.arrayBuffer();
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plainBuf);
+  const rawKey = await crypto.subtle.exportKey('raw', key);
+  return { blob: new Blob([ct]), ivB64: b64(iv), keyB64: b64(rawKey) };
+}
+async function decryptDownloadedFile(buf, ivB64, keyB64, mimeType) {
+  const key = await crypto.subtle.importKey('raw', ub64(keyB64), { name: 'AES-GCM' }, false, ['decrypt']);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(ivB64) }, key, buf);
+  return new Blob([plain], { type: mimeType || 'application/octet-stream' });
+}
+
 async function sendMediaMessage(file, kind) {
   if (!state.activeConv) return;
-  if (!window.MediaStorage || !window.MEDIA_CONFIG?.uploadUrl) {
-    toast('⚠️ Kein Medienspeicher konfiguriert — siehe media-storage.js/config.js');
-    return;
-  }
   toast('📎 Wird hochgeladen…', 4000);
   try {
     let toUpload = file;
-    if (kind === 'image') {
+    if (kind === 'image' && window.MediaStorage?.shrinkImage) {
       try { toUpload = await window.MediaStorage.shrinkImage(file); } catch {}
     }
-    const uploaded = await window.MediaStorage.uploadMedia(toUpload,
-      { uploadUrl: window.MEDIA_CONFIG.uploadUrl, kind });
-    const ref = window.MediaStorage.mediaReference(uploaded);
+
+    const { path: mediaPath, uploadUrl } = await api._fetch('/api/media/upload-url', { method: 'POST' });
+    const { blob, ivB64, keyB64 } = await encryptFileForUpload(toUpload);
+    const uploadResp = await fetch(uploadUrl, { method: 'PUT', body: blob });
+    if (!uploadResp.ok) throw new Error('Hochladen fehlgeschlagen (' + uploadResp.status + ')');
+
+    const ref = { path: mediaPath, iv: ivB64, key: keyB64, mime: file.type, name: file.name, size: file.size };
 
     /* Nur die winzige Referenz (~250 Byte) geht durch den geschützten
        Ratchet-Pfad — genau wie Text, nur mit kind:'media' markiert,
@@ -3469,12 +3866,13 @@ function parseStructured(text, key) {
 }
 
 async function downloadAndShowMedia(msgId, ref, kind) {
-  if (!window.MediaStorage || !window.MEDIA_CONFIG?.downloadUrl) {
-    toast('⚠️ Kein Medienspeicher konfiguriert'); return;
-  }
   toast('⬇️ Wird geladen…', 3000);
   try {
-    const blob = await window.MediaStorage.downloadMedia(ref, { downloadUrl: window.MEDIA_CONFIG.downloadUrl });
+    const { downloadUrl } = await api._fetch('/api/media/download-url?path=' + encodeURIComponent(ref.path));
+    const resp = await fetch(downloadUrl);
+    if (!resp.ok) throw new Error('Download fehlgeschlagen (' + resp.status + ')');
+    const encryptedBuf = await resp.arrayBuffer();
+    const blob = await decryptDownloadedFile(encryptedBuf, ref.iv, ref.key, ref.mime);
     const url = URL.createObjectURL(blob);
     for (const list of state.messages.values()) {
       const m = list.find(x => x.id === msgId);

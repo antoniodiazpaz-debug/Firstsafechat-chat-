@@ -161,6 +161,7 @@ function renderConnected(call, remoteStream) {
       <div class="call-peername ${isVideo ? 'call-peername-overlay' : ''}">${escapeHtml(call.peerName)}</div>
       <div class="call-status call-timer" id="callTimer">00:00</div>
       ${isVideo ? '<video id="callLocalVideo" class="call-local-preview call-local-preview-small call-local-mirrored" autoplay muted playsinline></video>' : ''}
+      ${isVideo ? '<button class="call-swap-btn" id="callSwapBtn" aria-label="Video tauschen"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M7 4l-3 3M7 4l3 3M17 20V4M17 20l-3-3M17 20l3-3"/></svg></button>' : ''}
       <div class="call-volume">
         <span class="call-volume-ic">🔉</span>
         <input type="range" id="callVolumeSlider" min="0" max="100" value="100" aria-label="Lautstärke">
@@ -227,6 +228,32 @@ function renderConnected(call, remoteStream) {
     flipBtn.disabled = true;
     try { await Call.switchCamera(); } catch (e) { /* Gerät hat evtl. nur eine Kamera */ }
     flipBtn.disabled = false;
+  };
+
+  /* Tausch: großes und kleines Bild wechseln die Rolle. Statt die
+     Video-Elemente selbst zu verschieben (würde srcObject/Playback
+     unterbrechen), werden nur ihre CSS-Klassen vertauscht — der
+     Browser behält beide MediaStreams am Laufen, nur die Darstellung
+     ändert sich. isSwapped hält den Zustand für die aktuelle
+     render()-Instanz, geht beim nächsten vollen Rerender verloren
+     (z. B. Kamerawechsel) — das ist bewusst so, damit ein Kamera-
+     Wechsel nicht in einem unerwartet vertauschten Zustand endet. */
+  let isSwapped = false;
+  const swapBtn = document.getElementById('callSwapBtn');
+  if (swapBtn) swapBtn.onclick = () => {
+    isSwapped = !isSwapped;
+    /* Position/Inline-Styles vom Dragging zurücksetzen — sonst würde
+       ein zuvor verschobenes PiP-Fenster seine alte Bildschirmposition
+       auf die neue Rolle (großes Vollbild) übertragen. */
+    remoteVideoEl.style.cssText = '';
+    localVideoEl.style.cssText = '';
+    if (isSwapped) {
+      remoteVideoEl.className = 'call-local-preview call-local-preview-small';
+      localVideoEl.className = 'call-remote-video call-local-mirrored';
+    } else {
+      remoteVideoEl.className = 'call-remote-video';
+      localVideoEl.className = 'call-local-preview call-local-preview-small call-local-mirrored';
+    }
   };
 
   startCallTimer();
