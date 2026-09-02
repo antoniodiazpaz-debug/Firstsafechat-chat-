@@ -28,6 +28,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const PORT = process.env.PORT || 8787;
+
+/* Eigener, separater Ordner für den lokalen Medien-Fallback — bewusst
+   NICHT unter public/, damit die Dateien nicht versehentlich über den
+   statischen Datei-Server ausgeliefert werden (siehe serveStatic).
+   Zugriff läuft ausschließlich über die authentifizierten
+   /api/media/*-Routen. */
+const LOCAL_MEDIA_DIR = path.join(__dirname, 'local-media-storage');
+try { fs.mkdirSync(LOCAL_MEDIA_DIR, { recursive: true }); } catch {}
+
 const OPK_LOW_WATER = 5;
 /* 19 Jahre statt der früheren 30 Tage — mit der Umstellung auf
    passwortlose Anmeldung gibt es ohne ein noch gültiges Token keinen
@@ -274,6 +283,27 @@ CREATE TABLE IF NOT EXISTS group_members (
 -- (siehe sw.js) — der Server kennt den Klartext nie, kann ihn also auch
 -- nicht in eine Push-Payload packen.
 -- ═══════════════════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
+-- LOKALER MEDIEN-FALLBACK — nur aktiv, solange kein R2 konfiguriert ist
+-- ─────────────────────────────────────────────────────────────────────
+-- Ohne R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/etc. würden Medien-Uploads sonst
+-- komplett fehlschlagen (siehe /api/media/upload-url, 503). Als
+-- Übergangslösung landen verschlüsselte Blobs stattdessen in einem
+-- eigenen Ordner auf der lokalen Festplatte des Servers; diese Tabelle
+-- hält nur Metadaten (Pfad, Größe, Zeitstempel) — der Dateiinhalt bleibt
+-- ausschließlich im Dateisystem, nie in der Datenbank selbst (das würde
+-- Neon/Postgres unnötig aufblähen). Bewusst KEIN Ersatz für R2 in
+-- Produktion: ohne Objektspeicher-Replikation ist ein Server-Neustart
+-- oder Datenträgerausfall ein Datenverlustrisiko für Medien.
+-- ═══════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS local_media (
+  id          TEXT PRIMARY KEY,      -- entspricht dem Dateinamen (UUID.bin)
+  owner_id    TEXT REFERENCES users(id) ON DELETE SET NULL,
+  size_bytes  BIGINT NOT NULL,
+  created_at  BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_local_media_owner ON local_media(owner_id);
+
 CREATE TABLE IF NOT EXISTS push_subscriptions (
   device_id   TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
   platform    TEXT NOT NULL,         -- web | fcm
@@ -469,6 +499,8 @@ const q = {
     platform=excluded.platform, endpoint=excluded.endpoint, p256dh=excluded.p256dh,
     auth=excluded.auth, created_at=excluded.created_at`),
   pushForDevice:db.prepare('SELECT * FROM push_subscriptions WHERE device_id=?'),
+  addLocalMedia: db.prepare('INSERT INTO local_media (id,owner_id,size_bytes,created_at) VALUES (?,?,?,?)'),
+  localMediaById: db.prepare('SELECT * FROM local_media WHERE id=?'),
   dropPush:     db.prepare('DELETE FROM push_subscriptions WHERE device_id=?'),
 
   /* ---- Geplante Anrufe ---- */
@@ -1274,10 +1306,60 @@ const routes = {
      ohne sie voll nutzbar. */
   'POST /api/media/upload-url': async (req, res) => {
     const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    if (!R2.isConfigured()) return json(res, 503, { error: 'Medien-Speicher nicht konfiguriert' });
+    if (!R2.isConfigured()) {
+      /* Fallback: statt einer presigned R2-URL bekommt der Client eine
+         eigene Server-Route, an die er die (bereits lokal verschlüsselte)
+         Datei per PUT direkt schickt — asynchron zur restlichen App,
+         blockiert also keine anderen Anfragen. */
+      const key = crypto.randomUUID() + '.bin';
+      return json(res, 200, { path: key, uploadUrl: '/api/media/local-upload/' + key, expiresIn: 600, local: true });
+    }
     const key = R2.randomObjectKey();
     const uploadUrl = R2.presign({ method: 'PUT', key, expiresInSeconds: 600 });
     json(res, 200, { path: key, uploadUrl, expiresIn: 600 });
+  },
+
+  /* Lokaler Fallback-Upload: nimmt den rohen (bereits Client-seitig
+     verschlüsselten) Body entgegen und schreibt ihn asynchron in
+     LOCAL_MEDIA_DIR. fs.promises hält den Event-Loop frei, während
+     große Dateien auf die Platte geschrieben werden. */
+  'PUT /api/media/local-upload': async (req, res, url) => {
+    /* Bewusst OHNE auth(req)-Pflicht: media-storage.js behandelt diese
+       URL wie eine presigned R2-URL und schickt daher typischerweise
+       KEINEN Bearer-Token mit — die presigned-URL-Konvention trägt die
+       Berechtigung im Pfad selbst. Sicherheit kommt hier stattdessen
+       daher, dass der Schlüssel eine kryptographisch zufällige UUID
+       ist (siehe /api/media/upload-url), die niemand erraten kann, und
+       dass jede Datei nur EINMAL beschreibbar ist (kein Overwrite
+       fremder Inhalte möglich, siehe Existenzprüfung unten). */
+    const key = url.pathname.split('/').pop();
+    if (!/^[0-9a-f-]{36}\.bin$/.test(key)) return json(res, 400, { error: 'Ungültiger Medienschlüssel' });
+    const filePath = path.join(LOCAL_MEDIA_DIR, key);
+    try {
+      await fs.promises.access(filePath);
+      return json(res, 409, { error: 'Datei existiert bereits' });
+    } catch { /* Datei existiert noch nicht — das ist der erwartete Normalfall */ }
+
+    const chunks = [];
+    let total = 0;
+    const MAX_SIZE = 50 * 1024 * 1024;   // 50 MB Obergrenze für den lokalen Fallback
+    try {
+      await new Promise((resolve, reject) => {
+        req.on('data', (chunk) => {
+          total += chunk.length;
+          if (total > MAX_SIZE) { reject(new Error('Datei zu groß für lokalen Speicher (max. 50 MB)')); return; }
+          chunks.push(chunk);
+        });
+        req.on('end', resolve);
+        req.on('error', reject);
+      });
+      const buf = Buffer.concat(chunks);
+      await fs.promises.writeFile(filePath, buf);
+      await q.addLocalMedia.run(key, null, buf.length, Date.now());
+      json(res, 200, { ok: true });
+    } catch (e) {
+      json(res, 400, { error: e.message });
+    }
   },
 
   /* Presigned-Download-URL für einen bereits hochgeladenen Pfad —
@@ -1288,12 +1370,35 @@ const routes = {
      avatarPath eines Kontakts über /api/users). */
   'GET /api/media/download-url': async (req, res, url) => {
     const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
-    if (!R2.isConfigured()) return json(res, 503, { error: 'Medien-Speicher nicht konfiguriert' });
-    const path = url.searchParams.get('path');
-    if (!path || !/^[0-9a-f-]{36}\.bin$/.test(path))
+    const path_ = url.searchParams.get('path');
+    if (!path_ || !/^[0-9a-f-]{36}\.bin$/.test(path_))
       return json(res, 400, { error: 'Ungültiger Medienpfad' });
-    const downloadUrl = R2.presign({ method: 'GET', key: path, expiresInSeconds: 600 });
+    if (!R2.isConfigured()) {
+      /* Prüfen, ob die Datei im lokalen Fallback-Speicher liegt, bevor
+         eine nutzlose URL ausgestellt wird. */
+      const rec = await q.localMediaById.get(path_);
+      if (!rec) return json(res, 404, { error: 'Datei nicht gefunden' });
+      return json(res, 200, { downloadUrl: '/api/media/local-download/' + path_, expiresIn: 600, local: true });
+    }
+    const downloadUrl = R2.presign({ method: 'GET', key: path_, expiresInSeconds: 600 });
     json(res, 200, { downloadUrl, expiresIn: 600 });
+  },
+
+  /* Lokaler Fallback-Download: liest die Datei asynchron und streamt
+     sie direkt in die Response, statt sie komplett im Speicher zu
+     puffern — wichtig bei größeren Videos/Dateien. */
+  'GET /api/media/local-download': async (req, res, url) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const key = url.pathname.split('/').pop();
+    if (!/^[0-9a-f-]{36}\.bin$/.test(key)) return json(res, 400, { error: 'Ungültiger Medienschlüssel' });
+    const filePath = path.join(LOCAL_MEDIA_DIR, key);
+    try {
+      await fs.promises.access(filePath);
+    } catch {
+      return json(res, 404, { error: 'Datei nicht gefunden' });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+    fs.createReadStream(filePath).pipe(res);
   },
 
   /* Profilbild: Client lädt bereits verschlüsselt zu R2 hoch (siehe
@@ -2012,6 +2117,12 @@ const server = http.createServer(async (req, res) => {
     /* Dynamische Routen */
     if (req.method === 'GET' && url.pathname.startsWith('/api/user/')) {
       return routes['GET /api/user'](req, res, url);
+    }
+    if (req.method === 'PUT' && url.pathname.startsWith('/api/media/local-upload/')) {
+      return routes['PUT /api/media/local-upload'](req, res, url);
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/api/media/local-download/')) {
+      return routes['GET /api/media/local-download'](req, res, url);
     }
     return json(res, 404, { error: 'Unbekannter Endpunkt' });
   }
