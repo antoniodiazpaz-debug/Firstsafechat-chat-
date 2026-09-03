@@ -1177,9 +1177,22 @@ async function handleEnvelope(env, live) {
     });
   } else {
     state.messages.get(convId).push({
-      id: env.id, from: env.senderId || '(versiegelt)', text: plaintext,
-      ts: env.sentAt, mine: false, sealed: !!env.sealed
+      id: env.id, from: env.senderId || '(versiegelt)', fromName: env.senderName,
+      text: plaintext, ts: env.sentAt, mine: false, sealed: !!env.sealed
     });
+    /* In Gruppen mit mehreren Absendern braucht jede fremde Nachricht
+       einen sichtbaren Namen (siehe renderChatMessages) — falls der
+       Server ihn nicht mitschickte, einmalig nachladen und die bereits
+       gerenderte Nachricht rückwirkend aktualisieren. */
+    if (env.groupId && !env.senderName && env.senderId) {
+      fetch(API_BASE + '/api/user/' + env.senderId, { headers: { Authorization: 'Bearer ' + api.token } })
+        .then(r => r.ok ? r.json() : null)
+        .then(u => {
+          if (!u?.user?.name) return;
+          const msg = state.messages.get(convId)?.find(x => x.id === env.id);
+          if (msg) { msg.fromName = u.user.name; if (state.activeConv?.convId === convId) renderChatMessages(); }
+        }).catch(() => {});
+    }
   }
 
   const isSilent = !!(pollVoteObj || liveLocUpdate);
@@ -2118,7 +2131,9 @@ function renderChatMessages() {
           ? `<div class="media"><img src="${m.mediaUrl}"></div>`
           : media.kind === 'video'
             ? `<div class="media"><video src="${m.mediaUrl}" controls></video></div>`
-            : `<div class="filemsg">📄 <a href="${m.mediaUrl}" download style="color:inherit">${esc(media.name || 'Datei')}</a></div>`;
+            : media.kind === 'audio'
+              ? `<audio src="${m.mediaUrl}" controls style="width:220px;max-width:100%"></audio>`
+              : `<div class="filemsg">📄 <a href="${m.mediaUrl}" download style="color:inherit">${esc(media.name || 'Datei')}</a></div>`;
       } else if (thumb && (media.kind === 'image' || media.kind === 'video')) {
         /* Thumbnail ist Teil der bereits entschlüsselten Nachricht
            selbst (siehe makeThumbnail/sendMediaMessage) — Sender UND
@@ -2137,11 +2152,12 @@ function renderChatMessages() {
               <div class="media-load-badge">⬇️ Original laden</div>
             </div>`;
       } else {
-        const icon = media.kind === 'image' ? '🖼️' : media.kind === 'video' ? '🎬' : '📄';
+        const icon = media.kind === 'image' ? '🖼️' : media.kind === 'video' ? '🎬' : media.kind === 'audio' ? '🎤' : '📄';
+        const label = media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : media.kind === 'audio' ? 'Sprachnachricht' : (media.name || 'Datei');
         content = m.mine
-          ? `<div class="filemsg">${icon} <span>${media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : (media.name || 'Datei')} — von dir gesendet</span></div>`
+          ? `<div class="filemsg">${icon} <span>${label} — von dir gesendet</span></div>`
           : `<div class="filemsg" style="cursor:pointer" onclick="window.__app.loadMedia('${m.id}')">
-              ${icon} <span>${media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : (media.name || 'Datei')} — antippen zum Laden</span></div>`;
+              ${icon} <span>${label} — antippen zum Anhören/Laden</span></div>`;
       }
     } else {
       content = `<div class="tx">${esc(m.text)}</div>`;
@@ -2158,6 +2174,7 @@ function renderChatMessages() {
         oncontextmenu="window.__app.openMsgMenu('${esc(m.id)}');return false;">
         ${msgSelMode ? `<span class="msgselectcheck">${msgSelected ? '✅' : '⭕'}</span>` : ''}
         <div class="bub" style="${m.pending ? 'opacity:.65' : ''}">
+          ${state.activeConv.isGroup && !m.mine ? `<div class="msg-sender-name">${esc(m.fromName || 'Unbekannt')}</div>` : ''}
           ${content}
           <div class="ft"><span class="tm">${time(m.ts)}</span>
             ${m.mine ? renderCheckmark(m) : ''}
@@ -2920,11 +2937,11 @@ function clearLocalCache() {
 
 function editProfile() {
   const avatarPreview = state.me.avatarUrl
-    ? `<img src="${state.me.avatarUrl}" style="width:80px;height:80px;border-radius:50%;object-fit:cover">`
+    ? `<div class="av" style="width:80px;height:80px;font-size:32px"><img src="${esc(state.me.avatarUrl)}" alt=""></div>`
     : `<div class="av" style="width:80px;height:80px;font-size:32px">${esc((state.me.name || '?')[0].toUpperCase())}</div>`;
   openSettingsPage('Profil bearbeiten', `
     <div style="text-align:center;margin-bottom:8px">
-      <div id="avatarPreviewWrap" style="display:inline-block;position:relative">${avatarPreview}
+      <div id="avatarPreviewWrap" style="display:inline-flex;position:relative;vertical-align:top">${avatarPreview}
         <button class="navbtn3d" style="position:absolute;bottom:-2px;right:-2px;width:30px;height:30px"
           onclick="window.__app.pickAvatarPhoto()" aria-label="Profilfoto ändern">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="#fff"><path d="M9 3l-1.8 2H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
@@ -3838,6 +3855,17 @@ function showLiveLocationWidget(liveId, data) {
       if (isSender) stopLiveLocation();
       else closeLiveLocationWidget();
     };
+    /* Antippen der Karte (nicht des Schließen-Buttons) vergrößert das
+       Fenster — erneutes Antippen verkleinert wieder. Ein einfacher
+       Klick statt Drag wird über die minimale Bewegung erkannt, damit
+       Verschieben nicht versehentlich als Klick gewertet wird. */
+    let dragMoved = false;
+    widget.addEventListener('pointerdown', () => { dragMoved = false; });
+    widget.addEventListener('pointermove', () => { dragMoved = true; });
+    widget.querySelector('.live-location-map').addEventListener('click', (e) => {
+      if (dragMoved) return;
+      widget.classList.toggle('live-location-widget-large');
+    });
     /* makeDraggable ist in call-ui.js definiert (Pointer-Events-basiert,
        hält das Fenster im sichtbaren Bereich) — hier wiederverwendet,
        kein zweites Mal implementiert. */
@@ -4005,7 +4033,16 @@ async function sendMediaMessage(file, kind) {
 
     const msgs = state.messages.get(state.activeConv.convId) || [];
     const last = msgs[msgs.length - 1];
-    if (last) { last.media = { ref, kind, name: file.name }; last.text = ''; }
+    if (last) {
+      last.media = { ref, kind, name: file.name };
+      last.text = '';
+      /* Sender kann seine eigene Datei sofort abspielen/ansehen, ohne
+         sie erneut vom Server herunterzuladen — die Originaldatei
+         (unverschlüsselt) liegt ja schon lokal im Browser vor. Wichtig
+         besonders für Sprachnachrichten: ohne das hätte der Sender
+         seine eigene Aufnahme nie anhören können. */
+      last.mediaUrl = URL.createObjectURL(file);
+    }
     renderChatMessages();
   } catch (e) {
     toast('⚠️ Upload fehlgeschlagen: ' + e.message);
