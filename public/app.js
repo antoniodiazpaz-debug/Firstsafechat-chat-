@@ -1151,17 +1151,30 @@ async function handleEnvelope(env, live) {
     state.convs.set(convId, { convId, groupId: env.groupId, isGroup: true, name: 'Gruppe', memberIds: [], unread: 0 });
   }
 
-  /* Umfrage-Stimmen sind eine eigene, "unsichtbare" Nachrichtenart:
-     sie tragen keinen Chatverlauf-Eintrag, sondern aktualisieren nur
-     die lokal aggregierten Stimmen (state.pollVotes) — sonst würde
-     jede einzelne Stimme als eigene Chatzeile auftauchen. */
-  let pollVoteObj = null;
-  try { const parsed = JSON.parse(plaintext); if (parsed?.__pollVote) pollVoteObj = parsed.__pollVote; } catch {}
+  /* Umfrage-Stimmen und Live-Standort-Updates sind "unsichtbare"
+     Nachrichtenarten: sie tragen keinen Chatverlauf-Eintrag, sondern
+     lösen jeweils ihre eigene Anzeige aus (aggregierte Stimmen bzw.
+     das schwebende Kartenfenster) — sonst würde jedes einzelne Update
+     als eigene Chatzeile auftauchen. */
+  let pollVoteObj = null, liveLocUpdate = null;
+  try {
+    const parsed = JSON.parse(plaintext);
+    if (parsed?.__pollVote) pollVoteObj = parsed.__pollVote;
+    if (parsed?.__liveLocationUpdate) liveLocUpdate = parsed.__liveLocationUpdate;
+  } catch {}
+
   if (pollVoteObj && env.senderId) {
     if (!state.pollVotes) state.pollVotes = new Map();
     const votes = state.pollVotes.get(pollVoteObj.pollId) || {};
     votes[env.senderId] = pollVoteObj.optionIdx;
     state.pollVotes.set(pollVoteObj.pollId, votes);
+  } else if (liveLocUpdate) {
+    showLiveLocationWidget(liveLocUpdate.liveId, {
+      lat: liveLocUpdate.lat, lng: liveLocUpdate.lng,
+      expiresAt: liveLocUpdate.expiresAt,
+      fromName: liveLocUpdate.fromName || env.senderName || 'Kontakt',
+      isSender: false
+    });
   } else {
     state.messages.get(convId).push({
       id: env.id, from: env.senderId || '(versiegelt)', text: plaintext,
@@ -1169,9 +1182,10 @@ async function handleEnvelope(env, live) {
     });
   }
 
+  const isSilent = !!(pollVoteObj || liveLocUpdate);
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
-  conv.lastMsg = pollVoteObj ? conv.lastMsg : { text: plaintext, ts: env.sentAt };
-  conv.unread = pollVoteObj ? conv.unread : (conv.unread || 0) + 1;
+  conv.lastMsg = isSilent ? conv.lastMsg : { text: plaintext, ts: env.sentAt };
+  conv.unread = isSilent ? conv.unread : (conv.unread || 0) + 1;
   if (!conv.name && env.senderName) conv.name = env.senderName;
   state.convs.set(convId, conv);
   /* Name nachladen falls noch unbekannt */
@@ -2096,16 +2110,38 @@ function renderChatMessages() {
     } else if (contactCard) {
       content = `<div class="filemsg">👤 <span>${esc(contactCard.name || contactCard.id)}</span></div>`;
     } else if (media) {
+      const thumb = media.ref?.thumb;
       if (m.mediaUrl) {
+        /* Original bereits heruntergeladen und entschlüsselt (siehe
+           downloadAndShowMedia) — das zeigt die volle Datei. */
         content = media.kind === 'image'
           ? `<div class="media"><img src="${m.mediaUrl}"></div>`
           : media.kind === 'video'
             ? `<div class="media"><video src="${m.mediaUrl}" controls></video></div>`
             : `<div class="filemsg">📄 <a href="${m.mediaUrl}" download style="color:inherit">${esc(media.name || 'Datei')}</a></div>`;
+      } else if (thumb && (media.kind === 'image' || media.kind === 'video')) {
+        /* Thumbnail ist Teil der bereits entschlüsselten Nachricht
+           selbst (siehe makeThumbnail/sendMediaMessage) — Sender UND
+           Empfänger sehen es SOFORT, ohne dass irgendjemand die
+           Originaldatei vom Server laden muss. Nur der EMPFÄNGER kann
+           antippen, um das (deutlich größere) Original nachzuladen —
+           der Sender hat die Datei bereits lokal, ein erneuter
+           Download vom eigenen Upload wäre unnötig. */
+        content = m.mine
+          ? `<div class="media media-thumb"><img src="${thumb}">
+              ${media.kind === 'video' ? '<div class="media-play-badge">▶</div>' : ''}
+            </div>`
+          : `<div class="media media-thumb" style="cursor:pointer" onclick="window.__app.loadMedia('${m.id}')">
+              <img src="${thumb}">
+              ${media.kind === 'video' ? '<div class="media-play-badge">▶</div>' : ''}
+              <div class="media-load-badge">⬇️ Original laden</div>
+            </div>`;
       } else {
         const icon = media.kind === 'image' ? '🖼️' : media.kind === 'video' ? '🎬' : '📄';
-        content = `<div class="filemsg" style="cursor:pointer" onclick="window.__app.loadMedia('${m.id}')">
-          ${icon} <span>${media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : (media.name || 'Datei')} — antippen zum Laden</span></div>`;
+        content = m.mine
+          ? `<div class="filemsg">${icon} <span>${media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : (media.name || 'Datei')} — von dir gesendet</span></div>`
+          : `<div class="filemsg" style="cursor:pointer" onclick="window.__app.loadMedia('${m.id}')">
+              ${icon} <span>${media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : (media.name || 'Datei')} — antippen zum Laden</span></div>`;
       }
     } else {
       content = `<div class="tx">${esc(m.text)}</div>`;
@@ -3689,17 +3725,22 @@ function sendLocationOnce() {
   );
 }
 
-/* ── Live-Standort ──
-   Sendet den eigenen Standort periodisch (alle 20s) als aktualisierte
-   __location-Nachricht mit einer gemeinsamen liveId, damit der Empfänger
-   sie als EINE sich bewegende Karte darstellen kann statt vieler
-   einzelner Chatzeilen (siehe renderChatMessages: nur die neueste
-   Position pro liveId wird gezeigt). Läuft automatisch nach der
-   gewählten Dauer ab; watchPosition() statt wiederholtem
-   getCurrentPosition() spart Akku, weil das Betriebssystem selbst
-   entscheidet, wann eine neue Messung nötig ist. */
+/* ═══════════════════════════════════════════════════════════════════════
+   LIVE-STANDORT ALS SCHWEBENDES FENSTER
+   ─────────────────────────────────────────────────────────────────────
+   Bewusst KEIN wiederholtes Update einer Chat-Nachricht mehr — das gab
+   entweder viele einzelne Chatzeilen oder eine verwirrend "springende"
+   einzelne Nachricht. Stattdessen: EIN Overlay-Fenster (frei
+   verschiebbar wie das PiP im Videoanruf, siehe makeDraggable in
+   call-ui.js), das sich per WebSocket-Update in Echtzeit bewegt.
+   Position-Updates laufen über denselben Envelope-Mechanismus wie
+   Chatnachrichten (Ende-zu-Ende verschlüsselt), landen aber NIE im
+   sichtbaren Chatverlauf (siehe handleEnvelope: __liveLocationUpdate
+   wird herausgefiltert, ähnlich den Umfrage-Stimmen). */
 let _liveLocationWatchId = null;
 let _liveLocationTimer = null;
+let _liveLocationConv = null;
+
 function startLiveLocation(minutes) {
   document.getElementById('shareLocationSheet')?.remove();
   if (!state.activeConv) return;
@@ -3708,16 +3749,19 @@ function startLiveLocation(minutes) {
   const liveId = 'live_' + Date.now();
   const conv = state.activeConv;
   const endAt = Date.now() + minutes * 60000;
+  _liveLocationConv = conv;
 
   const sendUpdate = async (pos) => {
     const { latitude, longitude } = pos.coords;
-    const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
     try {
       await sendMessage(conv.peerId, conv.convId, JSON.stringify({
-        __location: { lat: latitude, lng: longitude, url: mapsUrl, liveId, expiresAt: endAt }
+        __liveLocationUpdate: { liveId, lat: latitude, lng: longitude, expiresAt: endAt, fromName: state.me.name }
       }));
-      if (state.activeConv?.convId === conv.convId) renderChatMessages();
     } catch {}
+    /* Eigenes Fenster ebenfalls aktualisieren — der Sender sieht seine
+       eigene Live-Position genauso im schwebenden Fenster wie der
+       Empfänger, statt gar keine Rückmeldung zu haben. */
+    showLiveLocationWidget(liveId, { lat: latitude, lng: longitude, expiresAt: endAt, fromName: 'Du', isSender: true });
   };
 
   navigator.geolocation.getCurrentPosition(sendUpdate, () => toast('⚠️ Standortzugriff verweigert'), { enableHighAccuracy: true });
@@ -3729,8 +3773,86 @@ function startLiveLocation(minutes) {
 function stopLiveLocation(silent) {
   if (_liveLocationWatchId != null) { navigator.geolocation.clearWatch(_liveLocationWatchId); _liveLocationWatchId = null; }
   if (_liveLocationTimer) { clearTimeout(_liveLocationTimer); _liveLocationTimer = null; }
+  closeLiveLocationWidget();
   if (!silent) toast('Live-Standort beendet');
 }
+
+/* Schwebendes, verschiebbares Kartenfenster — ein einziges Element,
+   das bei jedem Positions-Update nur seinen Kartenausschnitt
+   austauscht, statt neu erzeugt zu werden (verhindert, dass die vom
+   Nutzer gewählte Bildschirmposition bei jedem Update zurückspringt). */
+/* Eigenständige Drag-Funktion (nicht von call-ui.js abhängig, das nur
+   bei aktivem Anruf-Feature geladen wird) — dasselbe Pointer-Events-
+   Muster wie beim Video-PiP, hier für das Live-Standort-Fenster. */
+function makeDraggableWidget(elm) {
+  let startX = 0, startY = 0, origX = 0, origY = 0, dragging = false;
+  elm.style.touchAction = 'none';
+  elm.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.live-location-close')) return;
+    dragging = true;
+    elm.setPointerCapture(e.pointerId);
+    const rect = elm.getBoundingClientRect();
+    origX = rect.left; origY = rect.top;
+    startX = e.clientX; startY = e.clientY;
+    elm.style.right = 'auto'; elm.style.bottom = 'auto';
+    elm.style.left = origX + 'px'; elm.style.top = origY + 'px';
+  });
+  elm.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    const maxX = window.innerWidth - elm.offsetWidth;
+    const maxY = window.innerHeight - elm.offsetHeight;
+    elm.style.left = Math.max(0, Math.min(maxX, origX + dx)) + 'px';
+    elm.style.top = Math.max(0, Math.min(maxY, origY + dy)) + 'px';
+  });
+  const stop = (e) => { dragging = false; try { elm.releasePointerCapture(e.pointerId); } catch {} };
+  elm.addEventListener('pointerup', stop);
+  elm.addEventListener('pointercancel', stop);
+}
+
+function showLiveLocationWidget(liveId, data) {
+  const { lat, lng, expiresAt, fromName, isSender } = data;
+  if (Date.now() > expiresAt) { closeLiveLocationWidget(); return; }
+
+  let widget = document.getElementById('liveLocationWidget');
+  const zoom = 15;
+  const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom));
+  const tileY = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
+  const tileUrl = `https://tile.openstreetmap.org/${zoom}/${tileX}/${tileY}.png`;
+  const mapsUrl = `https://www.google.com/maps?q=${lat},${lng}`;
+
+  if (!widget) {
+    widget = document.createElement('div');
+    widget.id = 'liveLocationWidget';
+    widget.className = 'live-location-widget';
+    widget.innerHTML = `
+      <button class="live-location-close" aria-label="Schließen">✕</button>
+      <div class="live-location-map">
+        <div class="live-location-orb"></div>
+        <div class="live-location-orb-pulse"></div>
+      </div>
+      <div class="live-location-label"></div>`;
+    document.body.appendChild(widget);
+    widget.querySelector('.live-location-close').onclick = (e) => {
+      e.stopPropagation();
+      if (isSender) stopLiveLocation();
+      else closeLiveLocationWidget();
+    };
+    /* makeDraggable ist in call-ui.js definiert (Pointer-Events-basiert,
+       hält das Fenster im sichtbaren Bereich) — hier wiederverwendet,
+       kein zweites Mal implementiert. */
+    makeDraggableWidget(widget);
+  }
+  widget.dataset.liveId = liveId;
+  widget.querySelector('.live-location-map').style.backgroundImage = `url('${tileUrl}')`;
+  widget.querySelector('.live-location-label').innerHTML =
+    `📍 ${esc(fromName)} · <a href="${esc(mapsUrl)}" target="_blank" rel="noopener" style="color:inherit">öffnen</a>`;
+}
+function closeLiveLocationWidget() {
+  document.getElementById('liveLocationWidget')?.remove();
+}
+
+
 
 /* ── Kontakt teilen — aus den eigenen SecureChat-Kontakten auswählen,
    Name + userId werden als strukturierte Nachricht gesendet. ── */
@@ -3808,6 +3930,51 @@ async function decryptDownloadedFile(buf, ivB64, keyB64, mimeType) {
   return new Blob([plain], { type: mimeType || 'application/octet-stream' });
 }
 
+/* Erzeugt ein kleines Vorschaubild (max. 160px, JPEG ~60% Qualität)
+   direkt im Browser — landet als Data-URL in der Nachricht selbst und
+   damit im ganz normalen Ende-zu-Ende-verschlüsselten Textpfad (die
+   Referenz __media trägt sie mit). Sender UND Empfänger sehen sie
+   sofort, ohne dass irgendwer die Originaldatei herunterladen muss —
+   das Original bleibt weiterhin ein expliziter Klick (siehe
+   downloadAndShowMedia), nur die Vorschau ist "kostenlos" dabei. */
+async function makeThumbnail(file, kind) {
+  if (kind !== 'image' && kind !== 'video') return null;
+  try {
+    let sourceEl;
+    if (kind === 'image') {
+      sourceEl = await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = URL.createObjectURL(file);
+      });
+    } else {
+      sourceEl = await new Promise((resolve, reject) => {
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+        video.muted = true;
+        video.src = URL.createObjectURL(file);
+        video.onloadeddata = () => { video.currentTime = Math.min(0.5, video.duration || 0); };
+        video.onseeked = () => resolve(video);
+        video.onerror = reject;
+      });
+    }
+    const maxDim = 160;
+    const w = sourceEl.videoWidth || sourceEl.naturalWidth || sourceEl.width;
+    const h = sourceEl.videoHeight || sourceEl.naturalHeight || sourceEl.height;
+    if (!w || !h) return null;
+    const scale = Math.min(1, maxDim / Math.max(w, h));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(w * scale);
+    canvas.height = Math.round(h * scale);
+    canvas.getContext('2d').drawImage(sourceEl, 0, 0, canvas.width, canvas.height);
+    URL.revokeObjectURL(sourceEl.src);
+    return canvas.toDataURL('image/jpeg', 0.6);
+  } catch {
+    return null;
+  }
+}
+
 async function sendMediaMessage(file, kind) {
   if (!state.activeConv) return;
   toast('📎 Wird hochgeladen…', 4000);
@@ -3817,16 +3984,19 @@ async function sendMediaMessage(file, kind) {
       try { toUpload = await window.MediaStorage.shrinkImage(file); } catch {}
     }
 
+    const thumb = await makeThumbnail(file, kind);
     const { path: mediaPath, uploadUrl } = await api._fetch('/api/media/upload-url', { method: 'POST' });
     const { blob, ivB64, keyB64 } = await encryptFileForUpload(toUpload);
     const uploadResp = await fetch(uploadUrl, { method: 'PUT', body: blob });
     if (!uploadResp.ok) throw new Error('Hochladen fehlgeschlagen (' + uploadResp.status + ')');
 
-    const ref = { path: mediaPath, iv: ivB64, key: keyB64, mime: file.type, name: file.name, size: file.size };
+    const ref = { path: mediaPath, iv: ivB64, key: keyB64, mime: file.type, name: file.name, size: file.size, thumb };
 
-    /* Nur die winzige Referenz (~250 Byte) geht durch den geschützten
+    /* Referenz + Thumbnail gehen zusammen durch den geschützten
        Ratchet-Pfad — genau wie Text, nur mit kind:'media' markiert,
-       damit der Empfänger weiß, dass er die Datei separat laden muss. */
+       damit der Empfänger weiß, dass er die Originaldatei separat
+       laden muss. Das Thumbnail selbst ist bereits Teil dieser
+       Nachricht und braucht keinen zusätzlichen Download. */
     const result = await sendMessage(state.activeConv.peerId, state.activeConv.convId,
       JSON.stringify({ __media: ref, kind }));
 
