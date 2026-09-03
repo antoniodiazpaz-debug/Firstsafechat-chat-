@@ -1388,7 +1388,13 @@ const routes = {
      sie direkt in die Response, statt sie komplett im Speicher zu
      puffern — wichtig bei größeren Videos/Dateien. */
   'GET /api/media/local-download': async (req, res, url) => {
-    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    /* Bewusst OHNE auth(req)-Pflicht — dieselbe Begründung wie beim
+       Upload-Handler: fetch(downloadUrl) im Client schickt keinen
+       Bearer-Token mit, weil diese URL wie eine presigned R2-URL
+       behandelt wird (Berechtigung steckt im unerratbaren UUID-Pfad).
+       Für Chat-Anhänge ist das ohnehin nur eine zweite Schutzebene:
+       der eigentliche Inhaltsschutz ist die Ende-zu-Ende-Verschlüsselung
+       (der Server liefert hier nur Chiffretext, nie den Klartext). */
     const key = url.pathname.split('/').pop();
     if (!/^[0-9a-f-]{36}\.bin$/.test(key)) return json(res, 400, { error: 'Ungültiger Medienschlüssel' });
     const filePath = path.join(LOCAL_MEDIA_DIR, key);
