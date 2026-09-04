@@ -1711,7 +1711,7 @@ const routes = {
         b.gossip ? JSON.stringify(b.gossip) : null, now);
 
       const env = {
-        type: 'envelope', id, senderId: a.user.id, senderDeviceId: a.device.id,
+        type: 'envelope', id, senderId: a.user.id, senderName: a.user.name, senderDeviceId: a.device.id,
         recipientId: b.recipientId, recipientDeviceId: d.deviceId,
         convId: b.convId, groupId: b.groupId || null, kind: b.kind || 'text',
         header: d.header || null, ciphertext: d.ciphertext, gossip: b.gossip || null, sentAt: now
@@ -1731,8 +1731,21 @@ const routes = {
   'GET /api/inbox': async (req, res) => {
     const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
     const pendingRows = await q.pending.all(a.device.id);
+    /* senderName fehlte hier bisher komplett — der Live-WebSocket-Pfad
+       (deliverToDevice, siehe /api/send) liefert ihn direkt mit, aber
+       beim Nachholen über die Inbox (z. B. nach Offline-Phase oder
+       App-Neustart) kam nur die rohe senderId an. Für Gruppenchats mit
+       mehreren Absendern zeigte das dann "Unbekannt" statt des echten
+       Namens — hier einmal pro eindeutigem Absender nachschlagen. */
+    const senderIds = [...new Set(pendingRows.map(r => r.sender_id).filter(Boolean))];
+    const senderNames = {};
+    for (const id of senderIds) {
+      const u = await q.userById.get(id);
+      if (u) senderNames[id] = u.name;
+    }
     const rows = pendingRows.map(r => ({
-      id: r.id, senderId: r.sender_id, senderDeviceId: r.sender_device_id,
+      id: r.id, senderId: r.sender_id, senderName: r.sender_id ? senderNames[r.sender_id] : null,
+      senderDeviceId: r.sender_device_id,
       sealed: !!r.sealed, convId: r.conv_id, groupId: r.group_id,
       kind: r.kind, header: r.header ? JSON.parse(r.header) : null,
       ciphertext: r.ciphertext, gossip: r.gossip ? JSON.parse(r.gossip) : null, sentAt: r.sent_at
