@@ -429,6 +429,7 @@ async function boot() {
   loadDisappearingSettings();
   loadChatPrefs();
   loadAccentTheme();
+  loadPinnedAndFavorites();
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
@@ -1434,11 +1435,20 @@ function renderMain() {
   let convs = [...state.convs.values()];
   if (activePill === 'unread') convs = convs.filter(c => (c.unread || 0) > 0);
   if (activePill === 'groups') convs = convs.filter(c => c.isGroup);
+  if (activePill === 'favorites') convs = convs.filter(c => state.favoriteChats?.has(c.convId));
   if (state.search) {
     const q = state.search.toLowerCase();
     convs = convs.filter(c => (c.name || c.peerId || '').toLowerCase().includes(q));
   }
-  convs.sort((a, b) => (b.lastMsg?.ts || 0) - (a.lastMsg?.ts || 0));
+  /* Angepinnte Chats immer zuerst, innerhalb der beiden Gruppen nach
+     letzter Nachricht sortiert — genau das übliche Verhalten, das
+     Nutzer aus anderen Messengern erwarten. */
+  convs.sort((a, b) => {
+    const aPinned = state.pinnedChats?.has(a.convId) ? 1 : 0;
+    const bPinned = state.pinnedChats?.has(b.convId) ? 1 : 0;
+    if (aPinned !== bPinned) return bPinned - aPinned;
+    return (b.lastMsg?.ts || 0) - (a.lastMsg?.ts || 0);
+  });
 
   const selMode = !!state.selectMode;
   main.innerHTML = `
@@ -1472,6 +1482,8 @@ function convRow(c, i) {
   const preview = c.lastMsg ? esc(c.lastMsg.text).slice(0, 60) : 'Noch keine Nachrichten';
   const selMode = !!state.selectMode;
   const isSelected = state.selectedConvs?.has(c.convId);
+  const isPinned = state.pinnedChats?.has(c.convId);
+  const isFavorite = state.favoriteChats?.has(c.convId);
   const rowClick = selMode
     ? `window.__app.toggleSelectConv('${c.convId}')`
     : `window.__app.openConv(${i})`;
@@ -1483,7 +1495,7 @@ function convRow(c, i) {
       ${selMode ? `<div class="selectcheck">${isSelected ? '✅' : '⭕'}</div>` : ''}
       <div class="av">${avatar}${c.isGroup ? '' : `<div class="dot ${c.online ? 'online' : 'offline'}"></div>`}</div>
       <div class="meta">
-        <div class="l1"><span class="nm">${esc(name)}</span>
+        <div class="l1"><span class="nm">${isPinned ? '📌 ' : ''}${isFavorite ? '⭐ ' : ''}${esc(name)}</span>
           <span class="tm ${unread ? 'un' : ''}">${c.lastMsg ? time(c.lastMsg.ts) : ''}</span></div>
         <div class="l2"><span class="pv">${preview}</span>
           ${unread ? `<span class="unread">${unread}</span>` : ''}</div>
@@ -1564,6 +1576,7 @@ const appActions = {
   openSettings() { openSettings(); },
   openDesignSettings() { openDesignSettings(); },
   setAccentTheme(theme) { setAccentTheme(theme); },
+  setCategoryTheme(category, theme) { setCategoryTheme(category, theme); },
   saveBrandingName() { saveBrandingName(); },
   pickBrandingLogo() { pickBrandingLogo(); },
   clearBrandingLogo() { clearBrandingLogo(); },
@@ -1616,6 +1629,8 @@ const appActions = {
   doChatSearch(q) { doChatSearch(q); },
   clearChatSearch() { clearChatSearch(); },
   toggleMuteChat() { toggleMuteChat(); },
+  toggleChatPin(convId) { toggleChatPin(convId); },
+  toggleChatFavorite(convId) { toggleChatFavorite(convId); },
   openDisappearingMessages() { openDisappearingMessages(); },
   setDisappearing(sec) { setDisappearing(sec); },
   showEncryptionFingerprint() { showEncryptionFingerprint(); },
@@ -1862,7 +1877,7 @@ function showVoiceRecordingBar() {
     <span style="color:#f15c6d;font-size:18px">●</span>
     <span id="voiceRecTimer" style="flex:1;font-variant-numeric:tabular-nums">0:00</span>
     <button class="btn ghost" style="padding:8px 16px" onclick="window.__app.stopVoiceRecording(false)">Abbrechen</button>
-    <button class="sendbtn navbtn3d navbtn3d-on" onclick="window.__app.stopVoiceRecording(true)" aria-label="Senden">
+    <button class="sendbtn navbtn3d navbtn3d-send" onclick="window.__app.stopVoiceRecording(true)" aria-label="Senden">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="#fff">${SEND_ICON}</svg>
     </button>`;
   $('#composer')?.appendChild(bar);
@@ -1998,7 +2013,7 @@ function openChat(c) {
             oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,110)+'px';window.__app.onMsgInputChange(this.value)"
             onkeydown="window.__app.inputKey(event)"></textarea>
         </div>
-        <button class="sendbtn navbtn3d navbtn3d-on" id="sendOrMicBtn"
+        <button class="sendbtn navbtn3d navbtn3d-send" id="sendOrMicBtn"
           onclick="window.__app.sendOrMicClick()" aria-label="Senden">
           <svg id="sendMicIcon" viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2z"/></svg>
         </button>
@@ -2633,47 +2648,98 @@ function openSettings() {
    Variablen nutzen (Buttons, Sende-Icon, Häkchen, aktive Tab-Farbe),
    ohne dass jede einzelne Komponente angepasst werden muss.
    ═══════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+   DESIGN-EINSTELLUNGEN — jede Button-Kategorie einzeln einstellbar
+   ─────────────────────────────────────────────────────────────────────
+   Statt EINES globalen Themes (--acc/--acc2 für alles) bekommt jede
+   funktionale Button-Gruppe ihre eigene CSS-Variable mit sinnvollem
+   Fallback auf die globale Akzentfarbe, falls für diese Kategorie
+   nichts explizit gewählt wurde (siehe index.html: var(--btn-x-2,
+   var(--acc2, #fallback))). Das erlaubt sowohl "alles einheitlich"
+   (nur --acc/--acc2 setzen) als auch volle Individualisierung. */
+const BUTTON_CATEGORIES = {
+  general:    { label: 'Allgemein (Navigation, Menüs)', cssVar: null },   // steuert --acc/--acc2 selbst
+  send:       { label: 'Senden-Button', cssVar: 'btn-send' },
+  attach:     { label: 'Anhang-Menü', cssVar: 'btn-attach' },
+  callAudio:  { label: 'Anrufen (Audio)', cssVar: 'btn-callaudio' },
+  callVideo:  { label: 'Anrufen (Video)', cssVar: 'btn-callvideo' },
+  callAccept: { label: 'Anruf annehmen', cssVar: 'call-accept' },
+  callEnd:    { label: 'Anruf beenden/ablehnen', cssVar: 'call-end' }
+};
 const ACCENT_THEMES = {
-  green:  { acc: '#00a884', acc2: '#25d366', label: 'Grün (Standard)' },
+  green:  { acc: '#00a884', acc2: '#25d366', label: 'Grün' },
   blue:   { acc: '#1d4ed8', acc2: '#5b9bf5', label: 'Blau' },
   purple: { acc: '#7c3aed', acc2: '#a78bfa', label: 'Violett' },
   orange: { acc: '#ea580c', acc2: '#fb923c', label: 'Orange' },
   pink:   { acc: '#db2777', acc2: '#f472b6', label: 'Pink' },
-  red:    { acc: '#dc2626', acc2: '#f87171', label: 'Rot' }
+  red:    { acc: '#dc2626', acc2: '#f87171', label: 'Rot' },
+  default:{ acc: '', acc2: '', label: 'Standard' }   // Kategorie-eigener Fallback greift
 };
 function loadAccentTheme() {
-  let theme = 'green';
-  try { theme = localStorage.getItem('sc:accentTheme') || 'green'; } catch {}
-  applyAccentTheme(theme);
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem('sc:buttonThemes') || '{}'); } catch {}
+  state.buttonThemes = stored;
+  for (const key of Object.keys(BUTTON_CATEGORIES)) {
+    applyButtonTheme(key, stored[key] || (key === 'general' ? 'green' : 'default'), false);
+  }
 }
-function applyAccentTheme(theme) {
-  const t = ACCENT_THEMES[theme] || ACCENT_THEMES.green;
-  document.documentElement.style.setProperty('--acc', t.acc);
-  document.documentElement.style.setProperty('--acc2', t.acc2);
-  state.accentTheme = theme;
+function applyButtonTheme(category, themeKey, persist = true) {
+  const t = ACCENT_THEMES[themeKey] || ACCENT_THEMES.default;
+  const cat = BUTTON_CATEGORIES[category];
+  if (!cat) return;
+  if (category === 'general') {
+    document.documentElement.style.setProperty('--acc', t.acc || '#00a884');
+    document.documentElement.style.setProperty('--acc2', t.acc2 || '#25d366');
+  } else if (themeKey === 'default') {
+    document.documentElement.style.removeProperty(`--${cat.cssVar}-1`);
+    document.documentElement.style.removeProperty(`--${cat.cssVar}-2`);
+  } else {
+    document.documentElement.style.setProperty(`--${cat.cssVar}-1`, t.acc);
+    document.documentElement.style.setProperty(`--${cat.cssVar}-2`, t.acc2);
+  }
+  if (!state.buttonThemes) state.buttonThemes = {};
+  state.buttonThemes[category] = themeKey;
+  if (persist) {
+    try { localStorage.setItem('sc:buttonThemes', JSON.stringify(state.buttonThemes)); } catch {}
+  }
 }
 function setAccentTheme(theme) {
-  applyAccentTheme(theme);
-  try { localStorage.setItem('sc:accentTheme', theme); } catch {}
+  /* Rückwärtskompatibel: setzt weiterhin NUR die allgemeine Kategorie —
+     der Aufruf aus alten UI-Elementen bleibt funktionsfähig. */
+  applyButtonTheme('general', theme);
+  openDesignSettings();
+}
+function setCategoryTheme(category, theme) {
+  applyButtonTheme(category, theme);
   openDesignSettings();
 }
 function openDesignSettings() {
-  const current = state.accentTheme || 'green';
   const branding = getAppBranding();
-  openSettingsPage('Design', `
-    <label style="font-size:13px;color:var(--sub)">Akzentfarbe</label>
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px">
-      ${Object.entries(ACCENT_THEMES).map(([key, t]) => `
-        <button onclick="window.__app.setAccentTheme('${key}')"
-          style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 4px;
-            border-radius:12px;border:2px solid ${current === key ? t.acc2 : 'transparent'};
-            background:var(--panel2);cursor:pointer">
-          <span style="width:32px;height:32px;border-radius:50%;background:${t.acc2}"></span>
-          <span style="font-size:12px;color:var(--tx)">${t.label}</span>
-        </button>`).join('')}
-    </div>
+  const swatches = (category) => Object.entries(ACCENT_THEMES).map(([key, t]) => {
+    const current = (state.buttonThemes?.[category] || (category === 'general' ? 'green' : 'default')) === key;
+    const swatchColor = t.acc2 || 'var(--panel2)';
+    return `
+      <button onclick="window.__app.setCategoryTheme('${category}','${key}')"
+        style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 2px;
+          border-radius:10px;border:2px solid ${current ? (t.acc2 || 'var(--sub)') : 'transparent'};
+          background:var(--panel2);cursor:pointer">
+        <span style="width:24px;height:24px;border-radius:50%;background:${swatchColor};
+          ${key === 'default' ? 'border:2px dashed var(--sub)' : ''}"></span>
+        <span style="font-size:10.5px;color:var(--tx)">${t.label}</span>
+      </button>`;
+  }).join('');
 
-    <label style="font-size:13px;color:var(--sub);display:block;margin-top:24px">App-Name im Kopfbereich</label>
+  openSettingsPage('Design', `
+    ${Object.entries(BUTTON_CATEGORIES).map(([key, cat]) => `
+      <div style="margin-bottom:22px">
+        <label style="font-size:13px;color:var(--sub)">${esc(cat.label)}</label>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px">
+          ${swatches(key)}
+        </div>
+      </div>
+    `).join('')}
+
+    <label style="font-size:13px;color:var(--sub);display:block;margin-top:8px">App-Name im Kopfbereich</label>
     <input id="brandingNameInput" type="text" value="${esc(branding.name)}" placeholder="SecureChat"
       style="width:100%;box-sizing:border-box;font-size:16px;padding:12px;border-radius:10px;
         border:none;background:var(--panel2);color:var(--tx);margin:8px 0 16px">
@@ -2759,7 +2825,8 @@ const DEFAULT_CHAT_PREFS = {
   readReceipts: true,
   showLastSeen: true,
   enterToSend: true,
-  fontSize: 'medium'   // small | medium | large
+  fontSize: 'medium',   // small | medium | large
+  liveLocationAsWidget: true   // true = schwebendes Fenster, false = Chat-Karte
 };
 function loadChatPrefs() {
   try {
@@ -2793,6 +2860,7 @@ function openChatSettings() {
       ${toggle('readReceipts', 'Lesebestätigungen', 'Zeigt anderen, wenn du ihre Nachricht gelesen hast')}
       ${toggle('showLastSeen', 'Zuletzt online zeigen', 'Andere sehen, wann du zuletzt aktiv warst')}
       ${toggle('enterToSend', 'Enter zum Senden', 'Sonst: Enter fügt einen Zeilenumbruch ein')}
+      ${toggle('liveLocationAsWidget', 'Live-Standort als schwebendes Fenster', 'Sonst: als normale Chat-Nachricht mit Kartenvorschau')}
     </div>
     <div style="margin-top:20px">
       <label style="font-size:13px;color:var(--sub)">Schriftgröße im Chat</label>
@@ -3104,8 +3172,11 @@ function chatMenu(e) {
   e?.stopPropagation();
   if (!state.activeConv) return;
   const peerId = state.activeConv.peerId;
+  const convId = state.activeConv.convId;
   const isBlocked = state.blocked.has(peerId);
   const isMuted = state.mutedChats?.has(peerId);
+  const isPinned = state.pinnedChats?.has(convId);
+  const isFavorite = state.favoriteChats?.has(convId);
 
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'chatMenuSheet';
@@ -3114,6 +3185,12 @@ function chatMenu(e) {
     <div class="sheetbox">
       <div class="grabber"></div>
       <div class="menulist">
+        <button class="menuitem" onclick="window.__app.toggleChatPin('${esc(convId)}');document.getElementById('chatMenuSheet').remove()">
+          <span class="mi-ic">📌</span><span>${isPinned ? 'Nicht mehr anpinnen' : 'Chat anpinnen'}</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.toggleChatFavorite('${esc(convId)}');document.getElementById('chatMenuSheet').remove()">
+          <span class="mi-ic">${isFavorite ? '⭐' : '☆'}</span><span>${isFavorite ? 'Aus Favoriten entfernen' : 'Als Favorit markieren'}</span>
+        </button>
         <button class="menuitem" onclick="window.__app.searchInChat()">
           <span class="mi-ic">🔍</span><span>In Chat suchen</span>
         </button>
@@ -3178,6 +3255,27 @@ function clearChatSearch() {
 }
 
 /* ── Stummschalten (nur lokal — reine Anzeige-/Benachrichtigungspräferenz) ── */
+/* ── Chat anpinnen (oben in der Liste halten) ── */
+function toggleChatPin(convId) {
+  if (!state.pinnedChats) state.pinnedChats = new Set();
+  if (state.pinnedChats.has(convId)) { state.pinnedChats.delete(convId); toast('Chat nicht mehr angepinnt'); }
+  else { state.pinnedChats.add(convId); toast('Chat angepinnt'); }
+  try { localStorage.setItem('sc:pinnedChats', JSON.stringify([...state.pinnedChats])); } catch {}
+  renderMain();
+}
+/* ── Chat als Favorit markieren (eigener Filter in der Pillbar) ── */
+function toggleChatFavorite(convId) {
+  if (!state.favoriteChats) state.favoriteChats = new Set();
+  if (state.favoriteChats.has(convId)) { state.favoriteChats.delete(convId); toast('Aus Favoriten entfernt'); }
+  else { state.favoriteChats.add(convId); toast('Als Favorit markiert'); }
+  try { localStorage.setItem('sc:favoriteChats', JSON.stringify([...state.favoriteChats])); } catch {}
+  renderMain();
+}
+function loadPinnedAndFavorites() {
+  try { state.pinnedChats = new Set(JSON.parse(localStorage.getItem('sc:pinnedChats') || '[]')); } catch { state.pinnedChats = new Set(); }
+  try { state.favoriteChats = new Set(JSON.parse(localStorage.getItem('sc:favoriteChats') || '[]')); } catch { state.favoriteChats = new Set(); }
+}
+
 function toggleMuteChat() {
   document.getElementById('chatMenuSheet')?.remove();
   if (!state.mutedChats) state.mutedChats = new Set();
@@ -3770,15 +3868,31 @@ function startLiveLocation(minutes) {
 
   const sendUpdate = async (pos) => {
     const { latitude, longitude } = pos.coords;
+    const asWidget = state.chatPrefs?.liveLocationAsWidget !== false;
     try {
-      await sendMessage(conv.peerId, conv.convId, JSON.stringify({
-        __liveLocationUpdate: { liveId, lat: latitude, lng: longitude, expiresAt: endAt, fromName: state.me.name }
-      }));
+      if (asWidget) {
+        await sendMessage(conv.peerId, conv.convId, JSON.stringify({
+          __liveLocationUpdate: { liveId, lat: latitude, lng: longitude, expiresAt: endAt, fromName: state.me.name }
+        }));
+      } else {
+        /* Fallback: normale Chat-Nachricht mit Kartenvorschau, wird bei
+           jedem Update NEU gesendet (eigener Chatverlauf-Eintrag pro
+           Position) statt eines schwebenden Fensters — für Nutzer, die
+           lieber einen nachvollziehbaren Verlauf im Chat selbst haben. */
+        const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
+        await sendMessage(conv.peerId, conv.convId, JSON.stringify({
+          __location: { lat: latitude, lng: longitude, url: mapsUrl, liveId, expiresAt: endAt }
+        }));
+        if (state.activeConv?.convId === conv.convId) renderChatMessages();
+      }
     } catch {}
     /* Eigenes Fenster ebenfalls aktualisieren — der Sender sieht seine
        eigene Live-Position genauso im schwebenden Fenster wie der
-       Empfänger, statt gar keine Rückmeldung zu haben. */
-    showLiveLocationWidget(liveId, { lat: latitude, lng: longitude, expiresAt: endAt, fromName: 'Du', isSender: true });
+       Empfänger, statt gar keine Rückmeldung zu haben. Nur im
+       Widget-Modus relevant. */
+    if (asWidget) {
+      showLiveLocationWidget(liveId, { lat: latitude, lng: longitude, expiresAt: endAt, fromName: 'Du', isSender: true });
+    }
   };
 
   navigator.geolocation.getCurrentPosition(sendUpdate, () => toast('⚠️ Standortzugriff verweigert'), { enableHighAccuracy: true });
