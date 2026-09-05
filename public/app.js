@@ -3839,6 +3839,7 @@ function shareLocation() {
   document.getElementById('attachSheet')?.remove();
   if (!navigator.geolocation) { toast('⚠️ Standort auf diesem Gerät nicht verfügbar'); return; }
 
+  const isActive = _liveLocationWatchId != null;
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'shareLocationSheet';
   sheet.onclick = ev => { if (ev.target === sheet) sheet.remove(); };
@@ -3846,20 +3847,29 @@ function shareLocation() {
     <div class="sheetbox">
       <div class="grabber"></div>
       <h3 style="margin:0 0 12px">Standort teilen</h3>
-      <div class="menulist">
-        <button class="menuitem" onclick="window.__app.sendLocationOnce()">
-          <span class="mi-ic">📍</span><span>Aktueller Standort (einmalig)</span>
-        </button>
-        <button class="menuitem" onclick="window.__app.startLiveLocation(15)">
-          <span class="mi-ic">🔴</span><span>Live-Standort für 15 Minuten</span>
-        </button>
-        <button class="menuitem" onclick="window.__app.startLiveLocation(60)">
-          <span class="mi-ic">🔴</span><span>Live-Standort für 1 Stunde</span>
-        </button>
-        <button class="menuitem" onclick="window.__app.startLiveLocation(480)">
-          <span class="mi-ic">🔴</span><span>Live-Standort für 8 Stunden</span>
-        </button>
-      </div>
+      ${isActive ? `
+        <div class="menulist">
+          <button class="menuitem" onclick="document.getElementById('shareLocationSheet').remove();window.__app.stopLiveLocation()">
+            <span class="mi-ic">⏹️</span><span style="color:var(--dan)">Live-Standort beenden</span>
+          </button>
+        </div>
+        <p style="color:var(--sub);font-size:13px;margin-top:8px">Live-Standort läuft bereits — beende ihn erst, um neu zu starten.</p>
+      ` : `
+        <div class="menulist">
+          <button class="menuitem" onclick="window.__app.sendLocationOnce()">
+            <span class="mi-ic">📍</span><span>Aktueller Standort (einmalig)</span>
+          </button>
+          <button class="menuitem" onclick="window.__app.startLiveLocation(15)">
+            <span class="mi-ic">🔴</span><span>Live-Standort für 15 Minuten</span>
+          </button>
+          <button class="menuitem" onclick="window.__app.startLiveLocation(60)">
+            <span class="mi-ic">🔴</span><span>Live-Standort für 1 Stunde</span>
+          </button>
+          <button class="menuitem" onclick="window.__app.startLiveLocation(480)">
+            <span class="mi-ic">🔴</span><span>Live-Standort für 8 Stunden</span>
+          </button>
+        </div>
+      `}
     </div>`;
   document.getElementById('overlays').appendChild(sheet);
 }
@@ -3897,13 +3907,31 @@ function sendLocationOnce() {
 let _liveLocationWatchId = null;
 let _liveLocationTimer = null;
 let _liveLocationConv = null;
+let _liveLocationLastLiveId = null;
 
 function startLiveLocation(minutes) {
   document.getElementById('shareLocationSheet')?.remove();
   if (!state.activeConv) return;
-  if (_liveLocationWatchId != null) { toast('⚠️ Live-Standort läuft bereits'); return; }
+  if (_liveLocationWatchId != null) {
+    /* Läuft bereits — statt nur zu warnen, das Widget wieder sichtbar
+       machen, falls es aus irgendeinem Grund verschwunden ist (z. B.
+       versehentlich mitgelöscht oder nie erfolgreich angezeigt wurde).
+       Ohne das bliebe der Nutzer in einem Zustand gefangen, in dem
+       "läuft schon" gemeldet wird, aber nichts zu sehen ist. */
+    if (_liveLocationLastLiveId && !document.getElementById('liveLocationWidget')) {
+      const data = state.liveLocationData?.get(_liveLocationLastLiveId);
+      if (data) {
+        showLiveLocationWidget(_liveLocationLastLiveId, { ...data, isSender: true });
+        toast('📍 Live-Standort-Fenster wiederhergestellt');
+        return;
+      }
+    }
+    toast('⚠️ Live-Standort läuft bereits — zum Beenden auf ✕ im Kartenfenster tippen');
+    return;
+  }
 
   const liveId = 'live_' + Date.now();
+  _liveLocationLastLiveId = liveId;
   const conv = state.activeConv;
   const endAt = Date.now() + minutes * 60000;
   _liveLocationConv = conv;
@@ -3941,12 +3969,24 @@ function startLiveLocation(minutes) {
     }
   };
 
-  navigator.geolocation.getCurrentPosition(sendUpdate, (err) => {
-    toast('⚠️ Standortzugriff verweigert oder nicht verfügbar: ' + (err.message || 'unbekannter Fehler'));
-  }, { enableHighAccuracy: true });
-  _liveLocationWatchId = navigator.geolocation.watchPosition(sendUpdate, (err) => {
-    console.warn('watchPosition-Fehler:', err.message);
-  }, { enableHighAccuracy: true });
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      /* watchPosition erst NACH der ersten erfolgreichen Positions-
+         ermittlung starten — sonst könnte _liveLocationWatchId gesetzt
+         sein, obwohl nie ein Widget erschien (z. B. weil die erste
+         Anfrage an einer Berechtigung scheiterte), was den Nutzer in
+         einem "läuft angeblich schon"-Zustand ohne sichtbares Fenster
+         gefangen hielte. */
+      sendUpdate(pos);
+      _liveLocationWatchId = navigator.geolocation.watchPosition(sendUpdate, (err) => {
+        console.warn('watchPosition-Fehler:', err.message);
+      }, { enableHighAccuracy: true });
+    },
+    (err) => {
+      toast('⚠️ Standortzugriff verweigert oder nicht verfügbar: ' + (err.message || 'unbekannter Fehler'));
+    },
+    { enableHighAccuracy: true }
+  );
 
   toast(`🔴 Live-Standort aktiv für ${minutes >= 60 ? (minutes / 60) + ' Std.' : minutes + ' Min.'}`);
   _liveLocationTimer = setTimeout(() => stopLiveLocation(true), minutes * 60000);
@@ -4043,7 +4083,7 @@ function showLiveLocationWidget(liveId, data) {
      die Karte) braucht die Koordinaten, um eine größere Kartenkachel
      nachzuladen, statt nur das kleine Thumbnail hochzuskalieren. */
   if (!state.liveLocationData) state.liveLocationData = new Map();
-  state.liveLocationData.set(liveId, { lat, lng, mapsUrl, fromName });
+  state.liveLocationData.set(liveId, { lat, lng, mapsUrl, fromName, expiresAt });
 }
 function closeLiveLocationWidget() {
   document.getElementById('liveLocationWidget')?.remove();
