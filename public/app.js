@@ -4162,12 +4162,37 @@ function pickMedia(accept, kind, useCamera) {
   input.type = 'file'; input.accept = accept;
   /* capture="environment" weist mobile Browser an, direkt die Kamera-
      App zu öffnen statt der Dateiauswahl — Foto/Video wird sofort nach
-     Aufnahme als Anhang zurückgegeben und automatisch weiterverarbeitet. */
+     Aufnahme als Anhang zurückgegeben und automatisch weiterverarbeitet.
+     Mehrfachauswahl ergibt dort keinen Sinn (eine Aufnahme pro Klick),
+     nur bei Galerie/Datei-Auswahl. */
   if (useCamera) input.capture = 'environment';
+  else input.multiple = true;
   input.onchange = async () => {
-    const file = input.files?.[0];
-    if (!file) return;
-    await sendMediaMessage(file, kind);
+    const files = [...(input.files || [])];
+    if (!files.length) return;
+    if (files.length === 1) {
+      await sendMediaMessage(files[0], kind);
+      return;
+    }
+    /* Mehrere Dateien: nacheinander senden, nicht parallel — sonst
+       würden mehrere gleichzeitige Uploads um dieselbe Bandbreite
+       konkurrieren und die Reihenfolge im Chatverlauf durcheinander
+       geraten (die Ratchet-Session verarbeitet ohnehin nur eine
+       Nachricht nach der anderen). Ein Fortschritts-Toast hält den
+       Nutzer bei größeren Serien auf dem Laufenden. */
+    toast(`📎 Sende ${files.length} Dateien…`, 4000);
+    let failed = 0;
+    for (let i = 0; i < files.length; i++) {
+      try {
+        await sendMediaMessage(files[i], kind, true);
+      } catch (e) {
+        failed++;
+        console.warn('Datei', i + 1, 'fehlgeschlagen:', e.message);
+      }
+    }
+    toast(failed
+      ? `⚠️ ${files.length - failed} von ${files.length} Dateien gesendet, ${failed} fehlgeschlagen`
+      : `✅ ${files.length} Dateien gesendet`);
   };
   input.click();
 }
@@ -4242,9 +4267,9 @@ async function makeThumbnail(file, kind) {
   }
 }
 
-async function sendMediaMessage(file, kind) {
+async function sendMediaMessage(file, kind, silent = false) {
   if (!state.activeConv) return;
-  toast('📎 Wird hochgeladen…', 4000);
+  if (!silent) toast('📎 Wird hochgeladen…', 4000);
   try {
     let toUpload = file;
     if (kind === 'image' && window.MediaStorage?.shrinkImage) {
@@ -4284,6 +4309,7 @@ async function sendMediaMessage(file, kind) {
     }
     renderChatMessages();
   } catch (e) {
+    if (silent) throw e;   // Aufrufer (Mehrfachversand-Schleife) protokolliert selbst
     toast('⚠️ Upload fehlgeschlagen: ' + e.message);
   }
 }
