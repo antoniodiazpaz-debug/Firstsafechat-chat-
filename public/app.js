@@ -1832,14 +1832,30 @@ async function sendMessage(peerId, convId, plaintext) {
 
   const result = await api.send({ recipientId: peerId, convId, kind: 'text', perDevice });
 
+  /* Strukturierte "unsichtbare" Nachrichtenarten (Umfrage-Stimmen,
+     Live-Standort-Updates) dürfen beim SENDER genauso wenig als
+     Chatzeile auftauchen wie beim Empfänger (siehe handleEnvelope,
+     das dieselbe Prüfung für eingehende Nachrichten macht) — sonst
+     sieht der Sender seine eigenen internen Protokoll-Nachrichten als
+     rohen JSON-Text im Chatverlauf UND in der Chat-Vorschau. */
+  let isSilent = false;
+  try {
+    const parsed = JSON.parse(plaintext);
+    if (parsed?.__pollVote || parsed?.__liveLocationUpdate) isSilent = true;
+  } catch {}
+
   const conv = state.convs.get(convId) || { convId, peerId };
-  conv.lastMsg = { text: plaintext, ts: result.sentAt };
-  conv.unread = 0;
+  if (!isSilent) {
+    conv.lastMsg = { text: plaintext, ts: result.sentAt };
+    conv.unread = 0;
+  }
   state.convs.set(convId, conv);
 
-  if (!state.messages.has(convId)) state.messages.set(convId, []);
-  state.messages.get(convId).push({ id: 'local-' + result.sentAt, text: plaintext, ts: result.sentAt, mine: true });
-  LocalCache.scheduleSave();
+  if (!isSilent) {
+    if (!state.messages.has(convId)) state.messages.set(convId, []);
+    state.messages.get(convId).push({ id: 'local-' + result.sentAt, text: plaintext, ts: result.sentAt, mine: true });
+    LocalCache.scheduleSave();
+  }
   return result;
 }
 
