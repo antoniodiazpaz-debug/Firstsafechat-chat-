@@ -430,6 +430,7 @@ async function boot() {
   loadChatPrefs();
   loadAccentTheme();
   loadPinnedAndFavorites();
+  loadDeletedConvIds();
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
@@ -1130,6 +1131,16 @@ async function openGroupMessage(env) {
 
 async function handleEnvelope(env, live) {
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
+
+  /* Eine tatsächlich eintreffende Nachricht ist ein bewusster
+     Neuanfang für diesen Chat — hebt eine frühere lokale Löschung auf
+     (siehe deleteSelectedChats), sonst würde die Konversation trotz
+     neuer Nachricht unsichtbar bleiben. */
+  if (state.deletedConvIds?.has(convId)) {
+    state.deletedConvIds.delete(convId);
+    try { localStorage.setItem('sc:deletedConvIds', JSON.stringify([...state.deletedConvIds])); } catch {}
+  }
+
   let plaintext = '[verschlüsselt]';
   try {
     if (env.groupId || env.kind === 'group') {
@@ -1535,13 +1546,27 @@ function deleteSelectedChats() {
   const count = state.selectedConvs.size;
   if (!count) return;
   if (!confirm(`${count} Chat${count > 1 ? 's' : ''} wirklich löschen? Nur lokal — der Gesprächspartner behält seine Kopie.`)) return;
+  if (!state.deletedConvIds) state.deletedConvIds = new Set();
   for (const convId of state.selectedConvs) {
     state.convs.delete(convId);
     state.messages.delete(convId);
+    /* Merken, dass dieser Chat aktiv gelöscht wurde — sonst würde
+       refreshInbox()/refreshGroups() ihn beim nächsten Laden wieder
+       aus Server-Daten rekonstruieren (Gruppen bleiben ja bestehen,
+       solange man Mitglied ist; 1:1-Chats tauchen wieder auf, sobald
+       eine neue Nachricht eintrifft). Erst eine neue eingehende
+       Nachricht (siehe handleEnvelope) hebt diese Markierung wieder
+       auf, weil das dann ein bewusster Neuanfang ist. */
+    state.deletedConvIds.add(convId);
   }
+  try { localStorage.setItem('sc:deletedConvIds', JSON.stringify([...state.deletedConvIds])); } catch {}
   LocalCache.scheduleSave();
   exitSelectMode();
   toast(`${count} Chat${count > 1 ? 's' : ''} gelöscht`);
+}
+function loadDeletedConvIds() {
+  try { state.deletedConvIds = new Set(JSON.parse(localStorage.getItem('sc:deletedConvIds') || '[]')); }
+  catch { state.deletedConvIds = new Set(); }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -1663,11 +1688,12 @@ const appActions = {
       const m = list.find(x => x.id === msgId);
       if (m) {
         const media = m.media || parseIncomingMedia(m.text);
-        if (media) downloadAndShowMedia(msgId, media.ref, media.kind);
+        if (media) downloadAndShowMedia(msgId, media.ref, media.kind, media.kind === 'image');
         break;
       }
     }
-  }
+  },
+  openMediaFullscreen(msgId) { openMediaFullscreen(msgId); },
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -2143,7 +2169,7 @@ function renderChatMessages() {
         /* Original bereits heruntergeladen und entschlüsselt (siehe
            downloadAndShowMedia) — das zeigt die volle Datei. */
         content = media.kind === 'image'
-          ? `<div class="media"><img src="${m.mediaUrl}"></div>`
+          ? `<div class="media" style="cursor:pointer" onclick="window.__app.openMediaFullscreen('${m.id}')"><img src="${m.mediaUrl}"></div>`
           : media.kind === 'video'
             ? `<div class="media"><video src="${m.mediaUrl}" controls></video></div>`
             : media.kind === 'audio'
@@ -2153,19 +2179,18 @@ function renderChatMessages() {
         /* Thumbnail ist Teil der bereits entschlüsselten Nachricht
            selbst (siehe makeThumbnail/sendMediaMessage) — Sender UND
            Empfänger sehen es SOFORT, ohne dass irgendjemand die
-           Originaldatei vom Server laden muss. Nur der EMPFÄNGER kann
-           antippen, um das (deutlich größere) Original nachzuladen —
-           der Sender hat die Datei bereits lokal, ein erneuter
-           Download vom eigenen Upload wäre unnötig. */
-        content = m.mine
-          ? `<div class="media media-thumb"><img src="${thumb}">
-              ${media.kind === 'video' ? '<div class="media-play-badge">▶</div>' : ''}
-            </div>`
-          : `<div class="media media-thumb" style="cursor:pointer" onclick="window.__app.loadMedia('${m.id}')">
-              <img src="${thumb}">
-              ${media.kind === 'video' ? '<div class="media-play-badge">▶</div>' : ''}
-              <div class="media-load-badge">⬇️ Original laden</div>
-            </div>`;
+           Originaldatei vom Server laden muss. Sender hat mediaUrl
+           bereits (siehe sendMediaMessage) und öffnet direkt Vollbild;
+           Empfänger muss erst laden (loadMedia kümmert sich danach
+           selbst ums Öffnen). */
+        const clickHandler = m.mine && m.mediaUrl
+          ? `window.__app.openMediaFullscreen('${m.id}')`
+          : `window.__app.loadMedia('${m.id}')`;
+        content = `<div class="media media-thumb" style="cursor:pointer" onclick="${clickHandler}">
+            <img src="${thumb}">
+            ${media.kind === 'video' ? '<div class="media-play-badge">▶</div>' : ''}
+            ${!m.mine ? '<div class="media-load-badge">⬇️ Original laden</div>' : ''}
+          </div>`;
       } else {
         const icon = media.kind === 'image' ? '🖼️' : media.kind === 'video' ? '🎬' : media.kind === 'audio' ? '🎤' : '📄';
         const label = media.kind === 'image' ? 'Foto' : media.kind === 'video' ? 'Video' : media.kind === 'audio' ? 'Sprachnachricht' : (media.name || 'Datei');
@@ -2313,6 +2338,7 @@ async function refreshGroups() {
 
   for (const g of groups) {
     const convId = 'grp_' + g.id;
+    if (state.deletedConvIds?.has(convId)) continue;   // Nutzer hat diese Gruppe lokal gelöscht
     let conv = state.convs.get(convId);
     if (!conv) {
       conv = { convId, groupId: g.id, isGroup: true, name: g.name, memberIds: g.members.map(m => m.userId), unread: 0 };
@@ -3885,7 +3911,11 @@ function startLiveLocation(minutes) {
         }));
         if (state.activeConv?.convId === conv.convId) renderChatMessages();
       }
-    } catch {}
+    } catch (e) {
+      console.warn('Live-Standort-Update fehlgeschlagen:', e.message);
+      toast('⚠️ Standort konnte nicht gesendet werden: ' + e.message);
+      return;   // Widget nicht mit fehlerhaften Daten anzeigen
+    }
     /* Eigenes Fenster ebenfalls aktualisieren — der Sender sieht seine
        eigene Live-Position genauso im schwebenden Fenster wie der
        Empfänger, statt gar keine Rückmeldung zu haben. Nur im
@@ -3895,8 +3925,12 @@ function startLiveLocation(minutes) {
     }
   };
 
-  navigator.geolocation.getCurrentPosition(sendUpdate, () => toast('⚠️ Standortzugriff verweigert'), { enableHighAccuracy: true });
-  _liveLocationWatchId = navigator.geolocation.watchPosition(sendUpdate, () => {}, { enableHighAccuracy: true });
+  navigator.geolocation.getCurrentPosition(sendUpdate, (err) => {
+    toast('⚠️ Standortzugriff verweigert oder nicht verfügbar: ' + (err.message || 'unbekannter Fehler'));
+  }, { enableHighAccuracy: true });
+  _liveLocationWatchId = navigator.geolocation.watchPosition(sendUpdate, (err) => {
+    console.warn('watchPosition-Fehler:', err.message);
+  }, { enableHighAccuracy: true });
 
   toast(`🔴 Live-Standort aktiv für ${minutes >= 60 ? (minutes / 60) + ' Std.' : minutes + ' Min.'}`);
   _liveLocationTimer = setTimeout(() => stopLiveLocation(true), minutes * 60000);
@@ -3969,16 +4003,15 @@ function showLiveLocationWidget(liveId, data) {
       if (isSender) stopLiveLocation();
       else closeLiveLocationWidget();
     };
-    /* Antippen der Karte (nicht des Schließen-Buttons) vergrößert das
-       Fenster — erneutes Antippen verkleinert wieder. Ein einfacher
-       Klick statt Drag wird über die minimale Bewegung erkannt, damit
-       Verschieben nicht versehentlich als Klick gewertet wird. */
+    /* Antippen der Karte öffnet die Kartenansicht im Vollbild —
+       Verschieben (Drag) darf dabei nicht versehentlich als Klick
+       gewertet werden, deshalb die minimale Bewegungsprüfung. */
     let dragMoved = false;
     widget.addEventListener('pointerdown', () => { dragMoved = false; });
     widget.addEventListener('pointermove', () => { dragMoved = true; });
     widget.querySelector('.live-location-map').addEventListener('click', (e) => {
       if (dragMoved) return;
-      widget.classList.toggle('live-location-widget-large');
+      openLiveLocationFullscreen(widget.dataset.liveId);
     });
     /* makeDraggable ist in call-ui.js definiert (Pointer-Events-basiert,
        hält das Fenster im sichtbaren Bereich) — hier wiederverwendet,
@@ -3989,9 +4022,45 @@ function showLiveLocationWidget(liveId, data) {
   widget.querySelector('.live-location-map').style.backgroundImage = `url('${tileUrl}')`;
   widget.querySelector('.live-location-label').innerHTML =
     `📍 ${esc(fromName)} · <a href="${esc(mapsUrl)}" target="_blank" rel="noopener" style="color:inherit">öffnen</a>`;
+
+  /* Letzte bekannte Position merken — der Vollbild-Viewer (Klick auf
+     die Karte) braucht die Koordinaten, um eine größere Kartenkachel
+     nachzuladen, statt nur das kleine Thumbnail hochzuskalieren. */
+  if (!state.liveLocationData) state.liveLocationData = new Map();
+  state.liveLocationData.set(liveId, { lat, lng, mapsUrl, fromName });
 }
 function closeLiveLocationWidget() {
   document.getElementById('liveLocationWidget')?.remove();
+}
+
+/* Vollbild-Kartenansicht — lädt eine größere Kartenkachel (Zoom 16)
+   statt nur das kleine 120px-Widget hochzuskalieren, was unscharf
+   aussehen würde. */
+function openLiveLocationFullscreen(liveId) {
+  const data = state.liveLocationData?.get(liveId);
+  if (!data) return;
+  const { lat, lng, mapsUrl, fromName } = data;
+  const zoom = 16;
+  const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom));
+  const tileY = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
+  const tileUrl = `https://tile.openstreetmap.org/${zoom}/${tileX}/${tileY}.png`;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'media-fullscreen-overlay';
+  overlay.innerHTML = `
+    <button class="media-fullscreen-close" aria-label="Schließen">✕</button>
+    <div style="width:100%;height:100%;background-image:url('${tileUrl}');background-size:cover;
+      background-position:center;position:relative">
+      <div class="live-location-orb" style="width:26px;height:26px"></div>
+      <div class="live-location-orb-pulse" style="width:26px;height:26px"></div>
+    </div>
+    <div style="position:absolute;bottom:30px;left:50%;transform:translateX(-50%);
+      background:rgba(0,0,0,.6);color:#fff;padding:10px 20px;border-radius:20px;
+      font-size:14px;white-space:nowrap">
+      📍 ${esc(fromName)} · <a href="${esc(mapsUrl)}" target="_blank" rel="noopener" style="color:#5b9bf5">In Google Maps öffnen</a>
+    </div>`;
+  overlay.onclick = (e) => { if (e.target === overlay || e.target.closest('.media-fullscreen-close')) overlay.remove(); };
+  document.body.appendChild(overlay);
 }
 
 
@@ -4186,7 +4255,7 @@ function parseStructured(text, key) {
   return null;
 }
 
-async function downloadAndShowMedia(msgId, ref, kind) {
+async function downloadAndShowMedia(msgId, ref, kind, openFullscreen) {
   toast('⬇️ Wird geladen…', 3000);
   try {
     const { downloadUrl } = await api._fetch('/api/media/download-url?path=' + encodeURIComponent(ref.path));
@@ -4200,9 +4269,30 @@ async function downloadAndShowMedia(msgId, ref, kind) {
       if (m) { m.mediaUrl = url; break; }
     }
     renderChatMessages();
+    if (openFullscreen) openMediaFullscreen(msgId);
   } catch (e) {
     toast('⚠️ Laden fehlgeschlagen: ' + e.message);
   }
+}
+
+/* ── Vollbild-Viewer für Bilder ──
+   Einfaches Overlay über die gesamte App, schließt per Antippen oder
+   Zurück-Button. Für Videos/Audio bleibt der Inline-Player im Chat
+   sinnvoller (eigene Steuerelemente, Vollbild würde nichts gewinnen). */
+function openMediaFullscreen(msgId) {
+  let mediaUrl = null;
+  for (const list of state.messages.values()) {
+    const m = list.find(x => x.id === msgId);
+    if (m?.mediaUrl) { mediaUrl = m.mediaUrl; break; }
+  }
+  if (!mediaUrl) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'media-fullscreen-overlay';
+  overlay.innerHTML = `
+    <button class="media-fullscreen-close" aria-label="Schließen">✕</button>
+    <img src="${mediaUrl}">`;
+  overlay.onclick = (e) => { if (e.target === overlay || e.target.closest('.media-fullscreen-close')) overlay.remove(); };
+  document.body.appendChild(overlay);
 }
 
 /* Für Tests: interne Funktionen und Zustand exportieren. Der Aufruf von
