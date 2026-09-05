@@ -392,6 +392,16 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 `);
 
+/* ── Migration für bestehende Datenbanken ──
+   CREATE TABLE IF NOT EXISTS legt neue Spalten nur an, wenn die Tabelle
+   komplett neu erstellt wird — bei einem bereits laufenden Deployment
+   mit existierender users-Tabelle bleibt show_last_seen sonst für immer
+   unbekannt, und jedes UPDATE darauf schlägt mit einem SQL-Fehler fehl
+   (das ließ "Zuletzt online zeigen" in den Einstellungen fehlschlagen).
+   ADD COLUMN IF NOT EXISTS ist in Postgres seit Version 9.6 verfügbar
+   und damit sicher für Neon. */
+await db.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS show_last_seen INTEGER DEFAULT 1;`).catch(() => {});
+
 const q = {
   userByName:   db.prepare('SELECT * FROM users WHERE lower(name)=lower(?)'),
   userById:     db.prepare('SELECT * FROM users WHERE id=?'),
