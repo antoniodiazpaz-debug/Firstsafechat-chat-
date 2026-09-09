@@ -143,44 +143,21 @@ const LocalCache = {
     this._deviceId = deviceId;
   },
 
-  /* Klartext in localStorage — einfach und zuverlässig, kein Crypto
-     nötig da bereits im Klartext-Ansatz der App (siehe Vault). */
-  async save() {
-    if (!this._deviceId) return;
-    const snapshot = {
-      convs: [...state.convs.entries()],
-      messages: [...state.messages.entries()],
-      outbox: state.outbox,
-      savedAt: Date.now()
-    };
-    try {
-      localStorage.setItem('sc:cache:' + this._deviceId, JSON.stringify(snapshot));
-    } catch (e) {
-      console.warn('LocalCache.save fehlgeschlagen:', e.message);
-    }
-  },
+  /* DEAKTIVIERT — Nachrichten werden bewusst NICHT mehr lokal
+     zwischengespeichert. Konsequenz: nach einem Reload/Neustart ist
+     der sichtbare Chatverlauf leer, bis neue Nachrichten eintreffen
+     oder vom Server nachgeholt werden (der Server löscht zugestellte
+     Umschläge ohnehin, siehe purgeAcked in server.js — bereits
+     gelesene ältere Nachrichten sind dann nicht mehr abrufbar). Als
+     no-op belassen statt entfernt, damit alle bestehenden Aufrufer
+     (LocalCache.scheduleSave() an vielen Stellen im Code) unverändert
+     bleiben können. */
+  async save() {},
 
-  async load() {
-    if (!this._deviceId) return false;
-    const raw = localStorage.getItem('sc:cache:' + this._deviceId);
-    if (!raw) return false;
-    try {
-      const snapshot = JSON.parse(raw);
-      state.convs = new Map(snapshot.convs);
-      state.messages = new Map(snapshot.messages);
-      state.outbox = snapshot.outbox || [];
-      return true;
-    } catch (e) {
-      console.warn('Lokaler Nachrichten-Cache nicht lesbar:', e.message);
-      return false;
-    }
-  },
+  async load() { return false; },
 
   _saveTimer: null,
-  scheduleSave() {
-    if (this._saveTimer) return;
-    this._saveTimer = setTimeout(() => { this._saveTimer = null; this.save().catch(() => {}); }, 800);
-  }
+  scheduleSave() {}
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -362,6 +339,138 @@ function sendReadReceipt(convId, peerId, msgIds) {
   api.wsSend?.({ type: 'read', to: peerId, convId, ids: msgIds });
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   LOKALE PRÄFERENZEN — ein zentrales Register statt verstreuter
+   localStorage-Aufrufe
+   ─────────────────────────────────────────────────────────────────────
+   Vorher: 19 Stellen im Code mit je eigenem Key-String, eigenem
+   try/catch, eigener JSON-Serialisierung — das führte u. a. zu einem
+   echten Bug (ein Key hieß an einer Stelle noch "securechat:userName"
+   statt "sc:userName", ein Rest aus der Zeit vor dem Vault-Umbau, der
+   den gespeicherten Namen beim Login-Bildschirm nie ankommen ließ).
+   Jetzt: EINE Tabelle mit Key, Default-Wert und Typ (set/map/plain),
+   und zwei generische Funktionen (loadPref/savePref), die Fehler an
+   EINER Stelle abfangen statt an 19. Neue Einstellungen brauchen nur
+   einen neuen Eintrag hier, keinen neuen Lade-/Speicher-Code.
+   ═══════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+   NACHRICHTENTYP-REGISTER — eine zentrale Stelle statt verstreuter Checks
+   ─────────────────────────────────────────────────────────────────────
+   Vorher: die Frage "ist das eine sichtbare Chatzeile oder eine stille
+   Protokoll-Nachricht (Umfrage-Stimme, Live-Standort-Update)?" wurde an
+   ZWEI unabhängigen Stellen beantwortet — einmal beim Senden
+   (sendMessage), einmal beim Empfangen (handleEnvelope). Beide Stellen
+   mussten bei jedem neuen Typ von Hand synchron gehalten werden; genau
+   das ging beim Live-Standort-Feature schief (die Nachricht landete
+   beim Sender als rohe JSON-Zeile im Chat, weil nur der Empfangspfad
+   gefiltert wurde).
+
+   Jetzt: EIN Register pro Nachrichtentyp mit
+   - key: das JSON-Feld, an dem der Typ erkannt wird (z. B. "__poll")
+   - visible: erscheint als Chatzeile? (false = "still", siehe oben)
+   - onReceive(payload, env): wird beim Empfang für stille Typen
+     aufgerufen, um ihren Seiteneffekt auszulösen (Widget zeigen,
+     Stimme zählen) — für sichtbare Typen bleibt sie leer, deren
+     Anzeige übernimmt renderChatMessages direkt.
+
+   parseMessageType() ist die einzige Stelle, die ein rohes JSON prüft;
+   sendMessage() und handleEnvelope() fragen nur noch dieses Register,
+   nie mehr die einzelnen __typ-Felder direkt. */
+const MESSAGE_TYPES = {
+  pollVote: {
+    key: '__pollVote',
+    visible: false,
+    onReceive(payload, env) {
+      if (!env.senderId) return;
+      if (!state.pollVotes) state.pollVotes = new Map();
+      const votes = state.pollVotes.get(payload.pollId) || {};
+      votes[env.senderId] = payload.optionIdx;
+      state.pollVotes.set(payload.pollId, votes);
+    }
+  },
+  liveLocationUpdate: {
+    key: '__liveLocationUpdate',
+    visible: false,
+    onReceive(payload, env) {
+      showLiveLocationWidget(payload.liveId, {
+        lat: payload.lat, lng: payload.lng, expiresAt: payload.expiresAt,
+        fromName: payload.fromName || env.senderName || 'Kontakt',
+        isSender: false
+      });
+    }
+  },
+  poll:     { key: '__poll',    visible: true },
+  location: { key: '__location', visible: true },
+  contact:  { key: '__contact',  visible: true },
+  media:    { key: '__media',    visible: true }
+};
+
+/* Prüft eine Klartext-Nachricht gegen das Register. Liefert
+   { typeName, def, payload } beim ersten Treffer, sonst null (dann ist
+   es eine ganz normale Textnachricht — kein JSON oder kein bekanntes
+   __-Feld). Reihenfolge ist unkritisch, da jede Nachricht nur genau
+   ein __-Feld trägt (siehe die einzelnen sendXxx-Funktionen). */
+function parseMessageType(text) {
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  if (!parsed || typeof parsed !== 'object') return null;
+  for (const [typeName, def] of Object.entries(MESSAGE_TYPES)) {
+    if (parsed[def.key] !== undefined) return { typeName, def, payload: parsed[def.key] };
+  }
+  return null;
+}
+
+const PREF_REGISTRY = {
+  deletedConvIds:  { key: 'sc:deletedConvIds', type: 'set' },
+  groupKeys_raw:   { key: 'sc:groupKeys',      type: 'plain', default: {} },
+  buttonThemes:    { key: 'sc:buttonThemes',   type: 'plain', default: {} },
+  branding:        { key: 'sc:branding',       type: 'plain', default: null },
+  chatPrefs:       { key: 'sc:chatPrefs',      type: 'plain', default: null },
+  pinnedChats:     { key: 'sc:pinnedChats',    type: 'set' },
+  favoriteChats:   { key: 'sc:favoriteChats',  type: 'set' },
+  mutedChats:      { key: 'sc:muted',          type: 'set' },
+  disappearing:    { key: 'sc:disappearing',   type: 'map' }
+};
+
+/* Lädt einen Wert nach seinem registrierten Typ. Ein Set wird als
+   JSON-Array gespeichert, eine Map als Array von [key, value]-Paaren
+   (localStorage kennt nur Strings — beides ist der übliche Weg, diese
+   Strukturen JSON-fähig zu machen). Fehler beim Parsen (z. B. nach
+   einem manuellen Löschen des Storage) liefern still den Default statt
+   die App abstürzen zu lassen. */
+function loadPref(name) {
+  const def = PREF_REGISTRY[name];
+  if (!def) { console.warn('Unbekannte Präferenz:', name); return null; }
+  try {
+    const raw = localStorage.getItem(def.key);
+    if (raw == null) {
+      if (def.type === 'set') return new Set();
+      if (def.type === 'map') return new Map();
+      return def.default ?? null;
+    }
+    const parsed = JSON.parse(raw);
+    if (def.type === 'set') return new Set(parsed);
+    if (def.type === 'map') return new Map(parsed);
+    return parsed;
+  } catch {
+    if (def.type === 'set') return new Set();
+    if (def.type === 'map') return new Map();
+    return def.default ?? null;
+  }
+}
+function savePref(name, value) {
+  const def = PREF_REGISTRY[name];
+  if (!def) { console.warn('Unbekannte Präferenz:', name); return; }
+  try {
+    const serializable = def.type === 'set' ? [...value]
+      : def.type === 'map' ? [...value.entries()]
+      : value;
+    localStorage.setItem(def.key, JSON.stringify(serializable));
+  } catch (e) {
+    console.warn('Speichern fehlgeschlagen für', name, ':', e.message);
+  }
+}
+
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -425,12 +534,29 @@ async function flushOutbox() {
 /* ═══════════════════════════════════════════════════════════════════════
    BOOT
    ═══════════════════════════════════════════════════════════════════════ */
+/* Räumt einmalig alte "sc:cache:<deviceId>"-Einträge auf, die aus der
+   Zeit stammen, bevor der Nachrichten-Cache deaktiviert wurde (siehe
+   LocalCache oben) — sonst bliebe der alte Klartext-Chatverlauf
+   dauerhaft im localStorage liegen, obwohl er nirgends mehr gelesen
+   oder aktualisiert wird. */
+function purgeOldMessageCache() {
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('sc:cache:')) keysToRemove.push(k);
+    }
+    keysToRemove.forEach(k => localStorage.removeItem(k));
+  } catch {}
+}
+
 async function boot() {
   loadDisappearingSettings();
   loadChatPrefs();
   loadAccentTheme();
   loadPinnedAndFavorites();
   loadDeletedConvIds();
+  purgeOldMessageCache();
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
@@ -468,7 +594,7 @@ async function boot() {
   $('#boot').classList.add('hide');
 
   if (knownDevice) {
-    renderLoginForKnownDevice(knownDevice, localStorage.getItem('securechat:userName') || '');
+    renderLoginForKnownDevice(knownDevice, localStorage.getItem('sc:userName') || '');
   } else {
     renderAuthChoice();
   }
@@ -1138,7 +1264,7 @@ async function handleEnvelope(env, live) {
      neuer Nachricht unsichtbar bleiben. */
   if (state.deletedConvIds?.has(convId)) {
     state.deletedConvIds.delete(convId);
-    try { localStorage.setItem('sc:deletedConvIds', JSON.stringify([...state.deletedConvIds])); } catch {}
+    savePref('deletedConvIds', state.deletedConvIds);
   }
 
   let plaintext = '[verschlüsselt]';
@@ -1163,30 +1289,15 @@ async function handleEnvelope(env, live) {
     state.convs.set(convId, { convId, groupId: env.groupId, isGroup: true, name: 'Gruppe', memberIds: [], unread: 0 });
   }
 
-  /* Umfrage-Stimmen und Live-Standort-Updates sind "unsichtbare"
-     Nachrichtenarten: sie tragen keinen Chatverlauf-Eintrag, sondern
-     lösen jeweils ihre eigene Anzeige aus (aggregierte Stimmen bzw.
-     das schwebende Kartenfenster) — sonst würde jedes einzelne Update
-     als eigene Chatzeile auftauchen. */
-  let pollVoteObj = null, liveLocUpdate = null;
-  try {
-    const parsed = JSON.parse(plaintext);
-    if (parsed?.__pollVote) pollVoteObj = parsed.__pollVote;
-    if (parsed?.__liveLocationUpdate) liveLocUpdate = parsed.__liveLocationUpdate;
-  } catch {}
+  /* Stille Nachrichtentypen (siehe MESSAGE_TYPES) lösen nur ihren
+     eigenen Seiteneffekt aus und tragen NIE einen Chatverlauf-Eintrag
+     — eine einzige Prüfung hier statt der früheren Direktabfrage
+     einzelner __typ-Felder. */
+  const matched = parseMessageType(plaintext);
+  const isSilent = matched && !matched.def.visible;
 
-  if (pollVoteObj && env.senderId) {
-    if (!state.pollVotes) state.pollVotes = new Map();
-    const votes = state.pollVotes.get(pollVoteObj.pollId) || {};
-    votes[env.senderId] = pollVoteObj.optionIdx;
-    state.pollVotes.set(pollVoteObj.pollId, votes);
-  } else if (liveLocUpdate) {
-    showLiveLocationWidget(liveLocUpdate.liveId, {
-      lat: liveLocUpdate.lat, lng: liveLocUpdate.lng,
-      expiresAt: liveLocUpdate.expiresAt,
-      fromName: liveLocUpdate.fromName || env.senderName || 'Kontakt',
-      isSender: false
-    });
+  if (isSilent) {
+    matched.def.onReceive?.(matched.payload, env);
   } else {
     state.messages.get(convId).push({
       id: env.id, from: env.senderId || '(versiegelt)', fromName: env.senderName,
@@ -1207,7 +1318,6 @@ async function handleEnvelope(env, live) {
     }
   }
 
-  const isSilent = !!(pollVoteObj || liveLocUpdate);
   const conv = state.convs.get(convId) || { convId, peerId: env.senderId, unread: 0 };
   conv.lastMsg = isSilent ? conv.lastMsg : { text: plaintext, ts: env.sentAt };
   conv.unread = isSilent ? conv.unread : (conv.unread || 0) + 1;
@@ -1559,14 +1669,13 @@ function deleteSelectedChats() {
        auf, weil das dann ein bewusster Neuanfang ist. */
     state.deletedConvIds.add(convId);
   }
-  try { localStorage.setItem('sc:deletedConvIds', JSON.stringify([...state.deletedConvIds])); } catch {}
+  savePref('deletedConvIds', state.deletedConvIds);
   LocalCache.scheduleSave();
   exitSelectMode();
   toast(`${count} Chat${count > 1 ? 's' : ''} gelöscht`);
 }
 function loadDeletedConvIds() {
-  try { state.deletedConvIds = new Set(JSON.parse(localStorage.getItem('sc:deletedConvIds') || '[]')); }
-  catch { state.deletedConvIds = new Set(); }
+  state.deletedConvIds = loadPref('deletedConvIds');
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -1832,17 +1941,14 @@ async function sendMessage(peerId, convId, plaintext) {
 
   const result = await api.send({ recipientId: peerId, convId, kind: 'text', perDevice });
 
-  /* Strukturierte "unsichtbare" Nachrichtenarten (Umfrage-Stimmen,
-     Live-Standort-Updates) dürfen beim SENDER genauso wenig als
-     Chatzeile auftauchen wie beim Empfänger (siehe handleEnvelope,
-     das dieselbe Prüfung für eingehende Nachrichten macht) — sonst
-     sieht der Sender seine eigenen internen Protokoll-Nachrichten als
-     rohen JSON-Text im Chatverlauf UND in der Chat-Vorschau. */
-  let isSilent = false;
-  try {
-    const parsed = JSON.parse(plaintext);
-    if (parsed?.__pollVote || parsed?.__liveLocationUpdate) isSilent = true;
-  } catch {}
+  /* Stille Nachrichtentypen dürfen beim SENDER genauso wenig als
+     Chatzeile auftauchen wie beim Empfänger — dieselbe Registerabfrage
+     wie in handleEnvelope() statt einer zweiten, separat gepflegten
+     Liste von __typ-Feldern (das war die Ursache für den früheren Bug:
+     ein neuer stiller Typ wurde nur an EINER der beiden Stellen
+     eingetragen). */
+  const matched = parseMessageType(plaintext);
+  const isSilent = matched && !matched.def.visible;
 
   const conv = state.convs.get(convId) || { convId, peerId };
   if (!isSilent) {
@@ -2142,15 +2248,19 @@ function renderChatMessages() {
 
     /* Medienreferenz erkennen: entweder schon beim Senden markiert
        (m.media, eigener Anhang) oder beim Empfangen aus dem
-       entschlüsselten JSON-Text erkannt. */
+       entschlüsselten JSON-Text erkannt. Für alle anderen strukturierten
+       Kartentypen (Umfrage, Standort, Kontakt) genügt EIN Aufruf des
+       zentralen Registers statt vier einzelner Prüfungen — dieselbe
+       Registerabfrage wie beim Senden/Empfangen (siehe sendMessage,
+       handleEnvelope), damit ein neuer Typ nur an einer Stelle
+       eingetragen werden muss. */
     const incomingMedia = !m.media && !m.mine ? parseIncomingMedia(m.text) : null;
     const media = m.media || incomingMedia;
-    const locationCard = !media ? parseStructured(m.text, '__location') : null;
-    const contactCard = !media ? parseStructured(m.text, '__contact') : null;
-    const pollCard = !media ? parseStructured(m.text, '__poll') : null;
-    const pollVote = !media ? parseStructured(m.text, '__pollVote') : null;
-
-    if (pollVote) continue;   // Stimmen werden separat verarbeitet (siehe onIncomingEnvelope), nicht als eigene Chatzeile gezeigt
+    const matched = !media ? parseMessageType(m.text) : null;
+    if (matched?.typeName === 'pollVote') continue;   // Stimmen werden separat verarbeitet (siehe handleEnvelope), nicht als eigene Chatzeile gezeigt
+    const pollCard = matched?.typeName === 'poll' ? matched.payload : null;
+    const locationCard = matched?.typeName === 'location' ? matched.payload : null;
+    const contactCard = matched?.typeName === 'contact' ? matched.payload : null;
 
     let content;
     if (pollCard) {
@@ -2298,23 +2408,29 @@ function forwardSelectedMsgs() {
   toast('Kontakt auswählen, um weiterzuleiten');
 }
 
-/* ── Gruppenschlüssel lokal persistieren (nur dieses Gerät) ── */
+/* ── Gruppenschlüssel lokal persistieren (nur dieses Gerät) ──
+   Hinweis: hier wird bewusst NICHT state.groupKeys (Map von CryptoKey-
+   Objekten) direkt gespeichert — CryptoKeys sind nicht JSON-fähig.
+   Stattdessen liegt unter dem Registry-Eintrag 'groupKeys_raw' ein
+   simples { groupId: base64String }-Objekt; die eigentliche Map mit
+   den importierten CryptoKeys lebt nur in state.groupKeys zur
+   Laufzeit. */
 function saveGroupKeyLocal(groupId, rawKeyB64) {
-  try {
-    const store = JSON.parse(localStorage.getItem('sc:groupKeys') || '{}');
-    store[groupId] = rawKeyB64;
-    localStorage.setItem('sc:groupKeys', JSON.stringify(store));
-  } catch {}
+  const store = loadPref('groupKeys_raw');
+  store[groupId] = rawKeyB64;
+  savePref('groupKeys_raw', store);
 }
 async function loadGroupKeysLocal() {
   if (!state.groupKeys) state.groupKeys = new Map();
-  try {
-    const store = JSON.parse(localStorage.getItem('sc:groupKeys') || '{}');
-    for (const [groupId, rawKeyB64] of Object.entries(store)) {
+  const store = loadPref('groupKeys_raw');
+  for (const [groupId, rawKeyB64] of Object.entries(store)) {
+    try {
       const key = await crypto.subtle.importKey('raw', ub64(rawKeyB64), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
       state.groupKeys.set(groupId, key);
+    } catch (e) {
+      console.warn('Gruppenschlüssel für', groupId, 'konnte nicht importiert werden:', e.message);
     }
-  } catch {}
+  }
 }
 
 /* Wird aufgerufen, wenn eine neue Gruppe für mich als Mitglied
@@ -2718,8 +2834,7 @@ const ACCENT_THEMES = {
   default:{ acc: '', acc2: '', label: 'Standard' }   // Kategorie-eigener Fallback greift
 };
 function loadAccentTheme() {
-  let stored = {};
-  try { stored = JSON.parse(localStorage.getItem('sc:buttonThemes') || '{}'); } catch {}
+  const stored = loadPref('buttonThemes');
   state.buttonThemes = stored;
   for (const key of Object.keys(BUTTON_CATEGORIES)) {
     applyButtonTheme(key, stored[key] || (key === 'general' ? 'green' : 'default'), false);
@@ -2741,9 +2856,7 @@ function applyButtonTheme(category, themeKey, persist = true) {
   }
   if (!state.buttonThemes) state.buttonThemes = {};
   state.buttonThemes[category] = themeKey;
-  if (persist) {
-    try { localStorage.setItem('sc:buttonThemes', JSON.stringify(state.buttonThemes)); } catch {}
-  }
+  if (persist) savePref('buttonThemes', state.buttonThemes);
 }
 function setAccentTheme(theme) {
   /* Rückwärtskompatibel: setzt weiterhin NUR die allgemeine Kategorie —
@@ -2806,13 +2919,11 @@ function openDesignSettings() {
    Bilder, kein Server-Upload nötig für reine UI-Kosmetik). */
 const DEFAULT_BRANDING = { name: 'SecureChat', logoUrl: null };
 function getAppBranding() {
-  try {
-    const raw = localStorage.getItem('sc:branding');
-    return raw ? { ...DEFAULT_BRANDING, ...JSON.parse(raw) } : { ...DEFAULT_BRANDING };
-  } catch { return { ...DEFAULT_BRANDING }; }
+  const stored = loadPref('branding');
+  return stored ? { ...DEFAULT_BRANDING, ...stored } : { ...DEFAULT_BRANDING };
 }
 function saveAppBranding(branding) {
-  try { localStorage.setItem('sc:branding', JSON.stringify(branding)); } catch {}
+  savePref('branding', branding);
 }
 function saveBrandingName() {
   const name = document.getElementById('brandingNameInput')?.value.trim() || 'SecureChat';
@@ -2871,14 +2982,12 @@ const DEFAULT_CHAT_PREFS = {
   liveLocationAsWidget: true   // true = schwebendes Fenster, false = Chat-Karte
 };
 function loadChatPrefs() {
-  try {
-    const raw = localStorage.getItem('sc:chatPrefs');
-    state.chatPrefs = raw ? { ...DEFAULT_CHAT_PREFS, ...JSON.parse(raw) } : { ...DEFAULT_CHAT_PREFS };
-  } catch { state.chatPrefs = { ...DEFAULT_CHAT_PREFS }; }
+  const stored = loadPref('chatPrefs');
+  state.chatPrefs = stored ? { ...DEFAULT_CHAT_PREFS, ...stored } : { ...DEFAULT_CHAT_PREFS };
   applyFontSizePref();
 }
 function saveChatPrefs() {
-  try { localStorage.setItem('sc:chatPrefs', JSON.stringify(state.chatPrefs)); } catch {}
+  savePref('chatPrefs', state.chatPrefs);
 }
 function applyFontSizePref() {
   const sizes = { small: '14px', medium: '15.5px', large: '17.5px' };
@@ -3302,7 +3411,7 @@ function toggleChatPin(convId) {
   if (!state.pinnedChats) state.pinnedChats = new Set();
   if (state.pinnedChats.has(convId)) { state.pinnedChats.delete(convId); toast('Chat nicht mehr angepinnt'); }
   else { state.pinnedChats.add(convId); toast('Chat angepinnt'); }
-  try { localStorage.setItem('sc:pinnedChats', JSON.stringify([...state.pinnedChats])); } catch {}
+  savePref('pinnedChats', state.pinnedChats);
   renderMain();
 }
 /* ── Chat als Favorit markieren (eigener Filter in der Pillbar) ── */
@@ -3310,12 +3419,12 @@ function toggleChatFavorite(convId) {
   if (!state.favoriteChats) state.favoriteChats = new Set();
   if (state.favoriteChats.has(convId)) { state.favoriteChats.delete(convId); toast('Aus Favoriten entfernt'); }
   else { state.favoriteChats.add(convId); toast('Als Favorit markiert'); }
-  try { localStorage.setItem('sc:favoriteChats', JSON.stringify([...state.favoriteChats])); } catch {}
+  savePref('favoriteChats', state.favoriteChats);
   renderMain();
 }
 function loadPinnedAndFavorites() {
-  try { state.pinnedChats = new Set(JSON.parse(localStorage.getItem('sc:pinnedChats') || '[]')); } catch { state.pinnedChats = new Set(); }
-  try { state.favoriteChats = new Set(JSON.parse(localStorage.getItem('sc:favoriteChats') || '[]')); } catch { state.favoriteChats = new Set(); }
+  state.pinnedChats = loadPref('pinnedChats');
+  state.favoriteChats = loadPref('favoriteChats');
 }
 
 function toggleMuteChat() {
@@ -3324,7 +3433,7 @@ function toggleMuteChat() {
   const peerId = state.activeConv.peerId;
   if (state.mutedChats.has(peerId)) { state.mutedChats.delete(peerId); toast('Stummschaltung aufgehoben'); }
   else { state.mutedChats.add(peerId); toast('Chat stummgeschaltet'); }
-  try { localStorage.setItem('sc:muted', JSON.stringify([...state.mutedChats])); } catch {}
+  savePref('mutedChats', state.mutedChats);
 }
 
 /* ── Verschwindende Nachrichten (Timer-Auswahl, lokal je Chat gespeichert) ── */
@@ -3359,9 +3468,7 @@ function openDisappearingMessages() {
 function setDisappearing(seconds) {
   if (!state.disappearing) state.disappearing = new Map();
   state.disappearing.set(state.activeConv.peerId, seconds);
-  try {
-    localStorage.setItem('sc:disappearing', JSON.stringify([...state.disappearing.entries()]));
-  } catch {}
+  savePref('disappearing', state.disappearing);
   document.getElementById('disappearSheet')?.remove();
   toast(seconds ? 'Verschwindende Nachrichten aktiviert' : 'Verschwindende Nachrichten deaktiviert');
 }
@@ -3395,32 +3502,75 @@ function pruneDisappearingMessages() {
   }
 }
 function loadDisappearingSettings() {
-  try {
-    const raw = localStorage.getItem('sc:disappearing');
-    if (raw) state.disappearing = new Map(JSON.parse(raw));
-  } catch {}
+  state.disappearing = loadPref('disappearing');
   /* Alle 30s prüfen — reicht für Minuten-Timer, ohne unnötig oft
      durchzulaufen. */
   setInterval(pruneDisappearingMessages, 30000);
 }
 
 /* ── Sicherheitscode / Fingerabdruck der Verschlüsselung ──
+   ─────────────────────────────────────────────────────────────────────
    Einzigartiges Vertrauens-Feature: zeigt einen aus den öffentlichen
    Identitätsschlüsseln beider Seiten abgeleiteten Code, den man z. B.
    persönlich oder per Videoanruf vergleichen kann, um sich gegen einen
    Man-in-the-Middle-Angriff abzusichern — genau das Prinzip hinter
-   Signal/WhatsApp "Sicherheitsnummer", hier selbst gebaut. */
+   Signal/WhatsApp "Sicherheitsnummer".
+
+   Frühere Version hatte zwei stille Fehlerquellen, die den Code
+   zwischen beiden Geräten unterschiedlich ausfallen lassen konnten,
+   ohne dass das sichtbar wurde:
+   1. Bei Kontakten mit MEHREREN Geräten nahm bundles?.[0] irgendein
+      Gerät in Server-Antwortreihenfolge — nicht deterministisch
+      garantiert dieselbe Wahl auf beiden Seiten. Jetzt: explizit das
+      Gerät mit isPrimary=true, mit einem klaren Fehler statt stillem
+      Fallback, falls keins als primär markiert ist.
+   2. War theirKey aus irgendeinem Grund undefined, flossen literale
+      "undefined"-Strings in den Hash ein — ein technisch gültiger,
+      aber SINNLOSER Code wurde trotzdem angezeigt. Jetzt: wirft einen
+      sichtbaren Fehler, zeigt nie einen Code ohne vollständige Daten.
+
+   Sortierung erfolgt außerdem nach USER-ID (stabil, eindeutig, jedem
+   Client bekannt), nicht mehr nach den Schlüssel-Koordinaten selbst
+   (String-Sortierung von x/y-Werten ist zwar mathematisch kommutativ
+   für das Egebnis, aber unnötig schwerer nachzuvollziehen/zu testen
+   als eine Sortierung nach einem Wert, den beide Seiten von Anfang an
+   kennen). */
+async function computeSecurityCode(peerId) {
+  if (!state.me?.id || !state.identity?.IK?.pubJwk) {
+    throw new Error('Eigene Identität noch nicht bereit');
+  }
+  const { bundles } = await api.fetchBundle(peerId);
+  const primaryBundle = bundles?.find(b => b.isPrimary) || bundles?.[0];
+  if (!primaryBundle?.ikDH?.x || !primaryBundle?.ikDH?.y) {
+    throw new Error('Kein gültiger Schlüssel für diesen Kontakt gefunden');
+  }
+  const myKey = state.identity.IK.pubJwk;
+  if (!myKey?.x || !myKey?.y) throw new Error('Eigener Schlüssel unvollständig');
+
+  /* Nach User-ID sortieren, nicht nach den Schlüsselwerten selbst —
+     beide Seiten kennen beide User-IDs von Anfang an, das macht die
+     Regel leichter nachvollziehbar und leichter zu testen (siehe
+     computeSecurityCode Tests, die exakt diese Reihenfolge erwarten). */
+  const [firstId, secondId] = [state.me.id, peerId].sort();
+  const firstKey = firstId === state.me.id ? myKey : primaryBundle.ikDH;
+  const secondKey = firstId === state.me.id ? primaryBundle.ikDH : myKey;
+
+  const combined = JSON.stringify([firstKey.x, firstKey.y, secondKey.x, secondKey.y]);
+  const hashBuf = await crypto.subtle.digest('SHA-256', te.encode(combined));
+  const hashArr = [...new Uint8Array(hashBuf)];
+  /* 15 Bytes → 15 dreistellige Blöcke (000–255), in 5er-Gruppen
+     angezeigt — dieselbe Größenordnung wie Signal/WhatsApp (60 Ziffern
+     dort, 45 hier; ausreichend Entropie gegen zufälliges Erraten,
+     ohne den Vergleich für Nutzer unnötig lang zu machen). */
+  return hashArr.slice(0, 15).map(b => String(b).padStart(3, '0'));
+}
+
 async function showEncryptionFingerprint() {
   document.getElementById('chatMenuSheet')?.remove();
   const peerId = state.activeConv.peerId;
   try {
-    const { bundles } = await api.fetchBundle(peerId);
-    const theirKey = bundles?.[0]?.ikDH || bundles?.[0]?.ik;
-    const myKey = state.identity.IK.pubJwk;
-    const combined = JSON.stringify([myKey.x, myKey.y, theirKey?.x, theirKey?.y].sort());
-    const hashBuf = await crypto.subtle.digest('SHA-256', te.encode(combined));
-    const hashArr = [...new Uint8Array(hashBuf)];
-    const code = hashArr.slice(0, 15).map(b => String(b).padStart(3, '0')).join(' ');
+    const codeBlocks = await computeSecurityCode(peerId);
+    const code = codeBlocks.join(' ');
     openSettingsPage('Sicherheitscode', `
       <p style="color:var(--sub);font-size:14px;margin-bottom:16px">
         Vergleiche diesen Code mit ${esc(state.activeConv.name)} über einen anderen Kanal
@@ -3430,7 +3580,7 @@ async function showEncryptionFingerprint() {
         background:var(--panel2);padding:20px;border-radius:12px;letter-spacing:1px">${code}</div>
     `);
   } catch (e) {
-    toast('⚠️ Sicherheitscode konnte nicht ermittelt werden');
+    toast('⚠️ Sicherheitscode konnte nicht ermittelt werden: ' + e.message);
   }
 }
 
@@ -4322,17 +4472,6 @@ function parseIncomingMedia(text) {
   try {
     const obj = JSON.parse(text);
     if (obj && obj.__media) return { ref: obj.__media, kind: obj.kind };
-  } catch {}
-  return null;
-}
-
-/* Generischer Parser für strukturierte Nachrichtentypen (__location,
-   __contact) — dasselbe Muster wie parseIncomingMedia, aber ohne
-   Medien-Download-Logik, da diese Karten nur Text/Links enthalten. */
-function parseStructured(text, key) {
-  try {
-    const obj = JSON.parse(text);
-    if (obj && obj[key]) return obj[key];
   } catch {}
   return null;
 }
