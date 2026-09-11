@@ -104,6 +104,16 @@ CREATE TABLE IF NOT EXISTS users (
      unnötig verkomplizieren und ist auch bei anderen Messengern die
      übliche Alles-oder-nichts-Einstellung. */
   show_last_seen   INTEGER DEFAULT 1,
+  /* Rein clientseitige UI-Präferenzen (angepinnte/favorisierte/
+     stummgeschaltete Chats, Farbthema, App-Branding) — bewusst als EIN
+     JSON-Blob statt einzelner Spalten, weil neue Präferenzen sonst bei
+     jeder Erweiterung eine neue Migration bräuchten. KEIN Ende-zu-Ende-
+     verschlüsselter Inhalt: es handelt sich nie um Nachrichtentexte
+     oder Schlüsselmaterial, nur um Anzeige-Vorlieben, die der Server
+     ohnehin nicht sinnvoll verbergen könnte (er kennt z. B. bereits
+     die Konversations-IDs). Damit ist plain JSON hier angemessen,
+     anders als beim eigentlichen Chat-Inhalt. */
+  prefs_json       TEXT,
   created_at    BIGINT NOT NULL,
   last_seen     BIGINT NOT NULL
 );
@@ -401,6 +411,7 @@ CREATE TABLE IF NOT EXISTS reports (
    ADD COLUMN IF NOT EXISTS ist in Postgres seit Version 9.6 verfügbar
    und damit sicher für Neon. */
 await db.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS show_last_seen INTEGER DEFAULT 1;`).catch(() => {});
+await db.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS prefs_json TEXT;`).catch(() => {});
 
 const q = {
   userByName:   db.prepare('SELECT * FROM users WHERE lower(name)=lower(?)'),
@@ -419,6 +430,7 @@ const q = {
   touchUser:    db.prepare('UPDATE users SET last_seen=? WHERE id=?'),
   updateProfile:db.prepare('UPDATE users SET name=?,bio=?,phone=? WHERE id=?'),
   setShowLastSeen: db.prepare('UPDATE users SET show_last_seen=? WHERE id=?'),
+  setPrefsJson: db.prepare('UPDATE users SET prefs_json=? WHERE id=?'),
   updateAvatar: db.prepare('UPDATE users SET avatar_path=? WHERE id=?'),
   markEmailVerified: db.prepare('UPDATE users SET email_verified=1 WHERE id=?'),
   markPhoneVerified: db.prepare('UPDATE users SET phone_verified=1 WHERE id=?'),
@@ -1303,6 +1315,37 @@ const routes = {
       await q.setShowLastSeen.run(b.showLastSeen ? 1 : 0, a.user.id);
     }
     json(res, 200, { user: pub(await q.userById.get(a.user.id), true) });
+  },
+
+  /* ── Kontogebundene UI-Präferenzen (Pins, Favoriten, Themes, ...) ──
+     Bewusst als eigener, kleiner Endpunkt getrennt von /api/profile —
+     dort geht es um Kontodaten (Name, Bio, Telefon), hier um reine
+     Geräteübergreifende Anzeige-Vorlieben. Kein Merge auf Server-Seite:
+     der Client schickt immer den kompletten aktuellen Stand (siehe
+     app.js syncPrefsToServer), "letzter Schreibvorgang gewinnt" ist für
+     diese Art Daten ausreichend — zwei Geräte gleichzeitig dieselbe
+     Einstellung ändern ist ein vernachlässigbarer Randfall. */
+  'GET /api/prefs': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    let prefs = {};
+    try { prefs = a.user.prefs_json ? JSON.parse(a.user.prefs_json) : {}; } catch {}
+    json(res, 200, { prefs });
+  },
+  'POST /api/prefs': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (typeof b.prefs !== 'object' || b.prefs === null) {
+      return json(res, 400, { error: 'prefs fehlt oder ungültig' });
+    }
+    /* Grobe Größenbegrenzung — das sind ein paar Sets/Strings, kein
+       Nachrichtenverlauf; 64 KB sind für jeden realistischen Umfang
+       an Pins/Favoriten/Themes weit mehr als genug und schützen davor,
+       dass hier versehentlich große Datenmengen (z. B. ein ganzer
+       Chatverlauf) landen. */
+    const serialized = JSON.stringify(b.prefs);
+    if (serialized.length > 65536) return json(res, 413, { error: 'Präferenzen zu groß' });
+    await q.setPrefsJson.run(serialized, a.user.id);
+    json(res, 200, { ok: true });
   },
 
   /* Presigned-Upload-URL ausstellen: Client verschlüsselt die Datei
