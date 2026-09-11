@@ -423,12 +423,12 @@ function parseMessageType(text) {
 const PREF_REGISTRY = {
   deletedConvIds:  { key: 'sc:deletedConvIds', type: 'set' },
   groupKeys_raw:   { key: 'sc:groupKeys',      type: 'plain', default: {} },
-  buttonThemes:    { key: 'sc:buttonThemes',   type: 'plain', default: {} },
-  branding:        { key: 'sc:branding',       type: 'plain', default: null },
-  chatPrefs:       { key: 'sc:chatPrefs',      type: 'plain', default: null },
-  pinnedChats:     { key: 'sc:pinnedChats',    type: 'set' },
-  favoriteChats:   { key: 'sc:favoriteChats',  type: 'set' },
-  mutedChats:      { key: 'sc:muted',          type: 'set' },
+  buttonThemes:    { key: 'sc:buttonThemes',   type: 'plain', default: {}, sync: true },
+  branding:        { key: 'sc:branding',       type: 'plain', default: null, sync: true },
+  chatPrefs:       { key: 'sc:chatPrefs',      type: 'plain', default: null, sync: true },
+  pinnedChats:     { key: 'sc:pinnedChats',    type: 'set', sync: true },
+  favoriteChats:   { key: 'sc:favoriteChats',  type: 'set', sync: true },
+  mutedChats:      { key: 'sc:muted',          type: 'set', sync: true },
   disappearing:    { key: 'sc:disappearing',   type: 'map' }
 };
 
@@ -468,6 +468,67 @@ function savePref(name, value) {
     localStorage.setItem(def.key, JSON.stringify(serializable));
   } catch (e) {
     console.warn('Speichern fehlgeschlagen für', name, ':', e.message);
+  }
+  if (def.sync) schedulePrefsSync();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PRÄFERENZ-SYNC ÜBER DAS KONTO — geräteübergreifend, kein E2EE nötig
+   ─────────────────────────────────────────────────────────────────────
+   Nur die als sync:true markierten Registry-Einträge betreffen — reine
+   Anzeige-Vorlieben (Pins, Favoriten, Mute, Farbthema, Branding), NIE
+   Nachrichteninhalte oder Schlüsselmaterial. Deshalb reicht ein
+   einfacher Klartext-JSON-Endpunkt am Server (siehe /api/prefs) statt
+   einer Ende-zu-Ende-verschlüsselten Übertragung: der Server kennt die
+   betroffenen Konversations-IDs ohnehin bereits aus dem normalen
+   Nachrichtenverkehr (er leitet sie ja weiter), eine zusätzliche
+   Verschlüsselung nur der Präferenzen böte keinen echten Mehrwert an
+   Vertraulichkeit, aber deutlich mehr Komplexität (Multi-Device-
+   Schlüsselverteilung wie bei Gruppen). */
+let _prefsSyncTimer = null;
+function schedulePrefsSync() {
+  if (_prefsSyncTimer) return;
+  /* Kurze Verzögerung sammelt mehrere schnelle Änderungen (z. B.
+     mehrere Chats kurz hintereinander anpinnen) zu einem einzigen
+     Server-Aufruf, statt bei jeder einzelnen Änderung sofort zu
+     senden. */
+  _prefsSyncTimer = setTimeout(() => {
+    _prefsSyncTimer = null;
+    pushPrefsToServer().catch(e => console.warn('Präferenz-Sync fehlgeschlagen:', e.message));
+  }, 1500);
+}
+function collectSyncablePrefs() {
+  const out = {};
+  for (const [name, def] of Object.entries(PREF_REGISTRY)) {
+    if (!def.sync) continue;
+    const value = loadPref(name);
+    out[name] = def.type === 'set' ? [...value] : def.type === 'map' ? [...value.entries()] : value;
+  }
+  return out;
+}
+async function pushPrefsToServer() {
+  if (!api?.token) return;   // vor dem Login noch nicht möglich, wird beim nächsten Trigger nachgeholt
+  await api._fetch('/api/prefs', { method: 'POST', body: { prefs: collectSyncablePrefs() } });
+}
+/* Beim Login: Server-Stand in lokale Registry übernehmen. "Letzter
+   Schreibvorgang gewinnt" — kein Merge mit dem lokalen Stand, der
+   Server ist nach einem erfolgreichen vorherigen Sync die Quelle der
+   Wahrheit für sync-fähige Werte. Ein frisches Gerät ohne lokale Werte
+   bekommt so exakt den Stand der anderen Geräte. */
+async function pullPrefsFromServer() {
+  if (!api?.token) return;
+  let prefs;
+  try { ({ prefs } = await api._fetch('/api/prefs')); }
+  catch (e) { console.warn('Präferenzen konnten nicht geladen werden:', e.message); return; }
+  if (!prefs || typeof prefs !== 'object') return;
+  for (const [name, def] of Object.entries(PREF_REGISTRY)) {
+    if (!def.sync || !(name in prefs)) continue;
+    const raw = prefs[name];
+    const value = def.type === 'set' ? new Set(raw) : def.type === 'map' ? new Map(raw) : raw;
+    try {
+      const serializable = def.type === 'set' ? [...value] : def.type === 'map' ? [...value.entries()] : value;
+      localStorage.setItem(def.key, JSON.stringify(serializable));
+    } catch {}
   }
 }
 
@@ -947,6 +1008,17 @@ async function afterAuth(data) {
   state.device = data.device;
   state.monitor = new KT.Monitor();
   await loadSessions();
+
+  /* Geräteübergreifende Präferenzen vom Server holen — MUSS vor den
+     einzelnen load*()-Aufrufen unten passieren, sonst würde z. B.
+     loadPinnedAndFavorites() bereits mit dem alten lokalen Stand statt
+     dem frisch synchronisierten laufen. pullPrefsFromServer schreibt
+     nur in localStorage; die anschließenden load*()-Aufrufe übernehmen
+     das dann in den laufenden State. */
+  await pullPrefsFromServer();
+  loadChatPrefs();
+  loadAccentTheme();
+  loadPinnedAndFavorites();
 
   /* Server-Wahrheit für showLastSeen übernehmen (falls auf einem
      anderen Gerät geändert) — alle anderen Chat-Präferenzen bleiben

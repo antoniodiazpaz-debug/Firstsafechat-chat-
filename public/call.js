@@ -148,9 +148,24 @@ const Call = (() => {
       }
     };
 
+    /* ontrack feuert MEHRFACH pro Verbindung — mindestens einmal pro
+       Media-Track (Audio UND Video sind zwei separate Tracks). Jeder
+       Aufruf hier löste bisher über notify() ein KOMPLETTES Neu-
+       Rendern der Anruf-UI aus (siehe renderConnected in call-ui.js:
+       overlayEl.innerHTML = ''), was das gerade erst zugewiesene
+       lokale Video-Element mitten in der Zuweisung zerstören und neu
+       erzeugen konnte — Ursache dafür, dass eine Seite ihr eigenes
+       Bild (oder bei Audio-Calls: der Ton) nach der Verbindung
+       gelegentlich nicht zu sehen/hören bekam. Der Stream selbst
+       (e.streams[0]) ist bei allen Tracks derselbe Objekt-Verweis,
+       ein zweites komplettes Rendern bringt keinen Mehrwert — nur der
+       ERSTE Aufruf baut das UI auf, alle weiteren sind no-ops. */
+    let connectedNotified = false;
     conn.ontrack = e => {
-      notify('connected', { remoteStream: e.streams[0] });
       clearTimeout(ringTimeout);
+      if (connectedNotified) return;
+      connectedNotified = true;
+      notify('connected', { remoteStream: e.streams[0] });
     };
 
     conn.onconnectionstatechange = () => {
