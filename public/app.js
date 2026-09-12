@@ -4,6 +4,7 @@
    hier den echten Server über HTTP/WebSocket an.
    ═══════════════════════════════════════════════════════════════════════ */
 import { P, PreKeys, KT, X3DH, Ratchet, MAX_SKIP, b64, ub64, hexs, te, td } from '/crypto-core.js';
+import { SenderKeys } from '/sender-keys.js';
 import { ApiClient, hashContact } from '/api-client.js';
 import { setLocale, getLocale, t } from '/i18n.js';
 import { detectLanguage, guessDialCode, preparePhoneInput, watchForSmsCode } from '/device-info.js';
@@ -422,7 +423,8 @@ function parseMessageType(text) {
 
 const PREF_REGISTRY = {
   deletedConvIds:  { key: 'sc:deletedConvIds', type: 'set' },
-  groupKeys_raw:   { key: 'sc:groupKeys',      type: 'plain', default: {} },
+  mySenderKeys_raw:    { key: 'sc:mySenderKeys',    type: 'plain', default: {} },
+  peerSenderKeys_raw:  { key: 'sc:peerSenderKeys',  type: 'plain', default: {} },
   buttonThemes:    { key: 'sc:buttonThemes',   type: 'plain', default: {}, sync: true },
   branding:        { key: 'sc:branding',       type: 'plain', default: null, sync: true },
   chatPrefs:       { key: 'sc:chatPrefs',      type: 'plain', default: null, sync: true },
@@ -1060,7 +1062,8 @@ async function afterAuth(data) {
 
   try { await window.StorageGuard?.requestPersistence?.(); } catch {}
   await loadBlockList();
-  await loadGroupKeysLocal();
+  await loadMySenderKeysLocal();
+  await loadPeerSenderKeysLocal();
   await refreshInbox();
   await refreshGroups();
 
@@ -1267,6 +1270,12 @@ function wireSocketEvents() {
   api.on('read', (msg) => {
     if (msg.convId) markMessagesStatus(msg.convId, msg.ids, 'read');
   });
+  api.on('group-member-left', (msg) => {
+    handleGroupMemberLeft(msg.groupId, msg.userId);
+  });
+  api.on('group-removed', (msg) => {
+    handleGroupRemoved(msg.groupId);
+  });
   api.on('connected', () => {
     toast('🟢 WebSocket verbunden', 1500);
     state.isOffline = false;
@@ -1311,20 +1320,30 @@ async function onIncomingEnvelope(env) {
   }
 }
 /* ── Gruppennachricht entschlüsseln ──
-   ciphertext-Format: "<iv-b64>.<ct-b64>" (siehe sendGroupMessage).
-   Fehlt der Gruppenschlüssel lokal (z. B. neue Gruppe, deren Wrap noch
-   nicht verarbeitet wurde), einmal versuchen ihn nachzuladen. */
+   ciphertext ist jetzt das JSON eines SenderKeys-Envelopes (siehe
+   sendGroupMessage/sender-keys.js), nicht mehr AES-GCM mit einem
+   gemeinsamen Gruppenschlüssel. Ist der Sender-Key des Absenders noch
+   nicht importiert (z. B. neu beigetreten oder Verteilung kam noch
+   nicht an), einmal versuchen ihn nachzuladen. */
 async function openGroupMessage(env) {
-  let groupKey = state.groupKeys?.get(env.groupId);
-  if (!groupKey) {
-    await refreshGroups();
-    groupKey = state.groupKeys?.get(env.groupId);
-    if (!groupKey) throw new Error('Kein Gruppenschlüssel verfügbar');
+  if (!env.senderId) throw new Error('Gruppennachricht ohne erkennbaren Absender');
+  const perSender = state.groupSenderStates?.get(env.groupId);
+  let senderState = perSender?.get(env.senderId);
+  if (!senderState) {
+    await fetchAndImportSenderKeys(env.groupId);
+    senderState = state.groupSenderStates?.get(env.groupId)?.get(env.senderId);
+    if (!senderState) throw new Error('Kein Sender-Key für diesen Absender verfügbar');
   }
-  const [ivB64, ctB64] = env.ciphertext.split('.');
-  const plain = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: ub64(ivB64) }, groupKey, ub64(ctB64));
-  return td.decode(plain);
+  const envelope = JSON.parse(env.ciphertext);
+  const plaintext = await SenderKeys.decrypt(senderState, envelope, env.groupId);
+  /* senderState wurde von SenderKeys.decrypt MUTIERT (chainKey/
+     iteration rückten vor) — Zustand persistieren, sonst müsste beim
+     nächsten Laden ab dem alten Stand neu vorgerückt werden (würde
+     bei vielen Nachrichten unnötig lange dauern, ist aber im
+     Unterschied zu einem Sicherheitsproblem nur ein Performance-
+     Aspekt: skipTo-artiges Vorwärtsrechnen bleibt korrekt). */
+  saveGroupSenderState(env.groupId, env.senderId, senderState);
+  return plaintext;
 }
 
 async function handleEnvelope(env, live) {
@@ -1831,6 +1850,9 @@ const appActions = {
   deleteSelectedMsgs() { deleteSelectedMsgs(); },
   forwardSelectedMsgs() { forwardSelectedMsgs(); },
   chatMenu(e) { chatMenu(e); },
+  leaveGroup(groupId) { leaveGroup(groupId); },
+  removeGroupMember(groupId, userId) { removeGroupMember(groupId, userId); },
+  openGroupMembersManage() { openGroupMembersManage(); },
   searchInChat() { searchInChat(); },
   doChatSearch(q) { doChatSearch(q); },
   clearChatSearch() { clearChatSearch(); },
@@ -1937,16 +1959,21 @@ async function ensureReceiverSession(env) {
    individuelles Neuverschlüsseln pro Empfänger nötig, im Gegensatz
    zu 1:1). AES-GCM mit zufälligem IV pro Nachricht. */
 async function sendGroupMessage(groupId, convId, plaintext) {
-  const groupKey = state.groupKeys?.get(groupId);
-  if (!groupKey) throw new Error('Kein Gruppenschlüssel vorhanden — bitte Gruppe neu laden');
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, groupKey, te.encode(plaintext));
-  const ciphertext = b64(iv) + '.' + b64(new Uint8Array(ct));
-
   const conv = state.convs.get(convId);
   const memberIds = (conv?.memberIds || []).filter(id => id !== state.me.id);
   if (!memberIds.length) throw new Error('Keine anderen Mitglieder in dieser Gruppe');
+
+  await ensureGroupSenderKeys(groupId, conv.memberIds);
+  const mySk = state.mySenderKeys.get(groupId);
+  if (!mySk) throw new Error('Kein eigener Sender-Key vorhanden');
+
+  /* SenderKeys.encrypt MUTIERT mySk (chainKey/iteration rücken vor,
+     siehe sender-keys.js) — sofort danach lokal persistieren, sonst
+     ginge der Fortschritt bei einem Reload verloren und der Empfänger
+     würde den Chain-Key-Zustand nicht mehr synchron wiederfinden. */
+  const envelope = await SenderKeys.encrypt(mySk, plaintext, groupId);
+  saveMySenderKeyState(groupId, mySk);
+  const ciphertext = JSON.stringify(envelope);
 
   const results = [];
   for (const memberId of memberIds) {
@@ -2142,11 +2169,12 @@ async function sendCurrentMessage() {
   input.style.height = 'auto';
   const { peerId, convId, groupId, isGroup } = state.activeConv;
 
-  /* Gruppen-Chats laufen über einen eigenen Pfad (AES-Gruppenschlüssel
-     statt 1:1-Ratchet) — siehe sendGroupMessage. Kein Offline-Queueing
-     für Gruppen in dieser ersten Version: die Zustellung an mehrere
-     Mitglieder gleichzeitig würde die Warteschlangen-Logik unnötig
-     verkomplizieren, ohne dass es aktuell einen dringenden Bedarf gibt. */
+  /* Gruppen-Chats laufen über einen eigenen Pfad (Sender Keys mit
+     Forward Secrecy statt gemeinsamem Gruppenschlüssel) — siehe
+     sendGroupMessage. Kein Offline-Queueing für Gruppen in dieser
+     ersten Version: die Zustellung an mehrere Mitglieder gleichzeitig
+     würde die Warteschlangen-Logik unnötig verkomplizieren, ohne dass
+     es aktuell einen dringenden Bedarf gibt. */
   if (isGroup) {
     try {
       await sendGroupMessage(groupId, convId, text);
@@ -2200,8 +2228,20 @@ function queueOffline(peerId, convId, text) {
    ═══════════════════════════════════════════════════════════════════════ */
 function openChat(c) {
   state.view = 'chat';
-  state.activeConv = { peerId: c.peerId, convId: c.convId, name: c.name || c.peerId };
+  state.activeConv = {
+    peerId: c.peerId, convId: c.convId, name: c.name || c.peerId,
+    isGroup: !!c.isGroup, groupId: c.groupId, memberIds: c.memberIds
+  };
   if (c.unread) { c.unread = 0; }
+
+  if (c.isGroup) {
+    /* Nicht awaiten — der Chat soll sofort sichtbar sein, auch wenn
+       das Nachladen fehlender Sender-Keys noch läuft. Bereits
+       empfangbare Nachrichten von Mitgliedern, deren Key schon lokal
+       vorliegt, werden trotzdem sofort korrekt angezeigt. */
+    ensureGroupSenderKeys(c.groupId, c.memberIds).catch(e =>
+      console.warn('Sender-Keys für Gruppe konnten nicht sichergestellt werden:', e.message));
+  }
 
   const overlay = document.createElement('div');
   overlay.className = 'chatview';
@@ -2480,61 +2520,78 @@ function forwardSelectedMsgs() {
   toast('Kontakt auswählen, um weiterzuleiten');
 }
 
-/* ── Gruppenschlüssel lokal persistieren (nur dieses Gerät) ──
-   Hinweis: hier wird bewusst NICHT state.groupKeys (Map von CryptoKey-
-   Objekten) direkt gespeichert — CryptoKeys sind nicht JSON-fähig.
-   Stattdessen liegt unter dem Registry-Eintrag 'groupKeys_raw' ein
-   simples { groupId: base64String }-Objekt; die eigentliche Map mit
-   den importierten CryptoKeys lebt nur in state.groupKeys zur
-   Laufzeit. */
-function saveGroupKeyLocal(groupId, rawKeyB64) {
-  const store = loadPref('groupKeys_raw');
-  store[groupId] = rawKeyB64;
-  savePref('groupKeys_raw', store);
+/* ── Sender-Keys lokal persistieren (nur dieses Gerät) ──
+   Zwei getrennte Speicherorte, weil es zwei grundverschiedene Rollen
+   sind: EIGENE Sender-Keys (mit privatem Signaturschlüssel, zum
+   Verschlüsseln/Signieren) vs. Sender-Keys ANDERER Mitglieder (nur
+   öffentlicher Verifikationsschlüssel, zum Entschlüsseln/Prüfen).
+   CryptoKey-Objekte sind nicht direkt JSON-fähig — export/importKey
+   überbrückt das (JWK-Format, dasselbe Muster wie überall sonst im
+   Code für Schlüsselmaterial). */
+function saveMySenderKeyState(groupId, sk) {
+  crypto.subtle.exportKey('jwk', sk.signPriv).then(signPrivJwk => {
+    const store = loadPref('mySenderKeys_raw');
+    store[groupId] = {
+      chainKeyB64: b64(sk.chainKey),
+      iteration: sk.iteration,
+      signPrivJwk,
+      signPubJwk: sk.signPubJwk
+    };
+    savePref('mySenderKeys_raw', store);
+  }).catch(e => console.warn('Sender-Key-Zustand konnte nicht gespeichert werden:', e.message));
 }
-async function loadGroupKeysLocal() {
-  if (!state.groupKeys) state.groupKeys = new Map();
-  const store = loadPref('groupKeys_raw');
-  for (const [groupId, rawKeyB64] of Object.entries(store)) {
+async function loadMySenderKeysLocal() {
+  if (!state.mySenderKeys) state.mySenderKeys = new Map();
+  const store = loadPref('mySenderKeys_raw');
+  for (const [groupId, rec] of Object.entries(store)) {
     try {
-      const key = await crypto.subtle.importKey('raw', ub64(rawKeyB64), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-      state.groupKeys.set(groupId, key);
+      const signPriv = await crypto.subtle.importKey(
+        'jwk', rec.signPrivJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+      state.mySenderKeys.set(groupId, {
+        chainKey: ub64(rec.chainKeyB64), iteration: rec.iteration,
+        signPriv, signPubJwk: rec.signPubJwk
+      });
     } catch (e) {
-      console.warn('Gruppenschlüssel für', groupId, 'konnte nicht importiert werden:', e.message);
+      console.warn('Eigener Sender-Key für', groupId, 'konnte nicht geladen werden:', e.message);
     }
   }
 }
-
-/* Wird aufgerufen, wenn eine neue Gruppe für mich als Mitglied
-   eintrifft (siehe refreshGroups) — entschlüsselt den für mich
-   gewrappten Gruppenschlüssel über meine bestehende Ratchet-Session
-   mit dem Gruppen-ERSTELLER (der hat ihn gewrappt, siehe
-   confirmCreateGroup). */
-async function unwrapGroupKey(groupId, creatorId, wrappedB64) {
-  try {
-    const wrappedJson = JSON.parse(td.decode(ub64(wrappedB64)));
-    await ensureSessions(creatorId);
-    const sessionKey = [...state.sessions.keys()].find(k => k.startsWith(creatorId + '>'));
-    const st = state.sessions.get(sessionKey);
-    if (!st) throw new Error('Keine Session zum Gruppen-Ersteller');
-    const rawKeyBuf = await Ratchet.decrypt(st,
-      { header: wrappedJson.header, ct: ub64(wrappedJson.ct) },
-      `v1|${creatorId}|group-key`);
-    scheduleSessionSave();
-    const rawKeyB64 = td.decode(rawKeyBuf);
-    const key = await crypto.subtle.importKey('raw', ub64(rawKeyB64), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-    if (!state.groupKeys) state.groupKeys = new Map();
-    state.groupKeys.set(groupId, key);
-    saveGroupKeyLocal(groupId, rawKeyB64);
-    return key;
-  } catch (e) {
-    console.warn('Gruppenschlüssel konnte nicht entschlüsselt werden:', e.message);
-    return null;
+function saveGroupSenderState(groupId, distributorId, senderState) {
+  const store = loadPref('peerSenderKeys_raw');
+  if (!store[groupId]) store[groupId] = {};
+  store[groupId][distributorId] = {
+    chainKeyB64: b64(senderState.chainKey),
+    iteration: senderState.iteration,
+    signPubJwk: senderState.signPubJwk
+  };
+  savePref('peerSenderKeys_raw', store);
+}
+async function loadPeerSenderKeysLocal() {
+  if (!state.groupSenderStates) state.groupSenderStates = new Map();
+  const store = loadPref('peerSenderKeys_raw');
+  for (const [groupId, byDistributor] of Object.entries(store)) {
+    const perSender = new Map();
+    for (const [distributorId, rec] of Object.entries(byDistributor)) {
+      try {
+        const signPub = await crypto.subtle.importKey(
+          'jwk', rec.signPubJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+        perSender.set(distributorId, {
+          chainKey: ub64(rec.chainKeyB64), iteration: rec.iteration,
+          signPub, signPubJwk: rec.signPubJwk
+        });
+      } catch (e) {
+        console.warn('Sender-Key von', distributorId, 'in', groupId, 'konnte nicht geladen werden:', e.message);
+      }
+    }
+    state.groupSenderStates.set(groupId, perSender);
   }
 }
 
 /* Eigene Gruppen vom Server laden und in state.convs einpflegen —
-   analog zu refreshInbox für 1:1-Chats. */
+   analog zu refreshInbox für 1:1-Chats. Sender-Keys werden NICHT hier
+   geladen, sondern lazy beim ersten Öffnen/Senden (siehe
+   ensureGroupSenderKeys) — unnötig, sie für Gruppen zu laden, die der
+   Nutzer in dieser Sitzung gar nicht öffnet. */
 async function refreshGroups() {
   let groups;
   try { ({ groups } = await api._fetch('/api/groups')); }
@@ -2545,11 +2602,8 @@ async function refreshGroups() {
     if (state.deletedConvIds?.has(convId)) continue;   // Nutzer hat diese Gruppe lokal gelöscht
     let conv = state.convs.get(convId);
     if (!conv) {
-      conv = { convId, groupId: g.id, isGroup: true, name: g.name, memberIds: g.members.map(m => m.userId), unread: 0 };
+      conv = { convId, groupId: g.id, isGroup: true, name: g.name, ownerId: g.ownerId, memberIds: g.members.map(m => m.userId), unread: 0 };
       state.convs.set(convId, conv);
-    }
-    if (!state.groupKeys?.has(g.id) && g.wrapped && g.ownerId !== state.me.id) {
-      await unwrapGroupKey(g.id, g.ownerId, g.wrapped);
     }
   }
   renderMain();
@@ -2722,6 +2776,212 @@ async function openCreateGroup() {
   document.getElementById('overlays').appendChild(sheet);
 }
 
+/* Verschlüsselt einen beliebigen Klartext über die bestehende 1:1-
+   Ratchet-Session zu einem bestimmten Nutzer — genutzt sowohl für die
+   Sender-Key-Verteilung als auch für deren spätere Rotation. Wirft,
+   wenn keine Session zum Ziel besteht (Aufrufer entscheidet, ob das
+   übersprungen oder als Fehler behandelt wird). */
+async function encryptToUserVia1to1(userId, plaintext, context) {
+  await ensureSessions(userId);
+  const sessionKey = [...state.sessions.keys()].find(k => k.startsWith(userId + '>'));
+  const st = state.sessions.get(sessionKey);
+  if (!st) throw new Error('Keine 1:1-Session zu ' + userId);
+  const env = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${context}`);
+  scheduleSessionSave();
+  return b64(te.encode(JSON.stringify({ header: env.header, ct: b64(new Uint8Array(env.ct)) })));
+}
+/* Kehrseite: entschlüsselt einen über encryptToUserVia1to1 verschickten
+   Blob, empfangen von fromUserId. */
+async function decryptFromUserVia1to1(fromUserId, payloadB64, context) {
+  const payload = JSON.parse(td.decode(ub64(payloadB64)));
+  await ensureSessions(fromUserId);
+  const sessionKey = [...state.sessions.keys()].find(k => k.startsWith(fromUserId + '>'));
+  const st = state.sessions.get(sessionKey);
+  if (!st) throw new Error('Keine 1:1-Session zu ' + fromUserId);
+  const buf = await Ratchet.decrypt(st, { header: payload.header, ct: ub64(payload.ct) },
+    `v1|${fromUserId}|${context}`);
+  scheduleSessionSave();
+  return td.decode(buf);
+}
+
+/* Verteilt MEINEN eigenen Sender-Key an alle übrigen Mitglieder einer
+   Gruppe — beim Erstellen, beim eigenen Beitritt zu einer bestehenden
+   Gruppe, und nach jeder Rotation (siehe rotateGroupSenderKeys). */
+async function distributeMySenderKey(groupId, memberIds, epoch) {
+  const sk = state.mySenderKeys?.get(groupId);
+  if (!sk) throw new Error('Kein eigener Sender-Key für diese Gruppe vorhanden');
+  const exported = SenderKeys.exportForDistribution(sk);
+  const payloads = {};
+  for (const memberId of memberIds) {
+    if (memberId === state.me.id) continue;
+    try {
+      payloads[memberId] = await encryptToUserVia1to1(memberId, JSON.stringify(exported), 'group-senderkey');
+    } catch (e) {
+      console.warn('Sender-Key konnte nicht an', memberId, 'verteilt werden:', e.message);
+    }
+  }
+  if (Object.keys(payloads).length) {
+    await api._fetch('/api/group/senderkey/distribute', {
+      method: 'POST', body: { groupId, epoch, payloads }
+    });
+  }
+}
+
+/* Holt und entschlüsselt die Sender-Keys ALLER anderen Mitglieder für
+   eine Gruppe — wird lazy beim ersten Öffnen des Chats aufgerufen
+   (siehe ensureGroupSenderKeys) und bei jedem Empfang einer Nachricht
+   von einem noch unbekannten Sender erneut versucht. */
+async function fetchAndImportSenderKeys(groupId) {
+  let epoch, distributions;
+  try {
+    ({ epoch, distributions } = await api._fetch('/api/group/senderkey?groupId=' + encodeURIComponent(groupId)));
+  } catch (e) {
+    console.warn('Sender-Keys für Gruppe', groupId, 'konnten nicht geladen werden:', e.message);
+    return;
+  }
+  if (!state.groupSenderStates) state.groupSenderStates = new Map();
+  if (!state.groupSenderStates.has(groupId)) state.groupSenderStates.set(groupId, new Map());
+  const perSender = state.groupSenderStates.get(groupId);
+
+  for (const dist of distributions) {
+    if (perSender.has(dist.distributorId)) continue;   // bereits importiert
+    try {
+      const decrypted = await decryptFromUserVia1to1(dist.distributorId, dist.payload, 'group-senderkey');
+      const senderState = await SenderKeys.importDistributed(JSON.parse(decrypted));
+      perSender.set(dist.distributorId, senderState);
+    } catch (e) {
+      console.warn('Sender-Key von', dist.distributorId, 'konnte nicht importiert werden:', e.message);
+    }
+  }
+  state.groupEpochs = state.groupEpochs || new Map();
+  state.groupEpochs.set(groupId, epoch);
+}
+
+/* Stellt sicher, dass sowohl mein eigener Sender-Key existiert und
+   verteilt ist, als auch die Sender-Keys aller anderen Mitglieder
+   importiert sind — wird vor dem ersten Senden/Öffnen eines Gruppen-
+   chats aufgerufen. Idempotent: mehrfacher Aufruf ist unschädlich. */
+async function ensureGroupSenderKeys(groupId, memberIds) {
+  if (!state.mySenderKeys) state.mySenderKeys = new Map();
+  const knownEpoch = state.groupEpochs?.get(groupId);
+  let serverEpoch;
+  try {
+    ({ epoch: serverEpoch } = await api._fetch('/api/group/senderkey?groupId=' + encodeURIComponent(groupId)));
+  } catch {
+    serverEpoch = knownEpoch || 1;
+  }
+
+  const needsFreshKey = !state.mySenderKeys.has(groupId) || (knownEpoch != null && serverEpoch > knownEpoch);
+  if (needsFreshKey) {
+    /* Neue Epoche seit dem letzten bekannten Stand (jemand ist
+       beigetreten oder ausgetreten, siehe handleGroupMemberLeft) —
+       ODER es ist der allererste Beitritt zu dieser Gruppe. In beiden
+       Fällen einen komplett frischen Sender-Key erzeugen und unter der
+       AKTUELLEN Epoche neu verteilen; der alte Chain-Key wird
+       verworfen, nicht weiterverwendet — genau das ist der Schutz vor
+       einem Ex-Mitglied, das mit seinem alten Key weiterlesen könnte. */
+    const sk = await SenderKeys.create();
+    state.mySenderKeys.set(groupId, sk);
+    saveMySenderKeyState(groupId, sk);
+    await distributeMySenderKey(groupId, memberIds, serverEpoch);
+  }
+  if (!state.groupEpochs) state.groupEpochs = new Map();
+  state.groupEpochs.set(groupId, serverEpoch);
+
+  await fetchAndImportSenderKeys(groupId);
+}
+
+/* ── Auf Mitgliederwechsel reagieren (WebSocket-Event) ──
+   Löscht den lokal gecachten Sender-Key-Zustand für die betroffene
+   Gruppe komplett — der nächste Aufruf von ensureGroupSenderKeys()
+   (beim nächsten Öffnen/Senden) bemerkt dann automatisch die erhöhte
+   Epoche und verteilt einen frischen eigenen Sender-Key. Peer-Zustände
+   werden ebenfalls verworfen: sie gehören zur abgelaufenen Epoche und
+   müssen ohnehin neu geholt werden. */
+function invalidateGroupSenderKeys(groupId) {
+  state.groupEpochs?.delete(groupId);
+  state.groupSenderStates?.delete(groupId);
+  const peerStore = loadPref('peerSenderKeys_raw');
+  delete peerStore[groupId];
+  savePref('peerSenderKeys_raw', peerStore);
+}
+function handleGroupMemberLeft(groupId, userId) {
+  const conv = state.convs.get('grp_' + groupId);
+  if (conv?.memberIds) conv.memberIds = conv.memberIds.filter(id => id !== userId);
+  invalidateGroupSenderKeys(groupId);
+  toast('Ein Mitglied hat die Gruppe verlassen — Verschlüsselung wird erneuert');
+  if (state.activeConv?.groupId === groupId) {
+    ensureGroupSenderKeys(groupId, conv?.memberIds || []).catch(() => {});
+  }
+}
+function handleGroupRemoved(groupId) {
+  const convId = 'grp_' + groupId;
+  state.convs.delete(convId);
+  state.messages.delete(convId);
+  invalidateGroupSenderKeys(groupId);
+  if (state.activeConv?.convId === convId) closeChat();
+  toast('Du wurdest aus dieser Gruppe entfernt');
+  renderMain();
+}
+
+/* ── Gruppe verlassen (Aufruf durch den Nutzer selbst) ── */
+async function leaveGroup(groupId) {
+  document.getElementById('chatMenuSheet')?.remove();
+  if (!confirm('Diese Gruppe wirklich verlassen?')) return;
+  try {
+    await api._fetch('/api/group/leave', { method: 'POST', body: { groupId } });
+    const convId = 'grp_' + groupId;
+    state.convs.delete(convId);
+    state.messages.delete(convId);
+    invalidateGroupSenderKeys(groupId);
+    if (state.activeConv?.convId === convId) closeChat();
+    toast('Gruppe verlassen');
+    renderMain();
+  } catch (e) {
+    toast('⚠️ Gruppe konnte nicht verlassen werden: ' + e.message);
+  }
+}
+
+/* ── Mitglied entfernen (nur für den Gruppen-Ersteller sichtbar) ── */
+async function removeGroupMember(groupId, userId) {
+  try {
+    await api._fetch('/api/group/remove-member', { method: 'POST', body: { groupId, userId } });
+    const conv = state.convs.get('grp_' + groupId);
+    if (conv?.memberIds) conv.memberIds = conv.memberIds.filter(id => id !== userId);
+    invalidateGroupSenderKeys(groupId);
+    toast('Mitglied entfernt — Verschlüsselung wird erneuert');
+    if (state.activeConv?.groupId === groupId) {
+      await ensureGroupSenderKeys(groupId, conv?.memberIds || []);
+    }
+    openGroupMembersManage();   // Liste aktualisieren
+  } catch (e) {
+    toast('⚠️ Mitglied konnte nicht entfernt werden: ' + e.message);
+  }
+}
+
+/* ── Mitgliederliste für den Ersteller ── */
+function openGroupMembersManage() {
+  document.getElementById('chatMenuSheet')?.remove();
+  const groupId = state.activeConv?.groupId;
+  const conv = state.convs.get(state.activeConv?.convId);
+  if (!groupId || !conv) return;
+  const memberIds = (conv.memberIds || []).filter(id => id !== state.me.id);
+
+  openSettingsPage('Mitglieder verwalten', `
+    <div class="menulist">
+      <div class="menuitem" style="cursor:default">
+        <span class="mi-ic">👤</span><span>${esc(state.me.name)} (Du, Ersteller)</span>
+      </div>
+      ${memberIds.map(id => `
+        <div class="menuitem">
+          <span class="mi-ic">👤</span><span style="flex:1">${esc(id)}</span>
+          <button class="btn ghost" style="padding:6px 12px;font-size:13px;color:var(--dan)"
+            onclick="window.__app.removeGroupMember('${esc(groupId)}','${esc(id)}')">Entfernen</button>
+        </div>`).join('')}
+    </div>
+  `);
+}
+
 async function confirmCreateGroup() {
   const name = document.getElementById('groupNameInput')?.value.trim();
   const checked = [...document.querySelectorAll('.groupmember-cb:checked')];
@@ -2729,57 +2989,29 @@ async function confirmCreateGroup() {
   if (!checked.length) { toast('⚠️ Bitte mindestens ein Mitglied auswählen'); return; }
 
   const members = checked.map(cb => ({ id: cb.value, name: cb.dataset.name }));
+  const memberIds = members.map(m => m.id);
   document.getElementById('createGroupSheet')?.remove();
   toast('Gruppe wird erstellt…', 3000);
 
   try {
-    /* Gruppenschlüssel generieren, exportieren, für jedes Mitglied
-       (inkl. mich selbst, für Multi-Device-Zugriff) über die
-       bestehende 1:1-Session verschlüsseln. */
-    const groupKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
-    const rawKey = await crypto.subtle.exportKey('raw', groupKey);
-    const rawKeyB64 = b64(rawKey);
-
-    const wrapped = {};
-    /* Für das eigene Konto wird KEIN Server-Wrap angelegt — der
-       Schlüssel bleibt ausschließlich lokal (state.groupKeys +
-       localStorage, siehe unten). Ein "Wrap für mich selbst" würde
-       bedeuten, entweder den Klartextschlüssel unverschlüsselt zum
-       Server zu schicken (Sicherheitsloch) oder eine eigene Geräte-zu-
-       Geräte-Verschlüsselung zu bauen, die hier noch fehlt. Preis
-       dafür: Gruppen sind aktuell an EIN Gerät pro Ersteller gebunden,
-       bis Multi-Device-Sync für Gruppen ergänzt wird. */
-
-    for (const m of members) {
-      try {
-        await ensureSessions(m.id);
-        const key = sk(m.id, [...state.sessions.keys()].find(k => k.startsWith(m.id + '>'))?.split('>')[1]);
-        const st = state.sessions.get(key);
-        if (!st) continue;
-        const env = await Ratchet.encrypt(st, te.encode(rawKeyB64), `v1|${state.me.id}|group-key`);
-        scheduleSessionSave();
-        wrapped[m.id] = b64(te.encode(JSON.stringify({ header: env.header, ct: b64(new Uint8Array(env.ct)) })));
-      } catch (e) {
-        console.warn('Gruppenschlüssel konnte nicht an', m.id, 'verteilt werden:', e.message);
-      }
-    }
-
+    /* Server-seitige Gruppe anlegen — OHNE wrapped-Feld, das ist die
+       Altlast des früheren Ein-Schlüssel-Modells (siehe Schema-
+       Kommentar in server.js). Sender Keys werden separat verteilt,
+       NACHDEM die Gruppe (und damit group_members, worauf die
+       Berechtigungsprüfung der Sender-Key-Endpunkte aufbaut) existiert. */
     const { groupId } = await api._fetch('/api/group', {
       method: 'POST',
-      body: { name, avatar: '👥', members: members.map(m => m.id), wrapped }
+      body: { name, avatar: '👥', members: memberIds }
     });
 
-    /* Gruppenschlüssel lokal cachen — spart erneutes Entschlüsseln bei
-       jeder Nachricht in dieser Sitzung, UND persistent speichern,
-       damit er einen Reload übersteht (nur auf diesem Gerät, siehe
-       Hinweis oben zu Multi-Device). */
-    if (!state.groupKeys) state.groupKeys = new Map();
-    state.groupKeys.set(groupId, groupKey);
-    saveGroupKeyLocal(groupId, rawKeyB64);
+    if (!state.mySenderKeys) state.mySenderKeys = new Map();
+    const mySk = await SenderKeys.create();
+    state.mySenderKeys.set(groupId, mySk);
+    await distributeMySenderKey(groupId, [state.me.id, ...memberIds], 1);
 
     const conv = {
-      convId: 'grp_' + groupId, groupId, isGroup: true,
-      name, memberIds: [state.me.id, ...members.map(m => m.id)], unread: 0
+      convId: 'grp_' + groupId, groupId, isGroup: true, ownerId: state.me.id,
+      name, memberIds: [state.me.id, ...memberIds], unread: 0
     };
     state.convs.set(conv.convId, conv);
     openChat(conv);
@@ -3396,10 +3628,14 @@ function chatMenu(e) {
   if (!state.activeConv) return;
   const peerId = state.activeConv.peerId;
   const convId = state.activeConv.convId;
+  const groupId = state.activeConv.groupId;
+  const isGroup = state.activeConv.isGroup;
   const isBlocked = state.blocked.has(peerId);
   const isMuted = state.mutedChats?.has(peerId);
   const isPinned = state.pinnedChats?.has(convId);
   const isFavorite = state.favoriteChats?.has(convId);
+  const conv = state.convs.get(convId);
+  const isGroupOwner = isGroup && conv?.ownerId === state.me.id;
 
   const sheet = document.createElement('div');
   sheet.className = 'sheet'; sheet.id = 'chatMenuSheet';
@@ -3423,22 +3659,31 @@ function chatMenu(e) {
         <button class="menuitem" onclick="window.__app.openDisappearingMessages()">
           <span class="mi-ic">⏱️</span><span>Verschwindende Nachrichten</span>
         </button>
+        ${!isGroup ? `
         <button class="menuitem" onclick="window.__app.openScheduleCall()">
           <span class="mi-ic">📅</span><span>Anruf planen</span>
         </button>
         <button class="menuitem" onclick="window.__app.showEncryptionFingerprint()">
           <span class="mi-ic">🔐</span><span>Sicherheitscode anzeigen</span>
-        </button>
+        </button>` : ''}
         <button class="menuitem" onclick="window.__app.exportChat()">
           <span class="mi-ic">📤</span><span>Chat exportieren</span>
         </button>
+        ${isGroup ? `
+        ${isGroupOwner ? `
+        <button class="menuitem" onclick="window.__app.openGroupMembersManage()">
+          <span class="mi-ic">👥</span><span>Mitglieder verwalten</span>
+        </button>` : ''}
+        <button class="menuitem" onclick="window.__app.leaveGroup('${esc(groupId)}')">
+          <span class="mi-ic">🚪</span><span style="color:var(--dan)">Gruppe verlassen</span>
+        </button>` : `
         <button class="menuitem" onclick="window.__app.reportUser()">
           <span class="mi-ic">🚩</span><span>Melden</span>
         </button>
         <button class="menuitem" onclick="window.__app.toggleBlock()">
           <span class="mi-ic">${isBlocked ? '✅' : '🚫'}</span>
           <span style="color:${isBlocked ? 'var(--acc2)' : 'var(--dan)'}">${isBlocked ? 'Entsperren' : 'Blockieren'}</span>
-        </button>
+        </button>`}
         <button class="menuitem" onclick="window.__app.clearChatHistory()">
           <span class="mi-ic">🗑️</span><span style="color:var(--dan)">Chatverlauf löschen</span>
         </button>
