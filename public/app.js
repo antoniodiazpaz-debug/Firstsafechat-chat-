@@ -536,6 +536,37 @@ async function pullPrefsFromServer() {
 
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
+/* ── Session-Mutex ──
+   Jede Ratchet-Session hat einen fortlaufenden Zustand (Double Ratchet:
+   Kettenposition, DH-Schlüsselpaare). Zwei GLEICHZEITIGE encrypt/
+   decrypt-Aufrufe auf DERSELBEN Session — z. B. eine normale Chat-
+   Nachricht und parallel eine Sender-Key-Verteilung für eine Gruppe,
+   beide über dieselbe 1:1-Session zum selben Kontakt — können sich
+   gegenseitig überschreiben, weil beide vom selben Ausgangszustand
+   lesen, bevor der jeweils andere seinen Fortschritt gespeichert hat.
+   Ergebnis war eine beschädigte Session mit "Nicht entschlüsselbar"
+   bei ganz normalen 1:1-Nachrichten, nachdem im Hintergrund eine
+   Sender-Key-Verteilung über dieselbe Session gelaufen war.
+
+   withSessionLock() serialisiert alle Zugriffe auf eine Session anhand
+   ihres Keys — der zweite Aufruf wartet, bis der erste (inklusive
+   seines scheduleSessionSave()) fertig ist, statt parallel auf
+   demselben Objekt zu arbeiten. */
+const _sessionLocks = new Map();
+async function withSessionLock(sessionKey, fn) {
+  const prior = _sessionLocks.get(sessionKey) || Promise.resolve();
+  let release;
+  const mine = new Promise(resolve => { release = resolve; });
+  _sessionLocks.set(sessionKey, prior.then(() => mine));
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (_sessionLocks.get(sessionKey) === mine) _sessionLocks.delete(sessionKey);
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
    NETZSTATUS
    ─────────────────────────────────────────────────────────────────────
@@ -1444,10 +1475,12 @@ async function openRatchet(env) {
      dem Entschlüsseln wieder entfernt werden — es wurde bereits von
      ensureReceiverSession() ausgelesen, wird hier nicht mehr gebraucht. */
   const { x3dh, ...ratchetHeader } = env.header || {};
-  const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) },
-    `v1|${env.senderId}|${env.convId}`);
-  scheduleSessionSave();
-  return td.decode(buf);
+  return withSessionLock(key, async () => {
+    const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) },
+      `v1|${env.senderId}|${env.convId}`);
+    scheduleSessionSave();
+    return td.decode(buf);
+  });
 }
 async function openSealed(env) {
   const raw = ub64(env.ciphertext);
@@ -2024,8 +2057,11 @@ async function sendMessage(peerId, convId, plaintext) {
        die Sitzung beim Gegenüber schon über den ersten Header etabliert
        wurde. */
     const isFirst = st.Ns === 0 && !!st.ephemeral;
-    const env = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${convId}`);
-    scheduleSessionSave();
+    const env = await withSessionLock(key, async () => {
+      const e = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${convId}`);
+      scheduleSessionSave();
+      return e;
+    });
     const header = isFirst
       ? { ...env.header, x3dh: { senderIK: state.identity.IK.pubJwk, senderEK: st.ephemeral.pubJwk, opkId: st.usedOpkId } }
       : env.header;
@@ -2786,9 +2822,11 @@ async function encryptToUserVia1to1(userId, plaintext, context) {
   const sessionKey = [...state.sessions.keys()].find(k => k.startsWith(userId + '>'));
   const st = state.sessions.get(sessionKey);
   if (!st) throw new Error('Keine 1:1-Session zu ' + userId);
-  const env = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${context}`);
-  scheduleSessionSave();
-  return b64(te.encode(JSON.stringify({ header: env.header, ct: b64(new Uint8Array(env.ct)) })));
+  return withSessionLock(sessionKey, async () => {
+    const env = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${context}`);
+    scheduleSessionSave();
+    return b64(te.encode(JSON.stringify({ header: env.header, ct: b64(new Uint8Array(env.ct)) })));
+  });
 }
 /* Kehrseite: entschlüsselt einen über encryptToUserVia1to1 verschickten
    Blob, empfangen von fromUserId. */
@@ -2798,10 +2836,12 @@ async function decryptFromUserVia1to1(fromUserId, payloadB64, context) {
   const sessionKey = [...state.sessions.keys()].find(k => k.startsWith(fromUserId + '>'));
   const st = state.sessions.get(sessionKey);
   if (!st) throw new Error('Keine 1:1-Session zu ' + fromUserId);
-  const buf = await Ratchet.decrypt(st, { header: payload.header, ct: ub64(payload.ct) },
-    `v1|${fromUserId}|${context}`);
-  scheduleSessionSave();
-  return td.decode(buf);
+  return withSessionLock(sessionKey, async () => {
+    const buf = await Ratchet.decrypt(st, { header: payload.header, ct: ub64(payload.ct) },
+      `v1|${fromUserId}|${context}`);
+    scheduleSessionSave();
+    return td.decode(buf);
+  });
 }
 
 /* Verteilt MEINEN eigenen Sender-Key an alle übrigen Mitglieder einer
