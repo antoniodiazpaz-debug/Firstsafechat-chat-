@@ -1895,6 +1895,7 @@ const appActions = {
   openDisappearingMessages() { openDisappearingMessages(); },
   setDisappearing(sec) { setDisappearing(sec); },
   showEncryptionFingerprint() { showEncryptionFingerprint(); },
+  resetSessionWithPeer(peerId) { resetSessionWithPeer(peerId); },
   exportChat() { exportChat(); },
   clearChatHistory() { clearChatHistory(); },
   toggleBlock() { toggleBlock(); },
@@ -3705,6 +3706,9 @@ function chatMenu(e) {
         </button>
         <button class="menuitem" onclick="window.__app.showEncryptionFingerprint()">
           <span class="mi-ic">🔐</span><span>Sicherheitscode anzeigen</span>
+        </button>
+        <button class="menuitem" onclick="window.__app.resetSessionWithPeer('${esc(peerId)}')">
+          <span class="mi-ic">🔄</span><span>Verschlüsselung zurücksetzen</span>
         </button>` : ''}
         <button class="menuitem" onclick="window.__app.exportChat()">
           <span class="mi-ic">📤</span><span>Chat exportieren</span>
@@ -3920,6 +3924,33 @@ async function computeSecurityCode(peerId) {
      dort, 45 hier; ausreichend Entropie gegen zufälliges Erraten,
      ohne den Vergleich für Nutzer unnötig lang zu machen). */
   return hashArr.slice(0, 15).map(b => String(b).padStart(3, '0'));
+}
+
+/* ── Verschlüsselungs-Session zurücksetzen ──
+   Sicherheitsnetz für den seltenen Fall, dass eine 1:1-Ratchet-Session
+   durch einen abgebrochenen Netzwerkvorgang, einen Absturz mitten im
+   Speichern, oder (früherer Bug) eine Race Condition zwischen zwei
+   gleichzeitigen Verschlüsselungsvorgängen auf derselben Session
+   inkonsistent geworden ist — sichtbar als dauerhaftes "Nicht
+   entschlüsselbar" bei Nachrichten, die eigentlich normal ankommen
+   sollten. Löscht die lokale Session zu diesem Kontakt komplett; beim
+   nächsten Senden baut ensureSessions() automatisch eine frische
+   Session per X3DH neu auf. Alte, bereits als "Nicht entschlüsselbar"
+   markierte Nachrichten bleiben so markiert (sie waren zum Zeitpunkt
+   des Empfangs tatsächlich nicht entschlüsselbar) — der Reset betrifft
+   nur künftige Nachrichten. */
+async function resetSessionWithPeer(peerId) {
+  document.getElementById('chatMenuSheet')?.remove();
+  if (!confirm('Verschlüsselung mit diesem Kontakt zurücksetzen? Nötig nur, wenn Nachrichten dauerhaft "Nicht entschlüsselbar" anzeigen. Neue Nachrichten funktionieren danach wieder normal.')) return;
+
+  let removed = 0;
+  for (const key of [...state.sessions.keys()]) {
+    if (key.startsWith(peerId + '>')) { state.sessions.delete(key); removed++; }
+  }
+  if (!removed) { toast('Keine bestehende Session gefunden'); return; }
+
+  scheduleSessionSave();
+  toast('🔄 Verschlüsselung zurückgesetzt — wird bei der nächsten Nachricht neu aufgebaut');
 }
 
 async function showEncryptionFingerprint() {
