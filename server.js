@@ -280,9 +280,53 @@ CREATE TABLE IF NOT EXISTS groups_tbl (
 CREATE TABLE IF NOT EXISTS group_members (
   group_id  TEXT NOT NULL REFERENCES groups_tbl(id) ON DELETE CASCADE,
   user_id   TEXT NOT NULL,
-  wrapped   TEXT,                   -- für dieses Mitglied verschlüsselter Gruppenschlüssel
+  wrapped   TEXT,                   -- Altlast aus dem früheren Ein-Schlüssel-Modell, siehe unten
   is_admin  INTEGER DEFAULT 0,
   PRIMARY KEY(group_id, user_id)
+);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- SENDER KEYS — Gruppenverschlüsselung mit Forward Secrecy
+-- ─────────────────────────────────────────────────────────────────────
+-- Ersetzt das frühere Modell "ein AES-Schlüssel für die ganze Gruppe,
+-- vom Ersteller einmal an jedes Mitglied gewrappt" (siehe group_members.
+-- wrapped oben, bleibt als Spalte bestehen für evtl. noch laufende alte
+-- Gruppen, wird für NEUE Gruppen nicht mehr befüllt).
+--
+-- Jetzt: JEDES Mitglied hat einen EIGENEN Sender-Key und verteilt ihn
+-- EINZELN an jedes andere Mitglied — daher eine N×N-Tabelle statt
+-- einer Spalte. distributor_id/recipient_id sind beide User-IDs, NIE
+-- Geräte-IDs: die Verteilung läuft über die 1:1-Ratchet-Session
+-- zwischen den beiden NUTZERN (siehe app.js distributeSenderKey), die
+-- App kümmert sich selbst darum, dass jedes Gerät des Empfängers den
+-- Key über seine eigene Session bekommt.
+--
+-- payload enthält NIE den Klartext-Chain-Key — das ist der bereits
+-- über die 1:1-Ratchet-Session verschlüsselte Blob (Header + Chiffrat),
+-- der Server sieht wie bei allen Nachrichten nur Chiffretext.
+-- ═══════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS sender_key_distributions (
+  group_id       TEXT NOT NULL REFERENCES groups_tbl(id) ON DELETE CASCADE,
+  distributor_id TEXT NOT NULL,   -- wessen Sender-Key das ist
+  recipient_id   TEXT NOT NULL,   -- für wen verschlüsselt
+  epoch          INTEGER NOT NULL DEFAULT 1,   -- siehe unten
+  payload        TEXT NOT NULL,   -- verschlüsselter Blob (Ratchet-Header + Chiffrat)
+  created_at     BIGINT NOT NULL,
+  PRIMARY KEY (group_id, distributor_id, recipient_id, epoch)
+);
+CREATE INDEX IF NOT EXISTS idx_skd_recipient ON sender_key_distributions(recipient_id, group_id);
+
+/* epoch: erhöht sich bei JEDEM Mitgliederwechsel (Beitritt oder
+   Austritt) — zwingt alle verbleibenden Mitglieder, einen frischen
+   Sender-Key zu verteilen. Ohne das könnte ein ausgetretenes Mitglied
+   mit seinem alten Chain-Key weiterhin künftige Nachrichten lesen, da
+   ein reiner Chain-Key-Ratchet nur VORWÄRTS Sicherheit bietet (wer den
+   Key zu einem Zeitpunkt X hat, kann alles ab X lesen, bis die Kette
+   komplett neu beginnt). */
+CREATE TABLE IF NOT EXISTS group_epochs (
+  group_id   TEXT PRIMARY KEY REFERENCES groups_tbl(id) ON DELETE CASCADE,
+  epoch      INTEGER NOT NULL DEFAULT 1,
+  updated_at BIGINT NOT NULL
 );
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -514,6 +558,21 @@ const q = {
                             WHERE m.user_id=?`),
   membersOf:    db.prepare('SELECT * FROM group_members WHERE group_id=?'),
   myWrapped:    db.prepare('SELECT wrapped FROM group_members WHERE group_id=? AND user_id=?'),
+  removeMember: db.prepare('DELETE FROM group_members WHERE group_id=? AND user_id=?'),
+  isGroupOwner: db.prepare('SELECT 1 FROM groups_tbl WHERE id=? AND owner_id=?'),
+
+  /* ---- Sender Keys ---- */
+  currentEpoch: db.prepare('SELECT epoch FROM group_epochs WHERE group_id=?'),
+  ensureEpoch:  db.prepare(`INSERT INTO group_epochs (group_id,epoch,updated_at) VALUES (?,1,?)
+                             ON CONFLICT (group_id) DO NOTHING`),
+  bumpEpoch:    db.prepare(`UPDATE group_epochs SET epoch=epoch+1, updated_at=? WHERE group_id=?`),
+  putSenderKeyDist: db.prepare(`INSERT INTO sender_key_distributions
+    (group_id,distributor_id,recipient_id,epoch,payload,created_at) VALUES (?,?,?,?,?,?)
+    ON CONFLICT (group_id,distributor_id,recipient_id,epoch) DO UPDATE SET payload=excluded.payload`),
+  senderKeyDistsForRecipient: db.prepare(`SELECT * FROM sender_key_distributions
+    WHERE group_id=? AND recipient_id=? AND epoch=?`),
+  senderKeyDistributors: db.prepare(`SELECT DISTINCT distributor_id FROM sender_key_distributions
+    WHERE group_id=? AND epoch=?`),
 
   /* ---- Push ---- */
   putPush:      db.prepare(`INSERT INTO push_subscriptions (device_id,platform,endpoint,p256dh,auth,created_at)
@@ -1974,13 +2033,143 @@ const routes = {
     const gs = await Promise.all(groupRows.map(async g => {
       const members = await q.membersOf.all(g.id);
       const myWrapped = await q.myWrapped.get(g.id, a.user.id);
+      const epochRow = await q.currentEpoch.get(g.id);
       return {
         id: g.id, name: g.name, avatar: g.avatar, ownerId: g.owner_id, createdAt: g.created_at,
         members: members.map(m => ({ userId: m.user_id, isAdmin: !!m.is_admin })),
-        wrapped: myWrapped?.wrapped || null
+        wrapped: myWrapped?.wrapped || null,   // Altlast, siehe Schema-Kommentar
+        epoch: epochRow?.epoch || 1
       };
     }));
     json(res, 200, { groups: gs });
+  },
+
+  /* ── Sender-Key-Verteilung ──
+     Ein Mitglied hat seinen eigenen Sender-Key erzeugt (siehe
+     sender-keys.js SenderKeys.create) und ihn für JEDES andere
+     Mitglied einzeln über die 1:1-Ratchet-Session verschlüsselt
+     (payload). Dieser Endpunkt legt alle Verteilungen in einem
+     Aufruf ab, statt eines Requests pro Empfänger. */
+  'POST /api/group/senderkey/distribute': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!b.groupId || !b.epoch || !b.payloads || typeof b.payloads !== 'object') {
+      return json(res, 400, { error: 'groupId, epoch oder payloads fehlt' });
+    }
+    const members = await q.membersOf.all(b.groupId);
+    if (!members.some(m => m.user_id === a.user.id)) {
+      return json(res, 403, { error: 'Kein Mitglied dieser Gruppe' });
+    }
+    const now = Date.now();
+    for (const [recipientId, payload] of Object.entries(b.payloads)) {
+      await q.putSenderKeyDist.run(b.groupId, a.user.id, recipientId, b.epoch, payload, now);
+    }
+    json(res, 200, { ok: true });
+  },
+
+  /* Holt alle für MICH bestimmten Sender-Key-Verteilungen der
+     aktuellen Epoche — eine pro anderem Mitglied, das seinen Key
+     bereits verteilt hat (kann bei frisch beigetretenen Mitgliedern
+     kurzzeitig unvollständig sein, der Client fragt bei Bedarf erneut
+     nach, siehe app.js ensureGroupSenderKeys). */
+  'GET /api/group/senderkey': async (req, res, url) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const groupId = url.searchParams.get('groupId');
+    if (!groupId) return json(res, 400, { error: 'groupId fehlt' });
+    const members = await q.membersOf.all(groupId);
+    if (!members.some(m => m.user_id === a.user.id)) {
+      return json(res, 403, { error: 'Kein Mitglied dieser Gruppe' });
+    }
+    const epochRow = await q.currentEpoch.get(groupId);
+    const epoch = epochRow?.epoch || 1;
+    const dists = await q.senderKeyDistsForRecipient.all(groupId, a.user.id, epoch);
+    json(res, 200, {
+      epoch,
+      distributions: dists.map(d => ({ distributorId: d.distributor_id, payload: d.payload }))
+    });
+  },
+
+  /* Epoche erhöhen — MUSS bei jedem Mitgliederwechsel (Beitritt oder
+     Austritt) aufgerufen werden, sonst könnte ein Ex-Mitglied mit
+     seinem alten Chain-Key weiterhin künftige Nachrichten lesen (siehe
+     Schema-Kommentar zu group_epochs). Alte Verteilungen bleiben in
+     der DB stehen (kein DELETE) — sie gehören zu einer abgelaufenen
+     Epoche und werden von GET /api/group/senderkey ohnehin nicht mehr
+     ausgeliefert, das Aufräumen ist für die Korrektheit nicht nötig. */
+  'POST /api/group/senderkey/rotate': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!b.groupId) return json(res, 400, { error: 'groupId fehlt' });
+    const members = await q.membersOf.all(b.groupId);
+    if (!members.some(m => m.user_id === a.user.id)) {
+      return json(res, 403, { error: 'Kein Mitglied dieser Gruppe' });
+    }
+    await q.ensureEpoch.run(b.groupId, Date.now());
+    await q.bumpEpoch.run(Date.now(), b.groupId);
+    const epochRow = await q.currentEpoch.get(b.groupId);
+    json(res, 200, { epoch: epochRow?.epoch || 1 });
+  },
+
+  /* ── Gruppe verlassen (jedes Mitglied für sich selbst) ──
+     Erhöht die Epoche IM SELBEN Aufruf, atomar mit dem Entfernen aus
+     group_members — sonst gäbe es ein Zeitfenster, in dem das
+     ausgetretene Mitglied zwar schon keine neuen Nachrichten mehr
+     bekommt, sein alter Chain-Key aber noch für die aktuelle Epoche
+     gültig wäre (siehe group_epochs-Schema-Kommentar in der
+     Tabellendefinition oben: reiner Chain-Key-Ratchet bietet nur
+     Vorwärtssicherheit, kein Post-Compromise-Schutz von selbst). Die
+     verbleibenden Mitglieder merken das beim nächsten Senden/Abrufen
+     (epoch hat sich erhöht) und verteilen automatisch frische
+     Sender-Keys — siehe app.js handleEpochChange. */
+  'POST /api/group/leave': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!b.groupId) return json(res, 400, { error: 'groupId fehlt' });
+    const members = await q.membersOf.all(b.groupId);
+    if (!members.some(m => m.user_id === a.user.id)) {
+      return json(res, 404, { error: 'Kein Mitglied dieser Gruppe' });
+    }
+    await q.removeMember.run(b.groupId, a.user.id);
+    await q.ensureEpoch.run(b.groupId, Date.now());
+    await q.bumpEpoch.run(Date.now(), b.groupId);
+    /* Verbleibende Mitglieder aktiv benachrichtigen (WebSocket, falls
+       online) — schneller als darauf zu warten, dass sie zufällig die
+       nächste Nachricht senden/empfangen und dabei die neue Epoche
+       bemerken. */
+    const remaining = members.filter(m => m.user_id !== a.user.id);
+    for (const m of remaining) {
+      deliverToUser(m.user_id, { type: 'group-member-left', groupId: b.groupId, userId: a.user.id });
+    }
+    json(res, 200, { ok: true });
+  },
+
+  /* ── Mitglied entfernen (nur der Gruppen-Ersteller) ──
+     Dieselbe Epochen-Logik wie beim freiwilligen Verlassen — aus
+     Sicherheitssicht ist "rausgeworfen" und "selbst gegangen" identisch
+     zu behandeln, in beiden Fällen darf das ehemalige Mitglied keine
+     künftigen Nachrichten mehr lesen können. */
+  'POST /api/group/remove-member': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!b.groupId || !b.userId) return json(res, 400, { error: 'groupId oder userId fehlt' });
+    const isOwner = await q.isGroupOwner.get(b.groupId, a.user.id);
+    if (!isOwner) return json(res, 403, { error: 'Nur der Gruppen-Ersteller kann Mitglieder entfernen' });
+    if (b.userId === a.user.id) return json(res, 400, { error: 'Der Ersteller kann sich nicht selbst entfernen — Gruppe stattdessen verlassen' });
+
+    await q.removeMember.run(b.groupId, b.userId);
+    await q.ensureEpoch.run(b.groupId, Date.now());
+    await q.bumpEpoch.run(Date.now(), b.groupId);
+
+    const remaining = await q.membersOf.all(b.groupId);
+    for (const m of remaining) {
+      deliverToUser(m.user_id, { type: 'group-member-left', groupId: b.groupId, userId: b.userId });
+    }
+    /* Das entfernte Mitglied selbst auch informieren, falls online —
+       sein Client soll die Gruppe sofort aus der eigenen Chatliste
+       nehmen, statt erst beim nächsten Abgleich zu bemerken, dass er
+       nicht mehr Mitglied ist. */
+    deliverToUser(b.userId, { type: 'group-removed', groupId: b.groupId });
+    json(res, 200, { ok: true });
   },
 
   /* ---- Key Transparency ---- */
