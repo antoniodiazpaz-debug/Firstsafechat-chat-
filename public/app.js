@@ -1400,7 +1400,13 @@ async function handleEnvelope(env, live) {
     }
   } catch (e) {
     console.warn('Entschlüsselung fehlgeschlagen:', e.message);
-    plaintext = '⚠️ Nicht entschlüsselbar';
+    /* Temporär: die genaue Fehlermeldung sichtbar in der Chatzeile
+       statt nur in der (auf dem Handy nicht einsehbaren) Browser-
+       Konsole — nötig, um einen hartnäckigen Entschlüsselungsfehler
+       ohne Konsolenzugriff einzugrenzen. Sobald die Ursache gefunden
+       ist, sollte das wieder auf die kurze Nutzer-Meldung zurückgebaut
+       werden, siehe TODO unten. */
+    plaintext = '⚠️ Nicht entschlüsselbar [' + (e.message || e.name || 'unbekannt') + ']';
   }
 
   if (!state.messages.has(convId)) state.messages.set(convId, []);
