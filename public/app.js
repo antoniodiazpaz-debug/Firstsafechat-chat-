@@ -536,6 +536,22 @@ async function pullPrefsFromServer() {
 
 const sk = (peerId, peerDeviceId) => peerId + '>' + peerDeviceId;
 
+/* ═══════════════════════════════════════════════════════════════════════
+   TEMPORÄRES DIAGNOSEPROTOKOLL — Ratchet-Zustand bei jedem Ver-/
+   Entschlüsseln mitschreiben
+   ─────────────────────────────────────────────────────────────────────
+   Nötig, um einen hartnäckigen "OperationError"-Entschlüsselungsfehler
+   einzugrenzen, ohne Zugriff auf die Browser-Konsole am Endgerät zu
+   haben — die Einträge landen stattdessen sichtbar in der App (siehe
+   openCryptoDiagnostics). Nach Behebung des zugrundeliegenden Bugs
+   sollte dieser Log wieder entfernt werden (siehe TODO dort).
+   ═══════════════════════════════════════════════════════════════════════ */
+const _cryptoDiagLog = [];
+function logCryptoDiag(entry) {
+  _cryptoDiagLog.push({ ts: Date.now(), ...entry });
+  if (_cryptoDiagLog.length > 100) _cryptoDiagLog.shift();   // Speicher begrenzen
+}
+
 /* ── Session-Mutex ──
    Jede Ratchet-Session hat einen fortlaufenden Zustand (Double Ratchet:
    Kettenposition, DH-Schlüsselpaare). Zwei GLEICHZEITIGE encrypt/
@@ -1481,11 +1497,22 @@ async function openRatchet(env) {
      dem Entschlüsseln wieder entfernt werden — es wurde bereits von
      ensureReceiverSession() ausgelesen, wird hier nicht mehr gebraucht. */
   const { x3dh, ...ratchetHeader } = env.header || {};
+  logCryptoDiag({
+    dir: 'receive', peerId: env.senderId, deviceId: env.senderDeviceId, sessionKey: key,
+    Ns: st.Ns, Nr: st.Nr, dhSteps: st.dhSteps, hadX3dh: !!x3dh,
+    convId: env.convId, aad: `v1|${env.senderId}|${env.convId}`,
+    ratchetHeader: JSON.stringify(ratchetHeader)
+  });
   return withSessionLock(key, async () => {
-    const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) },
-      `v1|${env.senderId}|${env.convId}`);
-    scheduleSessionSave();
-    return td.decode(buf);
+    try {
+      const buf = await Ratchet.decrypt(st, { header: ratchetHeader, ct: ub64(env.ciphertext) },
+        `v1|${env.senderId}|${env.convId}`);
+      scheduleSessionSave();
+      return td.decode(buf);
+    } catch (e) {
+      logCryptoDiag({ dir: 'receive-error', peerId: env.senderId, sessionKey: key, error: e.message });
+      throw e;
+    }
   });
 }
 async function openSealed(env) {
@@ -1851,6 +1878,8 @@ const appActions = {
   openPrivacySettings() { openPrivacySettings(); },
   openBlockedList() { openBlockedList(); },
   openLinkedDevices() { openLinkedDevices(); },
+  openCryptoDiagnostics() { openCryptoDiagnostics(); },
+  copyDiagLog() { copyDiagLog(); },
   openLanguageSettings() { openLanguageSettings(); },
   changeLang(code) { changeLang(code); },
   openStorageSettings() { openStorageSettings(); },
@@ -2064,6 +2093,11 @@ async function sendMessage(peerId, convId, plaintext) {
        die Sitzung beim Gegenüber schon über den ersten Header etabliert
        wurde. */
     const isFirst = st.Ns === 0 && !!st.ephemeral;
+    logCryptoDiag({
+      dir: 'send', peerId, deviceId: bundle.deviceId, sessionKey: key,
+      Ns: st.Ns, Nr: st.Nr, dhSteps: st.dhSteps, hasEphemeral: !!st.ephemeral, isFirst,
+      convId, aad: `v1|${state.me.id}|${convId}`
+    });
     const env = await withSessionLock(key, async () => {
       const e = await Ratchet.encrypt(st, te.encode(plaintext), `v1|${state.me.id}|${convId}`);
       scheduleSessionSave();
@@ -3101,6 +3135,9 @@ function openMainMenu(e) {
         <button class="menuitem" onclick="window.__app.openScheduledCallsList()">
           <span class="mi-ic">📅</span><span>Geplante Anrufe</span>
         </button>
+        <button class="menuitem" onclick="window.__app.openCryptoDiagnostics()">
+          <span class="mi-ic">🔧</span><span>Verschlüsselungs-Diagnose</span>
+        </button>
       </div>
       <button class="btn ghost" style="width:100%;margin-top:16px" onclick="window.__app.logoutClick()">Abmelden</button>
       <button class="btn ghost" style="width:100%;margin-top:8px;color:#f15c6d" onclick="window.__app.showDeleteAccount()">Konto löschen</button>
@@ -3446,6 +3483,37 @@ async function unblockFromSettings(userId) {
     openBlockedList();
     toast('Kontakt entsperrt');
   } catch (e) { toast('⚠️ ' + e.message); }
+}
+
+/* ── Temporäre Diagnoseseite für den OperationError-Bug ──
+   Zeigt die letzten 100 Ver-/Entschlüsselungsversuche mit ihrem
+   vollständigen Ratchet-Zustand — Sende- und Empfangsseite
+   nebeneinander vergleichbar, um zu sehen, an welchem Wert (Ns/Nr,
+   AAD, Header) beide Seiten auseinanderlaufen. TODO: nach Behebung
+   des Bugs zusammen mit logCryptoDiag()/_cryptoDiagLog wieder
+   entfernen — das ist kein für Endnutzer gedachtes Dauerfeature. */
+function openCryptoDiagnostics() {
+  document.getElementById('mainMenuSheet')?.remove();
+  const entries = [..._cryptoDiagLog].reverse();
+  openSettingsPage('Verschlüsselungs-Diagnose', `
+    <p style="color:var(--sub);font-size:12px;margin-bottom:12px">
+      Letzte ${entries.length} Einträge (neueste zuerst). Nur für Fehlersuche.
+    </p>
+    <div style="font-family:monospace;font-size:11px;line-height:1.5">
+      ${entries.length ? entries.map(e => `
+        <div style="background:var(--panel2);border-radius:8px;padding:10px;margin-bottom:8px;
+          border-left:3px solid ${e.dir === 'receive-error' ? 'var(--dan)' : e.dir === 'send' ? 'var(--acc2)' : 'var(--info)'}">
+          <div style="font-weight:600;margin-bottom:4px">${esc(e.dir)} — ${new Date(e.ts).toLocaleTimeString('de-DE')}</div>
+          ${Object.entries(e).filter(([k]) => k !== 'dir' && k !== 'ts').map(([k, v]) =>
+            `<div>${esc(k)}: ${esc(String(v))}</div>`).join('')}
+        </div>`).join('') : '<p style="color:var(--sub)">Noch keine Einträge — sende oder empfange eine Nachricht.</p>'}
+    </div>
+    <button class="btn ghost" style="width:100%;margin-top:12px" onclick="window.__app.copyDiagLog()">Als Text kopieren</button>
+  `);
+}
+function copyDiagLog() {
+  const text = _cryptoDiagLog.map(e => JSON.stringify(e)).join('\n');
+  navigator.clipboard?.writeText(text).then(() => toast('Diagnoseprotokoll kopiert')).catch(() => toast('⚠️ Kopieren fehlgeschlagen'));
 }
 
 function openLinkedDevices() {
