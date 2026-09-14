@@ -2009,11 +2009,29 @@ async function ensureReceiverSession(env) {
   if (!env.header?.x3dh) throw new Error('Kein X3DH-Anfangsheader vorhanden — Sitzung nicht rekonstruierbar');
 
   const { senderIK, senderEK, opkId } = env.header.x3dh;
+  /* WICHTIG: Wenn der Sender einen One-Time-Prekey referenziert (opkId
+     gesetzt), MUSS dieser hier noch vorhanden sein — fehlt er (z. B.
+     weil ein früherer, gescheiterter Session-Aufbau-Versuch ihn schon
+     verbraucht und gelöscht hat), würde X3DH.responder() sonr STILL
+     mit dh4=leer weiterrechnen und einen kryptografisch validen, aber
+     FALSCHEN Root-Key erzeugen — der Sender hat ja mit dem echten OPK
+     gerechnet. Das Ergebnis wäre eine Session, die nie entschlüsselbar
+     ist, ohne dass beim Aufbau selbst ein Fehler auffällt (genau das
+     Symptom, das zum dauerhaften "Nicht entschlüsselbar" mit leerer
+     Fehlermeldung führte). Deshalb jetzt: klarer Fehler statt stillem
+     Fallback, der Aufrufer kann daraufhin gezielt eine Neuaushandlung
+     anstoßen statt eine kaputte Session zu persistieren. */
   const usedOpk = opkId ? state.identity.opks.get(opkId) : null;
+  if (opkId && !usedOpk) {
+    throw new Error('Referenzierter One-Time-Prekey (' + opkId + ') lokal nicht mehr vorhanden — Session kann nicht sicher aufgebaut werden');
+  }
   const SK = await X3DH.responder(state.identity.IK, state.identity.SPK, usedOpk, senderIK, senderEK);
   const st = Ratchet.initReceiver(SK, state.identity.SPK);
   state.sessions.set(key, st);
   scheduleSessionSave();
+  /* Erst NACH erfolgreichem Session-Aufbau löschen — vorher hätte ein
+     Fehler zwischen get() und hier den OPK unwiederbringlich verloren,
+     obwohl die Session nie zustande kam. */
   if (usedOpk) state.identity.opks.delete(opkId);
   return st;
 }
