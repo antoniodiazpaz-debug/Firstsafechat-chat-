@@ -1396,6 +1396,12 @@ async function openGroupMessage(env) {
 async function handleEnvelope(env, live) {
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
 
+  logCryptoDiag({
+    dir: 'envelope-arrived', live: !!live, senderId: env.senderId, senderDeviceId: env.senderDeviceId,
+    convId, groupId: env.groupId, kind: env.kind, sealed: !!env.sealed,
+    hasHeader: !!env.header, hasX3dh: !!env.header?.x3dh, envId: env.id
+  });
+
   /* Eine tatsächlich eintreffende Nachricht ist ein bewusster
      Neuanfang für diesen Chat — hebt eine frühere lokale Löschung auf
      (siehe deleteSelectedChats), sonst würde die Konversation trotz
