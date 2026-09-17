@@ -1503,6 +1503,30 @@ async function handleEnvelope(env, live) {
 async function openRatchet(env) {
   const key = sk(env.senderId, env.senderDeviceId);
   let st = state.sessions.get(key);
+
+  /* Trägt der eingehende Header einen X3DH-Block, hat der SENDER
+     entschieden, dass eine komplett neue Session nötig ist (siehe
+     sendMessage: isFirst wird nur true, wenn er selbst noch keine
+     Antwort auf dieser Session bekommen hat). Haben WIR aber bereits
+     eine (andere) Session zu diesem Gerät, ist sie zwangsläufig
+     veraltet — beide Seiten sind auseinandergelaufen (z. B. weil eine
+     Seite zurückgesetzt wurde, während die andere nichts davon wusste,
+     oder durch einen früheren Fehlversuch). Der alte Zustand würde nie
+     mehr zum neuen Header passen (anderer Root Key), jeder weitere
+     Versuch damit scheitert mit OperationError. Statt das zu
+     versuchen: alte Session verwerfen, aus dem NEUEN X3DH-Header eine
+     frische aufbauen — das ist die Selbstheilung, die ein reiner
+     Session-Reset auf nur einer Seite nicht leisten kann, weil die
+     andere Seite ja weiterhin die alte (jetzt fälschlich als gültig
+     angenommene) Session nutzen würde. */
+  if (st && env.header?.x3dh) {
+    logCryptoDiag({
+      dir: 'stale-session-detected', peerId: env.senderId, sessionKey: key,
+      oldNs: st.Ns, oldNr: st.Nr, oldDhSteps: st.dhSteps
+    });
+    state.sessions.delete(key);
+    st = null;
+  }
   if (!st) st = await ensureReceiverSession(env);
   /* env.ciphertext kommt als Base64-String vom Server (siehe sendMessage,
      das ArrayBuffer→Base64 vor dem Versand kodiert) — hier zurück zu
