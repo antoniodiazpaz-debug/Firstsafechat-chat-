@@ -1337,6 +1337,9 @@ function wireSocketEvents() {
   api.on('group-removed', (msg) => {
     handleGroupRemoved(msg.groupId);
   });
+  api.on('session-reset', (msg) => {
+    handleRemoteSessionReset(msg.fromId);
+  });
   api.on('connected', () => {
     toast('🟢 WebSocket verbunden', 1500);
     state.isOffline = false;
@@ -4075,6 +4078,26 @@ async function computeSecurityCode(peerId) {
    markierte Nachrichten bleiben so markiert (sie waren zum Zeitpunkt
    des Empfangs tatsächlich nicht entschlüsselbar) — der Reset betrifft
    nur künftige Nachrichten. */
+/* Gegenseite hat die Verschlüsselung zu uns zurückgesetzt (siehe
+   resetSessionWithPeer) — unsere eigene, aus IHRER Sicht jetzt
+   veraltete Session ebenfalls verwerfen. Ohne das würde nur der
+   auslösende Nutzer neu aufsetzen, während wir weiterhin unsere
+   (nach dem Reset der Gegenseite inkompatible) alte Session zu nutzen
+   versuchen — die nächste Nachricht in beide Richtungen würde
+   scheitern. Kein Bestätigungsdialog: das ist ein rein technischer,
+   folgenloser Vorgang (Sessions bauen sich beim nächsten Kontakt
+   automatisch neu auf), der Nutzer muss hier nichts entscheiden. */
+function handleRemoteSessionReset(fromId) {
+  let removed = 0;
+  for (const key of [...state.sessions.keys()]) {
+    if (key.startsWith(fromId + '>')) { state.sessions.delete(key); removed++; }
+  }
+  if (removed) {
+    scheduleSessionSave();
+    console.log('Session zu', fromId, 'nach Reset der Gegenseite verworfen');
+  }
+}
+
 async function resetSessionWithPeer(peerId) {
   document.getElementById('chatMenuSheet')?.remove();
   if (!confirm('Verschlüsselung mit diesem Kontakt zurücksetzen? Nötig nur, wenn Nachrichten dauerhaft "Nicht entschlüsselbar" anzeigen. Neue Nachrichten funktionieren danach wieder normal.')) return;
@@ -4083,10 +4106,24 @@ async function resetSessionWithPeer(peerId) {
   for (const key of [...state.sessions.keys()]) {
     if (key.startsWith(peerId + '>')) { state.sessions.delete(key); removed++; }
   }
-  if (!removed) { toast('Keine bestehende Session gefunden'); return; }
-
   scheduleSessionSave();
-  toast('🔄 Verschlüsselung zurückgesetzt — wird bei der nächsten Nachricht neu aufgebaut');
+
+  /* Gegenseite über den Server benachrichtigen, damit sie IHRE (aus
+     ihrer Sicht noch gültige) Session ebenfalls verwirft — ohne das
+     würde nur eine Seite zurückgesetzt, während die andere weiterhin
+     die jetzt inkompatible alte Session nutzt und jede folgende
+     Nachricht mit einem stillen OperationError scheitert, egal von
+     welcher Seite sie kommt. */
+  try {
+    const { peerNotifiedLive } = await api._fetch('/api/session/reset', { method: 'POST', body: { peerId } });
+    toast(peerNotifiedLive
+      ? '🔄 Verschlüsselung zurückgesetzt — Gegenseite wurde ebenfalls benachrichtigt'
+      : '🔄 Verschlüsselung zurückgesetzt — Gegenseite ist offline, wird beim nächsten Kontakt automatisch synchronisiert');
+  } catch (e) {
+    toast(removed
+      ? '🔄 Verschlüsselung lokal zurückgesetzt (Gegenseite konnte nicht benachrichtigt werden: ' + e.message + ')'
+      : '⚠️ Zurücksetzen fehlgeschlagen: ' + e.message);
+  }
 }
 
 async function showEncryptionFingerprint() {
