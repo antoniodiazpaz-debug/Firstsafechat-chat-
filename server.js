@@ -2110,6 +2110,29 @@ const routes = {
     json(res, 200, { epoch: epochRow?.epoch || 1 });
   },
 
+  /* ── Koordinierter 1:1-Session-Reset ──
+     Reiner Relay-Endpunkt, kein eigener Zustand auf dem Server nötig:
+     eine Seite fordert den Reset an, der Server benachrichtigt die
+     Gegenseite (falls online) sofort per WebSocket, und beide Clients
+     löschen daraufhin ihre lokale Ratchet-Session zueinander. Der
+     entscheidende Unterschied zum bisherigen einseitigen "Session
+     zurücksetzen"-Knopf: OHNE diese Koordination konnte eine Seite
+     zurücksetzen, während die andere ihre (jetzt garantiert
+     inkompatible) alte Session weiter für gültig hielt — jede neue
+     Nachricht scheiterte dann mit einem stillen OperationError, egal
+     welche Seite initiierte. Ist die Gegenseite offline, greift beim
+     nächsten Verbindungsaufbau ohnehin automatisch die in openRatchet
+     eingebaute Erkennung veralteter Sessions (an einem neuen X3DH-
+     Header) — dieser Endpunkt beschleunigt das nur, wenn beide gerade
+     online sind. */
+  'POST /api/session/reset': async (req, res) => {
+    const a = await auth(req); if (!a) return json(res, 401, { error: 'Nicht angemeldet' });
+    const b = await readBody(req);
+    if (!b.peerId) return json(res, 400, { error: 'peerId fehlt' });
+    const online = deliverToUser(b.peerId, { type: 'session-reset', fromId: a.user.id });
+    json(res, 200, { peerNotifiedLive: online });
+  },
+
   /* ── Gruppe verlassen (jedes Mitglied für sich selbst) ──
      Erhöht die Epoche IM SELBEN Aufruf, atomar mit dem Entfernen aus
      group_members — sonst gäbe es ein Zeitfenster, in dem das
