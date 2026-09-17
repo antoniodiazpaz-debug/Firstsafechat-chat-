@@ -144,21 +144,52 @@ const LocalCache = {
     this._deviceId = deviceId;
   },
 
-  /* DEAKTIVIERT — Nachrichten werden bewusst NICHT mehr lokal
-     zwischengespeichert. Konsequenz: nach einem Reload/Neustart ist
-     der sichtbare Chatverlauf leer, bis neue Nachrichten eintreffen
-     oder vom Server nachgeholt werden (der Server löscht zugestellte
-     Umschläge ohnehin, siehe purgeAcked in server.js — bereits
-     gelesene ältere Nachrichten sind dann nicht mehr abrufbar). Als
-     no-op belassen statt entfernt, damit alle bestehenden Aufrufer
-     (LocalCache.scheduleSave() an vielen Stellen im Code) unverändert
-     bleiben können. */
-  async save() {},
+  /* Klartext in localStorage — dieselbe Herangehensweise wie beim
+     Vault (Schlüssel/Token liegen dort ebenfalls unverschlüsselt,
+     siehe Vault oben): kein zusätzliches Crypto-Layer nötig, da der
+     Schutz bereits auf Geräteebene ansetzt (Displaysperre etc.), nicht
+     durch eine zweite Verschlüsselungsschicht im Browser-Speicher.
+     Bewahrt den Chatverlauf dauerhaft über Neustarts hinweg — wie bei
+     WhatsApps lokaler msgstore.db, nur ohne SQLite (siehe frühere
+     Diskussion: SQLite/OPFS im Browser wurde wegen COOP/COEP-
+     Nebenwirkungen und der bekannten IndexedDB-Fragilität in dieser
+     App bewusst nicht umgesetzt). */
+  async save() {
+    if (!this._deviceId) return;
+    const snapshot = {
+      convs: [...state.convs.entries()],
+      messages: [...state.messages.entries()],
+      outbox: state.outbox,
+      savedAt: Date.now()
+    };
+    try {
+      localStorage.setItem('sc:cache:' + this._deviceId, JSON.stringify(snapshot));
+    } catch (e) {
+      console.warn('LocalCache.save fehlgeschlagen:', e.message);
+    }
+  },
 
-  async load() { return false; },
+  async load() {
+    if (!this._deviceId) return false;
+    const raw = localStorage.getItem('sc:cache:' + this._deviceId);
+    if (!raw) return false;
+    try {
+      const snapshot = JSON.parse(raw);
+      state.convs = new Map(snapshot.convs);
+      state.messages = new Map(snapshot.messages);
+      state.outbox = snapshot.outbox || [];
+      return true;
+    } catch (e) {
+      console.warn('Lokaler Nachrichten-Cache nicht lesbar:', e.message);
+      return false;
+    }
+  },
 
   _saveTimer: null,
-  scheduleSave() {}
+  scheduleSave() {
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => { this._saveTimer = null; this.save().catch(() => {}); }, 800);
+  }
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -644,29 +675,12 @@ async function flushOutbox() {
 /* ═══════════════════════════════════════════════════════════════════════
    BOOT
    ═══════════════════════════════════════════════════════════════════════ */
-/* Räumt einmalig alte "sc:cache:<deviceId>"-Einträge auf, die aus der
-   Zeit stammen, bevor der Nachrichten-Cache deaktiviert wurde (siehe
-   LocalCache oben) — sonst bliebe der alte Klartext-Chatverlauf
-   dauerhaft im localStorage liegen, obwohl er nirgends mehr gelesen
-   oder aktualisiert wird. */
-function purgeOldMessageCache() {
-  try {
-    const keysToRemove = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith('sc:cache:')) keysToRemove.push(k);
-    }
-    keysToRemove.forEach(k => localStorage.removeItem(k));
-  } catch {}
-}
-
 async function boot() {
   loadDisappearingSettings();
   loadChatPrefs();
   loadAccentTheme();
   loadPinnedAndFavorites();
   loadDeletedConvIds();
-  purgeOldMessageCache();
   const bootMsgEarly = document.getElementById('bootMsg');
   if (bootMsgEarly) bootMsgEarly.textContent = 'Verbinde…';
 
