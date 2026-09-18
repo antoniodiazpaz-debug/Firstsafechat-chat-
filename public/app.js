@@ -209,6 +209,11 @@ const state = {
   monitor: null,
   search: '',
   blocked: new Set(),
+  /* Verhindert doppelte Verarbeitung derselben Envelope-ID (siehe
+     handleEnvelope) — kann sonst passieren, wenn eine Nachricht sowohl
+     aus der Inbox nachgeholt als auch kurz danach noch live per
+     WebSocket zugestellt wird. */
+  _processedEnvIds: new Set(),
   /* Eigener Netzstatus (nicht zu verwechseln mit "online" bei Kontakten,
      das ist deren WebSocket-Präsenz). Startet optimistisch mit
      navigator.onLine — das ist zuverlässig genug für "kein Netzadapter
@@ -1412,6 +1417,33 @@ async function openGroupMessage(env) {
 
 async function handleEnvelope(env, live) {
   const convId = env.convId || ('dm_' + [state.me.id, env.senderId].filter(Boolean).sort().join('_'));
+
+  /* Deduplizierung: dieselbe Nachricht kann sowohl beim Boot aus der
+     Inbox nachgeholt (live=false) als auch kurz danach noch per
+     WebSocket live zugestellt werden (live=true) — z. B. wenn der
+     Server sie beim Öffnen der Inbox-Anfrage noch nicht als
+     zugestellt markiert hatte. Ratchet.decrypt() MUTIERT den
+     Sitzungszustand (Nr, dhSteps) bereits bei den vorbereitenden
+     Schritten (dhStep/skipTo), BEVOR der abschließende GCM-Tag-Check
+     über Erfolg/Fehlschlag entscheidet — eine zweifach verarbeitete
+     Nachricht ließ die Session dadurch fälschlich ein zweites Mal
+     vorrücken, obwohl es dieselbe Nachricht war. Das zerstörte die
+     Synchronität mit der Gegenseite dauerhaft (Ursache eines
+     hartnäckigen "OperationError" bei allen folgenden Nachrichten).
+     _processedEnvIds hält die letzten paar hundert bereits
+     verarbeiteten IDs fest; alles Weitere wird bei einer erneuten
+     Zustellung übersprungen statt zweimal entschlüsselt zu werden. */
+  if (env.id) {
+    if (state._processedEnvIds.has(env.id)) {
+      logCryptoDiag({ dir: 'envelope-duplicate-skipped', envId: env.id, live: !!live });
+      return;
+    }
+    state._processedEnvIds.add(env.id);
+    if (state._processedEnvIds.size > 500) {
+      const first = state._processedEnvIds.values().next().value;
+      state._processedEnvIds.delete(first);
+    }
+  }
 
   logCryptoDiag({
     dir: 'envelope-arrived', live: !!live, senderId: env.senderId, senderDeviceId: env.senderDeviceId,
